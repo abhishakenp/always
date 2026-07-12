@@ -333,9 +333,11 @@ const LONG_RECORDING_WARN_SECS: u32 = 1500;
 /// accumulates toward an API payload limit.
 const MAX_SPEECH_SECS: u32 = 1800;
 /// Flush the live buffer as a committed chunk at the next tentative
-/// silence once it holds at least this much speech. 90s ≈ 2.9MB WAV —
-/// far below Groq's 25MB cap, big enough that chunk seams are rare.
-const CHUNK_TARGET_SECS: u32 = 90;
+/// silence once it holds at least this much speech. This is deliberately
+/// short: Groq's API is file-based, so "live" transcription means keeping
+/// small committed chunks in flight while the user keeps talking, then
+/// pasting once after the final relaxed pause.
+const CHUNK_TARGET_SECS: u32 = 6;
 
 /// `CHUNK_TARGET_SECS` with a test override: `ALWAYS_CHUNK_TARGET_SECS`
 /// lets an end-to-end test exercise the chunk path with seconds of audio
@@ -348,10 +350,10 @@ fn chunk_target_secs() -> u32 {
         .unwrap_or(CHUNK_TARGET_SECS)
 }
 /// Absolute per-chunk ceiling: flush at a frame boundary even mid-speech
-/// if the user talks continuously for this long without a 0.2s dip.
-/// Whisper tolerates a clean-frame cut; 2.5 min of literally pause-free
-/// speech is vanishingly rare.
-const CHUNK_HARD_MAX_SECS: u32 = 150;
+/// if the user talks continuously for this long without a tentative dip.
+/// This keeps uninterrupted monologues from becoming one large final STT
+/// call; natural-silence chunking above handles the common case.
+const CHUNK_HARD_MAX_SECS: u32 = 15;
 /// Adaptive mid-sentence extension: when the speculative transcript ends
 /// mid-thought (no terminator, or a trailing connector word), the final
 /// silence window is stretched by this factor so a thinking pause doesn't
@@ -1721,13 +1723,15 @@ fn looks_mid_sentence(loc: &crate::always::localization::Localization, text: &st
 #[cfg(test)]
 mod tests {
     use super::{
-        early_voice_frame_ok, extended_silence_frames, fast_energy_check, fast_normalized_energy,
-        looks_mid_sentence, normal_silence_frames, normalized_energy, speaker_gate_allows_score,
-        speaker_gate_allows_stt, speaker_gate_allows_transcription,
+        chunk_target_secs, early_voice_frame_ok, extended_silence_frames, fast_energy_check,
+        fast_normalized_energy, looks_mid_sentence, normal_silence_frames, normalized_energy,
+        speaker_gate_allows_score, speaker_gate_allows_stt, speaker_gate_allows_transcription,
         speaker_gate_dependencies_ready, speaker_gate_should_reject_unavailable,
         tentative_silence_frames, voice_activity_energy_threshold,
     };
     use crate::always::AlwaysConfig;
+
+    static CHUNK_TARGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn normalized_energy_handles_empty_input() {
@@ -1835,6 +1839,28 @@ mod tests {
         assert_eq!(extended_silence_frames(30), 60);
         // Large user window (3s → 100 frames): cap wins, 100+50=150 < 200.
         assert_eq!(extended_silence_frames(100), 150);
+    }
+
+    #[test]
+    fn chunk_target_defaults_to_liveish_chunks() {
+        let _guard = CHUNK_TARGET_ENV_LOCK
+            .lock()
+            .expect("CHUNK_TARGET_ENV_LOCK poisoned");
+        unsafe { std::env::remove_var("ALWAYS_CHUNK_TARGET_SECS") };
+
+        assert_eq!(chunk_target_secs(), 6);
+    }
+
+    #[test]
+    fn chunk_target_env_override_is_floored() {
+        let _guard = CHUNK_TARGET_ENV_LOCK
+            .lock()
+            .expect("CHUNK_TARGET_ENV_LOCK poisoned");
+        unsafe { std::env::set_var("ALWAYS_CHUNK_TARGET_SECS", "1") };
+
+        assert_eq!(chunk_target_secs(), 3);
+
+        unsafe { std::env::remove_var("ALWAYS_CHUNK_TARGET_SECS") };
     }
 
     #[test]

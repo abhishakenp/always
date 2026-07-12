@@ -974,4 +974,19 @@ mod tests {
         assert!(matches!(events[1], DaemonEvent::TranscribingStopped));
         assert_eq!(events.len(), 2);
     }
+
+    #[test]
+    fn transcript_chunks_do_not_change_lifecycle_state() {
+        let b = EventBroadcaster::new();
+        let mut rx = b.subscribe();
+        b.transcript_chunk("first rolling chunk".to_string());
+        b.transcript_chunk("second rolling chunk".to_string());
+        b.transcribing_stopped();
+        b.voice_activity_ended();
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], DaemonEvent::TranscriptChunk { .. }));
+        assert!(matches!(events[1], DaemonEvent::TranscriptChunk { .. }));
+    }
 }
