@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::localization::Localization;
 use super::postprocess::PostProcessor;
+use super::status_sound::StatusSoundSetting;
 use crate::db;
 use crate::db::Preferences;
 use crate::stt_dispatch::TranscriberBackendChoice;
@@ -267,6 +268,8 @@ pub struct AlwaysConfig {
     /// external consumers (e.g. IRIS tailing the file). Opt-in: persisted
     /// transcripts are privacy-relevant, so this defaults to off.
     pub transcript_stream_enabled: bool,
+    /// Status sounds for the four sleep-coding states. Off by default.
+    pub audible_status_sound: StatusSoundSetting,
 }
 
 #[derive(Debug, Clone)]
@@ -461,6 +464,11 @@ impl AlwaysConfig {
             // CLI/preference) without touching the merge logic.
             localization: Localization::ENGLISH,
             transcript_stream_enabled: resolve_transcript_stream(&prefs),
+            audible_status_sound: prefs
+                .audible_status_sound
+                .as_deref()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
         };
 
         Ok(config)
@@ -505,6 +513,7 @@ impl Default for AlwaysConfig {
             idle_pause_action: IdlePauseAction::default(),
             localization: Localization::ENGLISH,
             transcript_stream_enabled: false,
+            audible_status_sound: StatusSoundSetting::default(),
         }
     }
 }

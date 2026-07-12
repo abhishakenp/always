@@ -44,6 +44,7 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
 
     // Initialize the auto-enter state from config
     pause::init_auto_enter(cfg.auto_enter);
+    crate::always::status_sound::set_setting(cfg.audible_status_sound);
 
     // Create shared config early so UDS server can start immediately
     let active_cfg: ActiveConfig = Arc::new(RwLock::new(cfg.clone()));

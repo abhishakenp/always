@@ -446,6 +446,9 @@ pub enum DaemonCommand {
         /// Optional so payloads from older GUI builds still decode.
         #[serde(default)]
         adaptive_silence: Option<bool>,
+        /// Optional so payloads from older GUI builds still decode.
+        #[serde(default)]
+        audible_status_sound: Option<String>,
     },
     /// Approve a pending correction in the queue and apply it to the
     /// glossary. The daemon emits `CorrectionLogged` on success.
@@ -615,7 +618,11 @@ impl EventBroadcaster {
     /// Send transcribing started event. Always broadcast (re-emits double
     /// as a keep-alive heartbeat for the GUI's stale-state watchdog).
     pub fn transcribing_started(&self) {
-        self.transcribing_active.store(true, Ordering::SeqCst);
+        if !self.transcribing_active.swap(true, Ordering::SeqCst) {
+            crate::always::status_sound::cue(
+                crate::always::status_sound::StatusSound::Transcribing,
+            );
+        }
         self.send(DaemonEvent::TranscribingStarted);
     }
 
@@ -634,6 +641,7 @@ impl EventBroadcaster {
 
     /// Send transcript final event
     pub fn transcript_final(&self, text: String) {
+        crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Success);
         self.send(DaemonEvent::TranscriptFinal { text });
     }
 
@@ -677,7 +685,9 @@ impl EventBroadcaster {
     /// Send voice activity detected event. Always broadcast (re-emits
     /// double as a keep-alive heartbeat for the GUI's stale-state watchdog).
     pub fn voice_activity_detected(&self) {
-        self.voice_active.store(true, Ordering::SeqCst);
+        if !self.voice_active.swap(true, Ordering::SeqCst) {
+            crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Listening);
+        }
         self.send(DaemonEvent::VoiceActivityDetected);
     }
 
@@ -707,6 +717,7 @@ impl EventBroadcaster {
     /// Send a transcription-failed event (Groq/STT error) so the GUI can
     /// flash a red error overlay instead of leaving a stuck "Processing…".
     pub fn transcription_failed(&self, kind: impl Into<String>, message: impl Into<String>) {
+        crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Failure);
         self.send(DaemonEvent::TranscriptionFailed {
             kind: kind.into(),
             message: message.into(),

@@ -354,6 +354,7 @@ mod tests {
             idle_pause_action: IdlePauseAction::default(),
             localization: Localization::ENGLISH,
             transcript_stream_enabled: false,
+            audible_status_sound: crate::always::status_sound::StatusSoundSetting::default(),
         }
     }
 

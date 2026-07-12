@@ -582,6 +582,7 @@ fn execute_command(cmd: DaemonCommand, ctx: &ModelCommandCtx) {
             cooldown_ms,
             silero_threshold,
             adaptive_silence,
+            audible_status_sound,
         } => {
             apply_runtime_preferences(
                 ctx,
@@ -591,6 +592,7 @@ fn execute_command(cmd: DaemonCommand, ctx: &ModelCommandCtx) {
                 cooldown_ms,
                 silero_threshold,
                 adaptive_silence,
+                audible_status_sound,
             );
         }
         DaemonCommand::ApproveCorrection { id } => handle_approve_correction(&id),
@@ -952,6 +954,7 @@ fn apply_runtime_preferences(
     cooldown_ms: u32,
     silero_threshold: f32,
     adaptive_silence: Option<bool>,
+    audible_status_sound: Option<String>,
 ) {
     let mut cfg = ctx.cfg.write();
     cfg.auto_enter_delay_ms = auto_enter_delay_ms.min(60_000);
@@ -965,6 +968,13 @@ fn apply_runtime_preferences(
     if let Some(adaptive) = adaptive_silence {
         cfg.adaptive_silence_enabled = adaptive;
     }
+    if let Some(setting) = audible_status_sound
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+    {
+        cfg.audible_status_sound = setting;
+        crate::always::status_sound::set_setting(setting);
+    }
     tracing::info!(
         auto_enter_delay_ms = cfg.auto_enter_delay_ms,
         energy_threshold = cfg.energy_threshold,
@@ -972,6 +982,7 @@ fn apply_runtime_preferences(
         cooldown_ms = cfg.cooldown_ms,
         silero_threshold = cfg.silero_threshold,
         adaptive_silence = cfg.adaptive_silence_enabled,
+        audible_status_sound = cfg.audible_status_sound.as_str(),
         "uds_apply_runtime_preferences"
     );
 }
