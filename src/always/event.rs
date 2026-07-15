@@ -927,12 +927,20 @@ mod tests {
     #[test]
     fn set_consume_mode_command_parses_from_iris_wire_format() {
         // The exact JSON Iris writes to the socket. Must decode to the command.
-        let on = DaemonCommand::from_json_line(r#"{"type":"SetConsumeMode","data":{"enabled":true}}"#)
-            .expect("enable must parse");
-        assert!(matches!(on, DaemonCommand::SetConsumeMode { enabled: true }));
-        let off = DaemonCommand::from_json_line(r#"{"type":"SetConsumeMode","data":{"enabled":false}}"#)
-            .expect("disable must parse");
-        assert!(matches!(off, DaemonCommand::SetConsumeMode { enabled: false }));
+        let on =
+            DaemonCommand::from_json_line(r#"{"type":"SetConsumeMode","data":{"enabled":true}}"#)
+                .expect("enable must parse");
+        assert!(matches!(
+            on,
+            DaemonCommand::SetConsumeMode { enabled: true }
+        ));
+        let off =
+            DaemonCommand::from_json_line(r#"{"type":"SetConsumeMode","data":{"enabled":false}}"#)
+                .expect("disable must parse");
+        assert!(matches!(
+            off,
+            DaemonCommand::SetConsumeMode { enabled: false }
+        ));
     }
 
     fn drain(rx: &mut broadcast::Receiver<DaemonEvent>) -> Vec<DaemonEvent> {

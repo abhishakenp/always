@@ -598,7 +598,10 @@ fn handle_speech(
                 }
                 pause::dictation_buffer_clear();
                 event::global_broadcaster().voice_activity_ended();
-                tracing::info!(chars = final_text.chars().count(), "consume_mode_routed_to_stream");
+                tracing::info!(
+                    chars = final_text.chars().count(),
+                    "consume_mode_routed_to_stream"
+                );
                 return Ok(());
             }
 

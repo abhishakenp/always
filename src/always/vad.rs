@@ -1097,8 +1097,7 @@ fn record_with_local_vad(
                 // Stream previews aggressively to the consumer: fire the
                 // speculative transcription at ~240ms pauses. Clamp below the
                 // final-silence window so a preview always precedes the cut.
-                CONSUME_STREAM_TENTATIVE_FRAMES
-                    .min(eff_silence_frames.saturating_sub(1).max(1))
+                CONSUME_STREAM_TENTATIVE_FRAMES.min(eff_silence_frames.saturating_sub(1).max(1))
             } else if is_short {
                 short_tentative_frames
             } else {

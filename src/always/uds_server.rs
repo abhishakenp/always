@@ -961,6 +961,7 @@ fn switch_active_backend(ctx: &ModelCommandCtx, choice: TranscriberBackendChoice
 /// Hot-reload fields the main loop reads from [`AlwaysConfig`] each
 /// utterance. DB persistence is handled by the Mac app before this
 /// command is sent.
+#[allow(clippy::too_many_arguments)]
 fn apply_runtime_preferences(
     ctx: &ModelCommandCtx,
     auto_enter_delay_ms: u32,

@@ -15,9 +15,10 @@ pub enum StatusSound {
     Failure,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum StatusSoundSetting {
+    #[default]
     Off = 0,
     Low = 1,
     Medium = 2,
@@ -45,12 +46,6 @@ impl StatusSoundSetting {
 
     pub fn is_enabled(self) -> bool {
         self != Self::Off
-    }
-}
-
-impl Default for StatusSoundSetting {
-    fn default() -> Self {
-        Self::Off
     }
 }
 
