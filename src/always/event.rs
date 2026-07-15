@@ -436,6 +436,16 @@ pub enum DaemonCommand {
     SetAutoEnter {
         enabled: bool,
     },
+    /// "Consume mode" — route transcription to the daemon's stream consumers
+    /// (any UDS client / the transcript-stream file) INSTEAD of the
+    /// clipboard+paste+enter path. This is the generic hook that lets an
+    /// external controller drive Always for its own use case: while enabled
+    /// the daemon transcribes regardless of per-app/master pause (there is no
+    /// focused app to paste into) and suppresses all pasting. Cleared when the
+    /// last client disconnects so normal dictation resumes. Idempotent.
+    SetConsumeMode {
+        enabled: bool,
+    },
     /// Hot-reload sensitivity + auto-enter delay without restart.
     ApplyRuntimePreferences {
         auto_enter_delay_ms: u32,
@@ -913,6 +923,17 @@ pub fn global_broadcaster() -> &'static EventBroadcaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_consume_mode_command_parses_from_iris_wire_format() {
+        // The exact JSON Iris writes to the socket. Must decode to the command.
+        let on = DaemonCommand::from_json_line(r#"{"type":"SetConsumeMode","data":{"enabled":true}}"#)
+            .expect("enable must parse");
+        assert!(matches!(on, DaemonCommand::SetConsumeMode { enabled: true }));
+        let off = DaemonCommand::from_json_line(r#"{"type":"SetConsumeMode","data":{"enabled":false}}"#)
+            .expect("disable must parse");
+        assert!(matches!(off, DaemonCommand::SetConsumeMode { enabled: false }));
+    }
 
     fn drain(rx: &mut broadcast::Receiver<DaemonEvent>) -> Vec<DaemonEvent> {
         let mut out = Vec::new();
