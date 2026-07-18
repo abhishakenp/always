@@ -44,6 +44,7 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
 
     // Initialize the auto-enter state from config
     pause::init_auto_enter(cfg.auto_enter);
+    crate::always::status_sound::set_setting(cfg.audible_status_sound);
 
     // Create shared config early so UDS server can start immediately
     let active_cfg: ActiveConfig = Arc::new(RwLock::new(cfg.clone()));
@@ -197,7 +198,10 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
             continue;
         }
 
-        if pause::is_paused() {
+        // Consume mode: transcribe regardless of pause. There is no
+        // focused-app paste target, so per-app / master / idle pause is
+        // irrelevant — the transcript is routed to the stream consumers.
+        if pause::is_paused() && !pause::is_consume_mode() {
             // Wake-on-voice while idle-paused: keep the mic hot enough to
             // detect speech without running the full VAD/transcribe loop.
             if pause::is_idle_auto_paused()
@@ -583,6 +587,23 @@ fn handle_speech(
             });
 
             event::global_broadcaster().transcript_final(final_text.clone());
+
+            // Consume mode: the transcript has already been broadcast over UDS
+            // (TranscriptChunk previews during speech + TranscriptFinal above).
+            // Route it to the file stream too, then STOP — no clipboard, no
+            // paste, no Enter. Nothing is inserted into any app.
+            if pause::is_consume_mode() {
+                if cfg.transcript_stream_enabled {
+                    transcript_stream::append(&final_text);
+                }
+                pause::dictation_buffer_clear();
+                event::global_broadcaster().voice_activity_ended();
+                tracing::info!(
+                    chars = final_text.chars().count(),
+                    "consume_mode_routed_to_stream"
+                );
+                return Ok(());
+            }
 
             // Resume-merge path: if the auto-enter countdown is still
             // active from the previous utterance, the user paused only

@@ -333,9 +333,11 @@ const LONG_RECORDING_WARN_SECS: u32 = 1500;
 /// accumulates toward an API payload limit.
 const MAX_SPEECH_SECS: u32 = 1800;
 /// Flush the live buffer as a committed chunk at the next tentative
-/// silence once it holds at least this much speech. 90s ≈ 2.9MB WAV —
-/// far below Groq's 25MB cap, big enough that chunk seams are rare.
-const CHUNK_TARGET_SECS: u32 = 90;
+/// silence once it holds at least this much speech. This is deliberately
+/// short: Groq's API is file-based, so "live" transcription means keeping
+/// small committed chunks in flight while the user keeps talking, then
+/// pasting once after the final relaxed pause.
+const CHUNK_TARGET_SECS: u32 = 6;
 
 /// `CHUNK_TARGET_SECS` with a test override: `ALWAYS_CHUNK_TARGET_SECS`
 /// lets an end-to-end test exercise the chunk path with seconds of audio
@@ -348,10 +350,29 @@ fn chunk_target_secs() -> u32 {
         .unwrap_or(CHUNK_TARGET_SECS)
 }
 /// Absolute per-chunk ceiling: flush at a frame boundary even mid-speech
-/// if the user talks continuously for this long without a 0.2s dip.
-/// Whisper tolerates a clean-frame cut; 2.5 min of literally pause-free
-/// speech is vanishingly rare.
-const CHUNK_HARD_MAX_SECS: u32 = 150;
+/// if the user talks continuously for this long without a tentative dip.
+/// This keeps uninterrupted monologues from becoming one large final STT
+/// call; natural-silence chunking above handles the common case.
+const CHUNK_HARD_MAX_SECS: u32 = 15;
+/// Consume-mode preview cadence: fire the speculative transcription at a
+/// brief inter-phrase pause (~240ms = 8 × 30ms frames) so a stream consumer
+/// sees text land as the user speaks, instead of waiting ~1/4 of a long
+/// dictation-silence window. Only the PREVIEW (`TranscriptChunk`) timing is
+/// affected — the final cut still uses the full silence window, so the user's
+/// dictation-finalization behaviour is unchanged.
+const CONSUME_STREAM_TENTATIVE_FRAMES: usize = 8;
+/// Consume-mode LIVE streaming: while the user is talking continuously (no
+/// pause to trigger the tentative-silence speculation above), re-transcribe
+/// the growing buffer this often so previews land mid-sentence. Groq calls
+/// are file-based (~0.7-1.5s each) and `speculation_pending` serialises them,
+/// so this interval is measured from kickoff and the effective cadence
+/// self-limits to ≈ one Groq round-trip. Kept well below that latency so a
+/// new preview fires the instant the previous one lands — i.e. as fast as
+/// Groq can answer. Only active in consume mode.
+const CONSUME_STREAM_INTERVAL_MS: u64 = 200;
+/// Minimum voiced audio before the first live preview fires (~0.25s), so even
+/// a short utterance streams at least one preview before the final.
+const CONSUME_STREAM_MIN_SAMPLES: usize = 4_000;
 /// Adaptive mid-sentence extension: when the speculative transcript ends
 /// mid-thought (no terminator, or a trailing connector word), the final
 /// silence window is stretched by this factor so a thinking pause doesn't
@@ -539,6 +560,14 @@ fn record_with_local_vad(
     // discarded if speech resumes before final silence.
     let speculation_slot = SpeculationSlot::new();
     let mut speculation_pending = false;
+    // Consume-mode live streaming: a lightweight PREVIEW stream that runs
+    // WHILE the user is still speaking (the tentative speculation above only
+    // fires at a pause). Independent of the speculation slot / final path — it
+    // only re-transcribes the growing buffer and emits a `TranscriptChunk`.
+    // The atomic serialises the background transcribes (one Groq round-trip at
+    // a time) and is cleared by the thread on completion.
+    let preview_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut last_preview_at: Option<std::time::Instant> = None;
     // Adaptive mid-sentence extension: latched once per silence run when
     // the speculative transcript looks unfinished; reset on speech resume.
     // `decided` records that the speculative text was inspected (either
@@ -969,6 +998,45 @@ fn record_with_local_vad(
                     }
                 }
 
+                // Consume-mode LIVE preview: while the user is mid-sentence
+                // (this is the voiced branch — no pause needed), re-transcribe
+                // the growing buffer on an interval and emit it as a preview so
+                // a stream consumer sees text land as it's spoken. Serialised
+                // by `preview_pending`; the effective cadence self-limits to a
+                // single Groq round-trip. Preview only — the final still comes
+                // from the speculation/chunker path, unchanged.
+                if crate::always::pause::is_consume_mode()
+                    && speaker_gate_allows_stt(speaker_gate_requested, speaker_checked)
+                    && speech_samples.len() >= CONSUME_STREAM_MIN_SAMPLES
+                    && !preview_pending.load(std::sync::atomic::Ordering::Relaxed)
+                    && last_preview_at.is_none_or(|t| {
+                        t.elapsed() >= std::time::Duration::from_millis(CONSUME_STREAM_INTERVAL_MS)
+                    })
+                {
+                    last_preview_at = Some(std::time::Instant::now());
+                    preview_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flip_to_transcribing!();
+                    let audio_snapshot = speech_samples.clone();
+                    let transcriber_for_preview = Arc::clone(transcriber);
+                    let flag = Arc::clone(&preview_pending);
+                    std::thread::spawn(move || {
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> Result<crate::stt::TranscriptionResult> {
+                                let wav = audio::create_wav_bytes_i16_mono_16k(&audio_snapshot)?;
+                                transcriber_for_preview
+                                    .transcribe_from_bytes(wav)
+                                    .map_err(anyhow::Error::from)
+                            },
+                        ));
+                        if let Ok(Ok(ref r)) = outcome
+                            && !r.text.is_empty()
+                        {
+                            event::global_broadcaster().transcript_chunk(r.text.clone());
+                        }
+                        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+
                 // Per-chunk ceiling: a pause-free monologue never reaches
                 // the tentative-silence flush point, so cut at a frame
                 // boundary once the chunk is oversized.
@@ -1025,7 +1093,12 @@ fn record_with_local_vad(
             } else {
                 silence_frames
             };
-            let eff_tentative_frames = if is_short {
+            let eff_tentative_frames = if crate::always::pause::is_consume_mode() {
+                // Stream previews aggressively to the consumer: fire the
+                // speculative transcription at ~240ms pauses. Clamp below the
+                // final-silence window so a preview always precedes the cut.
+                CONSUME_STREAM_TENTATIVE_FRAMES.min(eff_silence_frames.saturating_sub(1).max(1))
+            } else if is_short {
                 short_tentative_frames
             } else {
                 tentative_silence_frames
@@ -1721,13 +1794,15 @@ fn looks_mid_sentence(loc: &crate::always::localization::Localization, text: &st
 #[cfg(test)]
 mod tests {
     use super::{
-        early_voice_frame_ok, extended_silence_frames, fast_energy_check, fast_normalized_energy,
-        looks_mid_sentence, normal_silence_frames, normalized_energy, speaker_gate_allows_score,
-        speaker_gate_allows_stt, speaker_gate_allows_transcription,
+        chunk_target_secs, early_voice_frame_ok, extended_silence_frames, fast_energy_check,
+        fast_normalized_energy, looks_mid_sentence, normal_silence_frames, normalized_energy,
+        speaker_gate_allows_score, speaker_gate_allows_stt, speaker_gate_allows_transcription,
         speaker_gate_dependencies_ready, speaker_gate_should_reject_unavailable,
         tentative_silence_frames, voice_activity_energy_threshold,
     };
     use crate::always::AlwaysConfig;
+
+    static CHUNK_TARGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn normalized_energy_handles_empty_input() {
@@ -1835,6 +1910,28 @@ mod tests {
         assert_eq!(extended_silence_frames(30), 60);
         // Large user window (3s → 100 frames): cap wins, 100+50=150 < 200.
         assert_eq!(extended_silence_frames(100), 150);
+    }
+
+    #[test]
+    fn chunk_target_defaults_to_liveish_chunks() {
+        let _guard = CHUNK_TARGET_ENV_LOCK
+            .lock()
+            .expect("CHUNK_TARGET_ENV_LOCK poisoned");
+        unsafe { std::env::remove_var("ALWAYS_CHUNK_TARGET_SECS") };
+
+        assert_eq!(chunk_target_secs(), 6);
+    }
+
+    #[test]
+    fn chunk_target_env_override_is_floored() {
+        let _guard = CHUNK_TARGET_ENV_LOCK
+            .lock()
+            .expect("CHUNK_TARGET_ENV_LOCK poisoned");
+        unsafe { std::env::set_var("ALWAYS_CHUNK_TARGET_SECS", "1") };
+
+        assert_eq!(chunk_target_secs(), 3);
+
+        unsafe { std::env::remove_var("ALWAYS_CHUNK_TARGET_SECS") };
     }
 
     #[test]

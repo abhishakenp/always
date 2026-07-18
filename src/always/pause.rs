@@ -53,6 +53,26 @@ static NO_GUI_PAUSED: AtomicBool = AtomicBool::new(false);
 /// until the user resumes either globally or for a specific app.
 static EFFECTIVE_PAUSED: AtomicBool = AtomicBool::new(true);
 
+/// Consumer source: an external controller asked the daemon (via
+/// `DaemonCommand::SetConsumeMode`) to route transcription to its stream
+/// consumers instead of the paste path. While set, the capture loop ignores
+/// every pause source (there is no focused app to leak into — nothing is
+/// pasted) and the paste path is skipped entirely. Cleared when the last
+/// client disconnects.
+static CONSUME_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable consume mode (route to stream consumers, suppress paste).
+pub fn set_consume_mode(enabled: bool) {
+    CONSUME_MODE.store(enabled, Ordering::Relaxed);
+}
+
+/// Is the daemon routing transcription to its stream consumers instead of
+/// pasting? When true, the capture loop runs regardless of pause state and no
+/// text is ever pasted.
+pub fn is_consume_mode() -> bool {
+    CONSUME_MODE.load(Ordering::Relaxed)
+}
+
 /// Recompute the effective pause state from MASTER + per-app rules.
 /// Returns `(new_effective, changed)`. Callers broadcast `Paused` /
 /// `Resumed` only when `changed` is true to keep the UDS log quiet.
