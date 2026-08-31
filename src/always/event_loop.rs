@@ -521,10 +521,9 @@ fn handle_speech(
             // utterances below are excluded — whisper noise artifacts would
             // clobber the clipboard on every false VAD trigger.
             match paste::copy_to_clipboard(text.to_string()) {
-                Ok(()) => tracing::info!(
-                    chars = text.chars().count(),
-                    "filtered_copied_to_clipboard"
-                ),
+                Ok(()) => {
+                    tracing::info!(chars = text.chars().count(), "filtered_copied_to_clipboard")
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, "filtered_clipboard_copy_failed")
                 }
@@ -596,68 +595,80 @@ fn handle_speech(
             // stack — expansions are user-authored text and must never
             // be reworded by the grammar LLM.
             let snippet_expansion = crate::always::snippets::expand(&transformed);
-            let (final_text, grammar_cache_hit, grammar_patch_async) =
-                if let Some(expanded) = snippet_expansion {
-                    let expanded_chars = expanded.chars().count();
-                    if let Some(utterance) = snippet_utterance_for_log(
-                        &transformed,
-                        crate::always::telemetry::should_log_transcripts(),
-                    ) {
-                        tracing::info!(
-                            stage = "snippet_expansion",
-                            utterance = %utterance,
-                            expanded_chars,
-                            "snippet trigger matched — pasting expansion verbatim"
-                        );
-                    } else {
-                        tracing::info!(
-                            stage = "snippet_expansion",
-                            utterance_chars = transformed.chars().count(),
-                            expanded_chars,
-                            "snippet trigger matched — pasting expansion verbatim"
-                        );
-                    }
-                    (expanded, false, false)
-                } else if is_short_utterance(&transformed) {
+            let GrammarOutcome {
+                text: final_text,
+                source: grammar_source,
+                pending: pending_grammar,
+            } = if let Some(expanded) = snippet_expansion {
+                let expanded_chars = expanded.chars().count();
+                if let Some(utterance) = snippet_utterance_for_log(
+                    &transformed,
+                    crate::always::telemetry::should_log_transcripts(),
+                ) {
                     tracing::info!(
-                        stage = "short_utterance_bypass",
-                        text = %transformed,
-                        "skipping correction stack — too short to benefit"
+                        stage = "snippet_expansion",
+                        utterance = %utterance,
+                        expanded_chars,
+                        "snippet trigger matched — pasting expansion verbatim"
                     );
-                    (transformed.clone(), false, false)
-                } else if transformed.chars().count() > GRAMMAR_MAX_CHARS {
-                    // Long chunked dictation: a single blocking LLM pass
-                    // over the joined text would blow the 8s grammar
-                    // timeout. Each chunk was already grammar-corrected
-                    // in the background as it flushed (chunker.rs), so
-                    // paste the join as-is.
-                    tracing::info!(
-                        stage = "long_transcript_grammar_bypass",
-                        chars = transformed.chars().count(),
-                        "skipping blocking grammar — per-chunk corrections already applied"
-                    );
-                    (transformed.clone(), false, false)
                 } else {
-                    // Single-paste policy: correct synchronously, then paste the
-                    // final text exactly ONCE. The old "paste acoustic now, patch
-                    // via Cmd+Z + repaste when the LLM returns" path surfaced text
-                    // a few hundred ms sooner but produced a DOUBLE transcript
-                    // whenever the undo failed to land — user pressed Enter first,
-                    // the app has non-standard undo (Slack, terminals, web
-                    // contenteditable), or focus shifted. One clean paste of the
-                    // corrected text is worth the small extra latency.
-                    //
-                    // The request bundles tier-1 acoustic rewrites, deferred
-                    // fuzzy glossary candidates, and dictation-session context
-                    // into one LLM message. The speculative warm in `vad.rs`
-                    // builds the identical request, so the cache key matches
-                    // and the LLM cost is usually already paid.
-                    let llm_available = cfg.postprocess_available();
-                    let req = crate::always::correction_request::build(&transformed, llm_available);
-                    let (corrected, cache_hit) = apply_grammar_blocking_request(&req, cfg, rt);
-                    (corrected, cache_hit, false)
-                };
+                    tracing::info!(
+                        stage = "snippet_expansion",
+                        utterance_chars = transformed.chars().count(),
+                        expanded_chars,
+                        "snippet trigger matched — pasting expansion verbatim"
+                    );
+                }
+                // Snippet expansions are user-authored text. They are
+                // pasted verbatim and never handed to the grammar LLM —
+                // no request is built, so no patch can rewrite them.
+                GrammarOutcome::bypass(expanded)
+            } else if is_short_utterance(&transformed) {
+                tracing::info!(
+                    stage = "short_utterance_bypass",
+                    text = %transformed,
+                    "skipping correction stack — too short to benefit"
+                );
+                GrammarOutcome::bypass(transformed.clone())
+            } else if transformed.chars().count() > GRAMMAR_MAX_CHARS {
+                // Long chunked dictation: a single blocking LLM pass
+                // over the joined text would blow the 8s grammar
+                // timeout. Each chunk was already grammar-corrected
+                // in the background as it flushed (chunker.rs), so
+                // paste the join as-is.
+                tracing::info!(
+                    stage = "long_transcript_grammar_bypass",
+                    chars = transformed.chars().count(),
+                    "skipping blocking grammar — per-chunk corrections already applied"
+                );
+                GrammarOutcome::bypass(transformed.clone())
+            } else {
+                // The LLM is OFF the critical path (`grammar_wait_ms`
+                // defaults to 0). We probe the correction cache — which
+                // costs a mutex lock, not a round-trip — and paste
+                // whatever we have. On a miss the acoustically corrected
+                // text goes out immediately and the LLM keeps running in
+                // the background.
+                //
+                // This replaced a synchronous `block_on` with an 8 s
+                // ceiling whose measured cost was p50 1 061 ms / p90
+                // 2 464 ms / max 7 783 ms (n=554 utterances that reached
+                // the LLM) of dead time before a single character
+                // appeared. The single-paste guarantee is unchanged:
+                // exactly one paste happens here either way.
+                //
+                // The request bundles tier-1 acoustic rewrites, deferred
+                // fuzzy glossary candidates, and dictation-session context
+                // into one LLM message. The speculative warm in `vad.rs`
+                // builds the identical request, so an already-finished
+                // warm lands as a cache hit and is applied to this same
+                // single paste at zero cost.
+                let llm_available = cfg.postprocess_available();
+                let req = crate::always::correction_request::build(&transformed, llm_available);
+                apply_grammar_nonblocking(req, cfg, rt)
+            };
             let grammar_ms = grammar_started.elapsed().as_millis() as u64;
+            let grammar_cache_hit = grammar_source == GrammarSource::Cache;
 
             // Privacy: gate transcript text behind `should_log_transcripts`
             if crate::always::telemetry::should_log_transcripts() {
@@ -910,6 +921,11 @@ fn handle_speech(
                     .as_millis() as u64,
                 speculation_used = timing.speculation_used,
                 grammar_cache_hit,
+                // `grammar_cache_hit` alone could never distinguish a cold
+                // call from a single-flight join to a still-running warm —
+                // both logged `false` — which is why warm effectiveness was
+                // unmeasurable. `grammar_source` names the actual path.
+                grammar_source = grammar_source.as_str(),
                 "utterance latency"
             );
             // Snapshot the focused app at paste time. If the user switches
@@ -925,19 +941,17 @@ fn handle_speech(
             // extra 100ms only delayed readiness for the next utterance.
             std::thread::sleep(Duration::from_millis(100));
 
-            if grammar_patch_async {
-                // The async-grammar path ends with `replace_via_undo` INSIDE
-                // `spawn_grammar_patch` (undo + copy(corrected) + Cmd+V), so
-                // the corrected transcript is what's left on the clipboard —
-                // exactly what we want in the user's clipboard history. No
-                // restore, matching the synchronous path below.
-                spawn_grammar_patch(rt, cfg, final_text.clone(), pasted_at, pasted_to_app);
-            } else {
-                pause::end_paste();
-                // Synchronous / no-grammar path: leave the pasted transcript on
-                // the clipboard so it enters the user's clipboard history. We
-                // intentionally do NOT restore the prior clipboard here.
-            }
+            // Release the paste-in-flight lock HERE, unconditionally, before
+            // any background grammar work. The retired async path held it
+            // inside the spawned task for the whole LLM round-trip, which
+            // turned ~1 s of LLM latency into ~1 s of deafness: an utterance
+            // finalizing in that window was dropped outright
+            // ("duplicate_paste_suppressed_in_flight"), not queued, not even
+            // recoverable via force-paste.
+            pause::end_paste();
+            // The pasted transcript stays on the clipboard so it enters the
+            // user's clipboard history. We intentionally do NOT restore the
+            // prior clipboard here.
 
             let auto_enter_effective =
                 per_app::effective_auto_enter(pause::is_auto_enter_enabled());
@@ -992,6 +1006,26 @@ fn handle_speech(
             } else {
                 crate::always::dictation::note_pasted(&written_clipboard);
             }
+
+            // In-place grammar patch (opt-in, `grammar_patch_after_paste`).
+            //
+            // Spawned LAST, after every anchor above is settled, so the
+            // patch's own bookkeeping replaces a consistent snapshot rather
+            // than racing the paste path that created it. A merge paste is
+            // excluded: `replace_via_undo` can only take back the last
+            // paste, and on a merge that is the delta, not the joined text
+            // the patch would be rewriting.
+            if let Some(pending) = pending_grammar {
+                if merge_active {
+                    tracing::debug!(
+                        stage = "grammar_patch",
+                        "skipped — merge paste, undo would take back only the delta"
+                    );
+                } else {
+                    spawn_grammar_patch(rt, cfg, pending, pasted_at, pasted_to_app);
+                }
+            }
+
             // Explicit voice-activity-ended after a successful paste so the
             // Swift overlay clears cleanly. Without this, the next VAD loop
             // iteration can pick up residual mic energy and fire a new
@@ -1055,136 +1089,287 @@ fn word_count(text: &str) -> usize {
 /// case-insensitively, followed by nothing / a space / a comma. Used only
 /// as a race-guard heuristic (see the call site in `handle_speech`) — the
 /// authoritative routing decision remains `pause::is_consume_mode()`.
-/// Stage 2 — blocking LLM grammar cleanup over a prepared
-/// [`CorrectionRequest`] (tier-1 acoustic text + deferred glossary
-/// candidates + dictation-session context). Returns the corrected text
-/// and whether it came from the PostProcessor cache (true when the
-/// speculative grammar warm already paid the LLM cost).
-fn apply_grammar_blocking_request(
-    req: &crate::always::correction_request::CorrectionRequest,
+/// Where the pasted text's grammar came from, for latency attribution.
+///
+/// `grammar_cache_hit` alone was ambiguous: a cold LLM call and a
+/// single-flight join to a still-running speculative warm both reported
+/// `false`, so the warm's effectiveness could not be measured from logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrammarSource {
+    /// No LLM involved: snippet, short utterance, oversized transcript,
+    /// or grammar correction unavailable for this backend.
+    Bypass,
+    /// Correction was already in the cache — applied at zero cost to the
+    /// same single paste. This is the outcome a working warm produces.
+    Cache,
+    /// The LLM landed inside a non-zero `grammar_wait_ms` budget.
+    Waited,
+    /// Budget expired (or was 0). The acoustic text was pasted and the
+    /// LLM is still running in the background.
+    Deferred,
+}
+
+impl GrammarSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrammarSource::Bypass => "bypass",
+            GrammarSource::Cache => "cache",
+            GrammarSource::Waited => "waited",
+            GrammarSource::Deferred => "deferred",
+        }
+    }
+}
+
+/// A grammar correction that outlived the paste.
+pub struct PendingGrammar {
+    /// Still-running LLM call. Spawned onto the runtime (not awaited
+    /// inline) so that abandoning the wait cannot cancel it: a dropped
+    /// future would also leave the single-flight cell uninitialised and
+    /// throw the work away instead of banking it in the cache.
+    handle: tokio::task::JoinHandle<Option<String>>,
+    /// Exactly what we pasted, for the no-op check and the undo guard.
+    acoustic: String,
+}
+
+/// What the paste path should insert, plus any correction still in
+/// flight behind it.
+pub struct GrammarOutcome {
+    pub text: String,
+    pub source: GrammarSource,
+    pub pending: Option<PendingGrammar>,
+}
+
+impl GrammarOutcome {
+    /// Text that never reaches the LLM — pasted exactly as given.
+    pub fn bypass(text: String) -> Self {
+        Self {
+            text,
+            source: GrammarSource::Bypass,
+            pending: None,
+        }
+    }
+}
+
+/// Grammar cleanup that never blocks the user.
+///
+/// Ordering, and why:
+/// 1. **Cache probe** (a mutex lock, no I/O). A finished speculative warm
+///    lands here and is applied to the same single paste for free.
+/// 2. **Spawn** the correction onto the runtime, so it survives whatever
+///    we do next. The previous implementation awaited the future directly
+///    under `block_on(timeout(8s, ..))`; on expiry the future was dropped,
+///    which cancelled the in-flight request AND left the single-flight
+///    `OnceCell` uninitialised, so the round-trip already paid for was
+///    discarded rather than cached.
+/// 3. **Wait at most `grammar_wait_ms`** — default 0, i.e. not at all.
+///
+/// Returns the acoustic text on every path where the LLM has not already
+/// answered, so the caller always has something to paste immediately.
+fn apply_grammar_nonblocking(
+    req: crate::always::correction_request::CorrectionRequest,
     cfg: &AlwaysConfig,
     rt: &Handle,
-) -> (String, bool) {
+) -> GrammarOutcome {
     let fallback = req.acoustic_text.clone();
-    if cfg.postprocess_available()
-        && let Some(ref pp) = cfg.post_processor
-    {
-        let started = Instant::now();
-        // Bound the blocking grammar call: this runs on the main loop
-        // thread, so a hung cloud endpoint would otherwise freeze the
-        // whole daemon — no new utterance could be recorded until it
-        // returned. On timeout we fall back to the tier-1 acoustic text
-        // exactly like the error arm below, so behavior on a stalled
-        // endpoint matches a failed one.
-        const GRAMMAR_BLOCKING_TIMEOUT: Duration = Duration::from_secs(8);
-        let timed = rt.block_on(async {
-            tokio::time::timeout(GRAMMAR_BLOCKING_TIMEOUT, pp.process_request(req)).await
-        });
-        let process_result = match timed {
-            Ok(inner) => inner,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    timeout_secs = GRAMMAR_BLOCKING_TIMEOUT.as_secs(),
-                    fallback_text = %fallback,
-                    "grammar correction timed out, using acoustic match result"
-                );
-                return (fallback, false);
-            }
-        };
-        match process_result {
-            Ok((cleaned, cache_hit)) => {
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                if fallback != cleaned {
-                    tracing::info!(
-                        stage = "grammar_correction",
-                        before = %fallback,
-                        after = %cleaned,
-                        elapsed_ms = elapsed_ms,
-                        cache_hit,
-                        "grammar correction applied"
-                    );
-                } else {
-                    tracing::debug!(
-                        stage = "grammar_correction",
-                        text = %cleaned,
-                        elapsed_ms = elapsed_ms,
-                        cache_hit,
-                        "no grammar changes"
-                    );
-                }
-                (cleaned, cache_hit)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    fallback_text = %fallback,
-                    "grammar correction failed, using acoustic match result"
-                );
-                (fallback, false)
-            }
-        }
-    } else {
+    if !cfg.postprocess_available() {
         tracing::debug!(
             stage = "grammar_correction",
             text = %fallback,
             "grammar correction disabled"
         );
-        (fallback, false)
+        return GrammarOutcome::bypass(fallback);
     }
+    let Some(pp) = cfg.post_processor.clone() else {
+        return GrammarOutcome::bypass(fallback);
+    };
+
+    // 1. Free hit: the warm already paid for this exact request.
+    if let Some(cached) = pp.cached_correction(&req.user_message) {
+        if cached != fallback {
+            tracing::info!(
+                stage = "grammar_correction",
+                before = %fallback,
+                after = %cached,
+                elapsed_ms = 0_u64,
+                cache_hit = true,
+                "grammar correction applied from cache"
+            );
+        }
+        return GrammarOutcome {
+            text: cached,
+            source: GrammarSource::Cache,
+            pending: None,
+        };
+    }
+
+    // 2. Detached so the wait budget can never cancel the work.
+    let joined_inflight = pp.has_inflight(&req.user_message);
+    let started = Instant::now();
+    let task_fallback = fallback.clone();
+    let handle = rt.spawn(async move {
+        match pp.process_request(&req).await {
+            Ok((corrected, _cache_hit)) => Some(corrected),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    fallback_text = %task_fallback,
+                    "grammar correction failed, acoustic match result kept"
+                );
+                None
+            }
+        }
+    });
+
+    // 3. Optional budget. Zero by default — the user never waits.
+    let budget = Duration::from_millis(cfg.postprocess_config.grammar_wait_ms);
+    if !budget.is_zero() {
+        let mut handle = handle;
+        let waited = rt.block_on(async { tokio::time::timeout(budget, &mut handle).await });
+        match waited {
+            Ok(Ok(Some(corrected))) => {
+                tracing::info!(
+                    stage = "grammar_correction",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    joined_inflight,
+                    changed = corrected != fallback,
+                    "grammar correction landed inside wait budget"
+                );
+                return GrammarOutcome {
+                    text: corrected,
+                    source: GrammarSource::Waited,
+                    pending: None,
+                };
+            }
+            // Task finished with no usable correction (error arm above, or
+            // the task itself panicked / was aborted): nothing to patch.
+            Ok(_) => {
+                return GrammarOutcome {
+                    text: fallback,
+                    source: GrammarSource::Waited,
+                    pending: None,
+                };
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    stage = "grammar_correction",
+                    budget_ms = budget.as_millis() as u64,
+                    "wait budget expired — pasting acoustic text, LLM still running"
+                );
+                return GrammarOutcome {
+                    text: fallback.clone(),
+                    source: GrammarSource::Deferred,
+                    pending: Some(PendingGrammar {
+                        handle,
+                        acoustic: fallback,
+                    }),
+                };
+            }
+        }
+    }
+
+    GrammarOutcome {
+        text: fallback.clone(),
+        source: GrammarSource::Deferred,
+        pending: Some(PendingGrammar {
+            handle,
+            acoustic: fallback,
+        }),
+    }
+}
+
+/// How much of a change is worth taking the user's text back for.
+///
+/// A pure capitalisation or trailing-punctuation fix is not worth a
+/// visible undo-and-repaste flicker in the user's editor; a word-level
+/// change is. Measured over 447 real corrections in this user's logs:
+/// 9.2% case-only, 34.2% punctuation-or-case-only, 56.6% word-level.
+fn patch_is_worth_applying(before: &str, after: &str) -> bool {
+    if before == after {
+        return false;
+    }
+    if normalize_for_paste_dedupe(before) == normalize_for_paste_dedupe(after) {
+        return false;
+    }
+    word_sequence(before) != word_sequence(after)
+}
+
+/// Lowercased alphanumeric word sequence — the unit `patch_is_worth_applying`
+/// compares. Punctuation and casing deliberately fall out.
+fn word_sequence(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect()
 }
 
 /// After paste-first, patch grammar via Cmd+Z + repaste when the LLM returns.
 ///
-/// Retired by the single-paste policy (see the `apply_grammar_blocking` branch
-/// in the main loop) because the undo step doubled the transcript whenever it
-/// failed to land. Kept behind `dead_code` so the paste-first path can be
-/// restored if a select-and-replace correction (no Cmd+Z) is built later.
-#[allow(dead_code)]
+/// **Opt-in** (`grammar_patch_after_paste`, default off). The undo step is
+/// what retired this path in `34bb5d1`: it doubled the transcript whenever
+/// the undo failed to land — the user pressed Return first, the app has
+/// non-standard undo (Slack, terminals, web contenteditable), or focus
+/// shifted. `dictation.rs` records the resulting rule: "Forward-only by
+/// design: text already pasted is never retro-edited."
+///
+/// Every guard hole in the retired implementation is closed here:
+/// - it reuses the ALREADY-RUNNING correction for the same request rather
+///   than issuing a second `pp.process(text, None)` call, which built a
+///   different cache key and silently dropped the glossary candidates and
+///   dictation context from the prompt;
+/// - the paste-in-flight lock is released by the caller before this is
+///   spawned, so LLM latency is no longer deafness;
+/// - `LAST_PASTED` and the dictation session are updated BEFORE the
+///   clipboard write, closing the window in which the passive clipboard
+///   watcher diffed corrected text against a stale acoustic anchor and
+///   laundered a machine edit into a user-approved glossary entry;
+/// - the daemon's own synthetic Cmd+Z / Cmd+V are marked so its own
+///   keyboard tap does not cancel the auto-enter countdown;
+/// - the "message already submitted" guard uses the PER-APP effective
+///   auto-enter setting, not the global preference;
+/// - a zero auto-enter delay aborts the patch outright: that countdown
+///   path presses Return after 50 ms with no cancel check at all, so no
+///   patch can win the race.
 fn spawn_grammar_patch(
     rt: &Handle,
     cfg: &AlwaysConfig,
-    acoustic_pasted: String,
+    pending: PendingGrammar,
     pasted_at: Instant,
     pasted_to_app: Option<String>,
 ) {
-    let Some(pp) = cfg.post_processor.clone() else {
-        return;
-    };
-    if !cfg.postprocess_config.grammar_correction_enabled {
+    if !cfg.postprocess_config.grammar_patch_after_paste {
+        // Still drain the handle so the correction reaches the cache — the
+        // next identical utterance then gets it for free.
+        rt.spawn(async move {
+            let _ = pending.handle.await;
+        });
         return;
     }
 
-    rt.spawn(async move {
-        // Release the paste-in-flight lock held since the initial Cmd+V.
-        struct PasteRelease;
-        impl Drop for PasteRelease {
-            fn drop(&mut self) {
-                pause::end_paste();
-            }
-        }
-        let _paste_release = PasteRelease;
+    let auto_enter_effective = per_app::effective_auto_enter(pause::is_auto_enter_enabled());
+    let auto_enter_delay_ms = per_app::effective_auto_enter_delay_ms(cfg.auto_enter_delay_ms);
+    if auto_enter_effective && auto_enter_delay_ms == 0 {
+        tracing::debug!(
+            stage = "grammar_patch",
+            "skipped — immediate auto-enter, Return fires before any patch can land"
+        );
+        rt.spawn(async move {
+            let _ = pending.handle.await;
+        });
+        return;
+    }
 
+    let PendingGrammar { handle, acoustic } = pending;
+    rt.spawn(async move {
         let started = Instant::now();
-        let cleaned = match pp.process(&acoustic_pasted, None).await {
-            Ok(c) => c,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    fallback_text = %acoustic_pasted,
-                    "async grammar patch failed"
-                );
-                return;
-            }
+        let Ok(Some(cleaned)) = handle.await else {
+            return;
         };
 
-        if cleaned == acoustic_pasted
-            || normalize_for_paste_dedupe(&cleaned) == normalize_for_paste_dedupe(&acoustic_pasted)
-        {
+        if !patch_is_worth_applying(&acoustic, &cleaned) {
             tracing::debug!(
                 stage = "grammar_patch",
-                text = %cleaned,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "no grammar changes"
+                "no change worth an undo"
             );
             return;
         }
@@ -1217,39 +1402,80 @@ fn spawn_grammar_patch(
             return;
         }
 
-        // Abort when auto-enter is enabled and the dictation buffer was
+        // Someone pasted after us — ours is no longer the last paste, so
+        // Cmd+Z would take back THEIR text. The retired implementation had
+        // no such check because it held the paste lock across the LLM call
+        // instead, at the cost of dropping every utterance in that window.
+        if pause::last_pasted_text_within(paste::GRAMMAR_PATCH_MAX_AGE).as_deref()
+            != Some(acoustic.as_str())
+        {
+            tracing::info!("grammar_patch_aborted_superseded_by_newer_paste");
+            return;
+        }
+
+        // Abort when auto-enter is active and the dictation buffer was
         // cleared — auto_enter_countdown clears it the moment Return fires.
         // If the buffer is gone, the message was already submitted: Cmd+Z
         // would do nothing (empty input) and Cmd+V would ghost-paste the
         // corrected text as a new message — the "double transcript" bug.
-        if pause::is_auto_enter_enabled() && pause::dictation_buffer_text().is_none() {
+        if auto_enter_effective && pause::dictation_buffer_text().is_none() {
             tracing::info!("grammar_patch_aborted_message_submitted");
             return;
         }
 
+        // Take the paste lock so a concurrently finalizing utterance cannot
+        // paste into the middle of our undo+repaste. Held for the keystroke
+        // sequence only (tens of ms), never across the LLM call.
+        if !pause::try_begin_paste() {
+            tracing::info!("grammar_patch_aborted_paste_in_flight");
+            return;
+        }
+        struct PasteRelease;
+        impl Drop for PasteRelease {
+            fn drop(&mut self) {
+                pause::end_paste();
+                pause::end_synthetic_input();
+            }
+        }
+        let _paste_release = PasteRelease;
+
+        // Update the anchors BEFORE touching the clipboard. The passive
+        // clipboard watcher polls every 250 ms and diffs "clipboard now"
+        // against `LAST_PASTED`; with the old ordering it could observe the
+        // corrected clipboard against the stale acoustic anchor and file the
+        // LLM's own edit as a user correction, badging it for glossary
+        // promotion.
         let clipboard = format!("{cleaned} ");
+        pause::set_last_pasted(cleaned.clone());
+        crate::always::dictation::note_pasted(&clipboard);
+
+        // Mark the Cmd+Z / Cmd+V we are about to post as ours, so the
+        // daemon's own keyboard tap does not read them as the user typing
+        // and cancel the pending auto-enter countdown.
+        pause::begin_synthetic_input(Duration::from_millis(1_500));
+
         if let Err(err) = paste::replace_via_undo(&clipboard) {
             tracing::warn!(
                 error = %err,
                 "grammar patch replace failed; acoustic paste kept"
             );
+            // Restore the anchors: the screen still holds the acoustic text.
+            pause::set_last_pasted(acoustic.clone());
             return;
         }
 
         tracing::info!(
             stage = "grammar_patch",
-            before = %acoustic_pasted,
+            before = %acoustic,
             after = %cleaned,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "async grammar correction applied"
         );
-        pause::set_last_pasted(cleaned.clone());
         // Notify the UI that grammar correction silently mutated the text.
-        event::global_broadcaster().grammar_corrected(acoustic_pasted.clone(), cleaned.clone());
+        event::global_broadcaster().grammar_corrected(acoustic.clone(), cleaned.clone());
         event::global_broadcaster().transcript_final(cleaned);
     });
 }
-
 fn print_banner(cfg: &AlwaysConfig) {
     tracing::info!(
         energy_threshold = cfg.energy_threshold,
@@ -1270,9 +1496,10 @@ mod tests {
     // decision logic can be exercised in isolation.
 
     use super::{
-        AUTO_ENTER_MIN_WORDS, SHORT_UTTERANCE_MAX_CHARS, SHORT_UTTERANCE_MAX_WORDS,
-        is_short_utterance, should_auto_enter_for_text, should_refetch_speaker_model,
-        snippet_utterance_for_log,
+        AUTO_ENTER_MIN_WORDS, AlwaysConfig, GrammarOutcome, GrammarSource,
+        SHORT_UTTERANCE_MAX_CHARS, SHORT_UTTERANCE_MAX_WORDS, apply_grammar_nonblocking,
+        is_short_utterance, patch_is_worth_applying, should_auto_enter_for_text,
+        should_refetch_speaker_model, snippet_utterance_for_log, word_sequence,
     };
 
     #[test]
@@ -1367,5 +1594,90 @@ mod tests {
         assert!(should_auto_enter_for_text("  hello over there  "));
 
         assert_eq!(AUTO_ENTER_MIN_WORDS, 1);
+    }
+    // ---- Grammar off the critical path ------------------------------
+
+    #[test]
+    fn grammar_source_names_are_stable_log_values() {
+        // These strings land in the `latency_breakdown` log line and are
+        // what any latency analysis groups on. Renaming one silently
+        // breaks every historical comparison.
+        assert_eq!(GrammarSource::Bypass.as_str(), "bypass");
+        assert_eq!(GrammarSource::Cache.as_str(), "cache");
+        assert_eq!(GrammarSource::Waited.as_str(), "waited");
+        assert_eq!(GrammarSource::Deferred.as_str(), "deferred");
+    }
+
+    #[test]
+    fn bypass_outcome_never_carries_a_pending_correction() {
+        // Snippet expansions and short utterances take this constructor.
+        // A pending correction here would let the LLM reword user-authored
+        // snippet text after the fact.
+        let outcome = GrammarOutcome::bypass("grill me".to_string());
+        assert_eq!(outcome.text, "grill me");
+        assert_eq!(outcome.source, GrammarSource::Bypass);
+        assert!(outcome.pending.is_none());
+    }
+
+    #[test]
+    fn word_sequence_drops_case_and_punctuation_but_keeps_apostrophes() {
+        assert_eq!(
+            word_sequence("Hello, there!"),
+            vec!["hello".to_string(), "there".to_string()]
+        );
+        assert_eq!(word_sequence("hello there"), word_sequence("Hello, there."));
+        // Contractions are one word, not two — otherwise "dont" vs "don't"
+        // would read as a word-level change and trigger a pointless patch.
+        assert_eq!(
+            word_sequence("I don't"),
+            vec!["i".to_string(), "don't".to_string()]
+        );
+    }
+
+    #[test]
+    fn patch_skips_case_only_and_punctuation_only_corrections() {
+        // 9.2% of real corrections are case-only and 34.2% are
+        // punctuation-or-case-only. None of those are worth taking the
+        // user's text back for.
+        assert!(!patch_is_worth_applying("same text", "same text"));
+        assert!(!patch_is_worth_applying(
+            "which is incredible.",
+            "Which is incredible."
+        ));
+        assert!(!patch_is_worth_applying(
+            "hello there how are you",
+            "Hello there, how are you?"
+        ));
+    }
+
+    #[test]
+    fn patch_applies_when_words_actually_change() {
+        // Word-level edits are the 56.6% majority and the only ones that
+        // justify an undo + repaste.
+        assert!(patch_is_worth_applying(
+            "like I'm a cat who learned",
+            "I'm a cat who learned"
+        ));
+        assert!(patch_is_worth_applying(
+            "does it record just me speaking",
+            "does it record only my speech"
+        ));
+    }
+
+    #[test]
+    fn grammar_is_bypassed_without_an_available_postprocessor() {
+        // The local STT backend deliberately never runs the LLM
+        // (`postprocess_available` requires the Groq backend), so the
+        // paste path must return the acoustic text with nothing pending —
+        // no spawn, no wait, no patch.
+        let cfg = AlwaysConfig::default();
+        assert!(!cfg.postprocess_available());
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let req = crate::always::correction_request::build("hello there friend", false);
+        let acoustic = req.acoustic_text.clone();
+        let outcome = apply_grammar_nonblocking(req, &cfg, rt.handle());
+        assert_eq!(outcome.text, acoustic);
+        assert_eq!(outcome.source, GrammarSource::Bypass);
+        assert!(outcome.pending.is_none());
     }
 }

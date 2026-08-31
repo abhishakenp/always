@@ -304,6 +304,34 @@ pub struct PostprocessConfig {
     pub learning_history_limit: usize,
     pub grammar_correction_enabled: bool,
     pub cache_ttl_seconds: u64,
+    /// How long the paste is allowed to wait for the grammar LLM, in ms.
+    ///
+    /// **0 = the user never waits.** The paste path probes the correction
+    /// cache (microseconds) and, on a miss, pastes the acoustically
+    /// corrected text immediately while the LLM finishes in the
+    /// background. Historically this was an 8 000 ms blocking call whose
+    /// measured cost was p50 1 061 ms / p90 2 464 ms / max 7 783 ms of
+    /// dead time before a single character appeared.
+    ///
+    /// A non-zero value buys back corrections at the cost of that much
+    /// user-visible latency. Override with `ALWAYS_GRAMMAR_WAIT_MS`.
+    pub grammar_wait_ms: u64,
+    /// Opt-in: when the LLM misses the wait budget, patch the
+    /// already-pasted text in place (undo + repaste) once it returns.
+    ///
+    /// **Default off, and deliberately so.** The undo-repaste path was
+    /// retired in `34bb5d1` because it produced a DOUBLE transcript
+    /// whenever the undo failed to land — the user pressed Return first,
+    /// or the app has non-standard undo (Slack, terminals, web
+    /// contenteditable), or focus shifted. `dictation.rs` states the
+    /// resulting invariant outright: "Forward-only by design: text
+    /// already pasted is never retro-edited."
+    ///
+    /// The implementation here fixes every guard hole found in the
+    /// retired code (see `spawn_grammar_patch`), but the undo semantics
+    /// of third-party apps remain outside our control, so enabling this
+    /// is a user decision. Override with `ALWAYS_GRAMMAR_PATCH=1`.
+    pub grammar_patch_after_paste: bool,
 }
 
 impl Default for PostprocessConfig {
@@ -327,6 +355,9 @@ impl Default for PostprocessConfig {
             // surface to iterate on when transcripts are wrong.
             grammar_correction_enabled: true,
             cache_ttl_seconds: 300,
+            // The LLM is never on the user's critical path by default.
+            grammar_wait_ms: 0,
+            grammar_patch_after_paste: false,
         }
     }
 }
@@ -690,7 +721,27 @@ fn load_postprocess_config() -> PostprocessConfig {
     {
         cfg.cache_ttl_seconds = parsed;
     }
+    if let Ok(wait) = std::env::var("ALWAYS_GRAMMAR_WAIT_MS")
+        && let Ok(parsed) = wait.parse()
+    {
+        cfg.grammar_wait_ms = parsed;
+    }
+    if let Ok(patch) = std::env::var("ALWAYS_GRAMMAR_PATCH")
+        && let Ok(parsed) = parse_bool_flag(&patch)
+    {
+        cfg.grammar_patch_after_paste = parsed;
+    }
     cfg
+}
+
+/// Accept `1`/`0` as well as `true`/`false` for boolean env flags — the
+/// rest of the daemon's env surface is documented with `=1`.
+fn parse_bool_flag(raw: &str) -> Result<bool, std::str::ParseBoolError> {
+    match raw.trim() {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        other => other.to_ascii_lowercase().parse(),
+    }
 }
 
 fn default_vocab_patterns() -> Vec<String> {
@@ -928,7 +979,7 @@ fn select_groq_key(
 
 #[cfg(test)]
 mod groq_key_tests {
-    use super::{GroqKeySource, select_groq_key};
+    use super::{GroqKeySource, PostprocessConfig, parse_bool_flag, select_groq_key};
 
     #[test]
     fn saved_groq_key_wins_over_stale_environment() {
@@ -958,5 +1009,26 @@ mod groq_key_tests {
             selected,
             Some((GroqKeySource::Environment, "env-key".to_string()))
         );
+    }
+    /// Env flags across the daemon are documented as `=1`, but `true`
+    /// must keep working — `ALWAYS_GRAMMAR_CORRECTION` has always used it.
+    #[test]
+    fn bool_env_flags_accept_both_spellings() {
+        assert_eq!(parse_bool_flag("1"), Ok(true));
+        assert_eq!(parse_bool_flag("0"), Ok(false));
+        assert_eq!(parse_bool_flag("true"), Ok(true));
+        assert_eq!(parse_bool_flag("TRUE"), Ok(true));
+        assert_eq!(parse_bool_flag(" false "), Ok(false));
+        assert!(parse_bool_flag("yes").is_err());
+    }
+
+    /// The LLM is off the critical path unless the user explicitly opts
+    /// back in. A non-zero default here would silently reintroduce the
+    /// p50 1 061 ms pre-paste stall this design removed.
+    #[test]
+    fn grammar_defaults_keep_the_llm_off_the_critical_path() {
+        let cfg = PostprocessConfig::default();
+        assert_eq!(cfg.grammar_wait_ms, 0);
+        assert!(!cfg.grammar_patch_after_paste);
     }
 }
