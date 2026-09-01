@@ -5,6 +5,7 @@ pub mod auto_enter_countdown;
 pub mod chunker;
 pub mod clipboard_watcher;
 pub mod config;
+pub mod consume_merge;
 pub mod correction;
 pub mod correction_queue;
 pub mod correction_request;
