@@ -66,8 +66,11 @@ kill_daemons || true
 sleep 1
 
 # Step 2: Build Rust CLI binary
+# `local-stt` is explicit here as well as in Cargo.toml's default set:
+# without it the daemon cannot honour a `local:<model>` backend choice
+# and silently degrades to Groq. Belt and braces on purpose.
 print_step "Building Always CLI binary (Rust)..."
-if cargo build --release; then
+if cargo build --release --features local-stt; then
     print_success "CLI binary built successfully"
 else
     print_error "Failed to build CLI binary"
