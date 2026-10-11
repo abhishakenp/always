@@ -159,14 +159,6 @@ fn speaker_gate_allows_stt(requested: bool, speaker_verified: bool) -> bool {
     !requested || speaker_verified
 }
 
-fn speaker_gate_should_reject_unavailable(
-    requested: bool,
-    ready: bool,
-    voiced_samples: usize,
-) -> bool {
-    SPEAKER_GATE_ENFORCE_DROP && requested && !ready && voiced_samples >= SPEAKER_GATE_EARLY_SAMPLES
-}
-
 fn speaker_gate_ctx(cfg: &AlwaysConfig) -> SpeakerGateContext {
     if !cfg.speaker_gate_enabled {
         return SpeakerGateContext {
@@ -275,6 +267,22 @@ fn best_voiceprint_match(
 /// fires: 2 s of actual voice gives the embedding enough evidence
 /// while still cutting a movie scene off ~2 s in.
 const SPEAKER_GATE_EARLY_SAMPLES: usize = 32_000;
+
+/// Consecutive failing unverified checks required before the early gate
+/// drops an utterance. 4 × 0.25 s cadence ≈ 1 s of CONTINUOUSLY
+/// non-user audio. One polluted window (a YouTube exclamation on top of
+/// the user's speech) is nowhere near enough — the old single-window
+/// drop destroyed the user's own utterance mid-sentence under exactly
+/// that noise. Any passing window verifies the user instead, so a
+/// streak only builds when NOTHING has ever matched.
+const SPEAKER_GATE_REJECT_STREAK: usize = 4;
+
+/// How long `StreamSession::finish` waits for SFSpeechRecognizer to
+/// report its final result after end-of-utterance. The recognizer has
+/// been consuming audio since speech onset, so finalization is usually
+/// near-instant; 1.5s is a generous ceiling after which the best
+/// partial is used instead of re-transcribing from scratch.
+const APPLE_STREAM_FINISH_MS: u32 = 1500;
 
 /// Speaker-aware end-of-utterance. Generic VAD keeps the utterance open
 /// as long as ANY speech-like audio continues — background media held
@@ -807,9 +815,19 @@ fn record_with_local_vad(
     // `speaker_checked == true` below always means "checked and passed
     // (or unverifiable → fail-open)".
     let speaker_gate_ctx = speaker_gate_ctx(cfg);
-    let speaker_gate_requested = speaker_gate_ctx.requested;
+    // Mutable: when the gate is requested but the embedding engine is
+    // unavailable, the utterance degrades to ungated (fail-open) instead of
+    // dropping every spoken word — a verification outage must never make
+    // the app deaf to its own user.
+    let mut speaker_gate_requested = speaker_gate_ctx.requested;
     let speaker_gate = speaker_gate_ctx.gate;
     let mut speaker_checked = false;
+    // Consecutive failing unverified trailing-window checks. The
+    // decisive drop requires a SUSTAINED mismatch (see
+    // SPEAKER_GATE_REJECT_STREAK), not one noisy window — a single
+    // media-polluted window at the 2s mark used to destroy utterances
+    // whose other windows passed.
+    let mut gate_fail_streak = 0usize;
     // Actual voiced audio accumulated (excludes pre-buffer and the
     // trailing-silence frames that also land in `speech_samples`) —
     // the embedding needs real voice, not padded silence.
@@ -838,6 +856,17 @@ fn record_with_local_vad(
     // tail cut truncates here so foreign trailing audio (movie line
     // after the user's last word) is never sent to STT.
     let mut confirmed_user_len = 0usize;
+    // Live streaming recognition session (Apple backend only). Created at
+    // speech onset, fed every frame; partials broadcast as interim
+    // transcripts and the final result replaces the end-of-utterance WAV
+    // round trip. `None` on other backends or when the engine is
+    // unavailable — everything below degrades to the existing paths.
+    let mut stream_session: Option<crate::always::apple_stt::StreamSession> = None;
+    let stream_session_lang = if cfg.lang == "auto" || cfg.lang.is_empty() {
+        None
+    } else {
+        Some(cfg.lang.as_str())
+    };
 
     loop {
         // A queued "My Voice" enrollment recording needs the mic and the
@@ -1074,6 +1103,24 @@ fn record_with_local_vad(
             consecutive_silence = 0;
             if consecutive_speech >= min_speech_frames {
                 in_speech = true;
+                // Start live recognition the moment speech is confirmed —
+                // partials flowing early is the whole point. Only the Apple
+                // backend has a streaming engine wired up.
+                if stream_session.is_none()
+                    && matches!(
+                        cfg.transcriber_backend,
+                        crate::stt_dispatch::TranscriberBackendChoice::Apple
+                    )
+                    && crate::always::apple_stt::check_availability()
+                {
+                    stream_session = crate::always::apple_stt::StreamSession::start(
+                        stream_session_lang,
+                        &crate::always::stt_apple::context_phrases(),
+                    );
+                    if stream_session.is_none() {
+                        tracing::debug!("apple_stream_session_unavailable");
+                    }
+                }
                 if !voice_logged {
                     // Fast energy check for very low thresholds to minimize latency
                     let passes_energy_check = if use_fast_energy_check {
@@ -1152,6 +1199,18 @@ fn record_with_local_vad(
                 speech_samples.extend_from_slice(samples);
                 voiced_since_flush = true;
                 voiced_samples += samples.len();
+                // Live recognition: feed the frame and broadcast any new
+                // partial. Interim text stays hidden until the speaker is
+                // verified — a stranger's words must never reach the
+                // overlay even as a preview.
+                if let Some(session) = stream_session.as_mut() {
+                    session.feed(samples);
+                    if speaker_checked
+                        && let Some(partial) = session.poll_partial()
+                    {
+                        event::global_broadcaster().transcription_interim(partial);
+                    }
+                }
                 // Same anchor refresh for the case where we were already in
                 // speech (consecutive_speech overflows min_speech_frames
                 // immediately) — keep the watchdog clock pinned to "right
@@ -1159,18 +1218,15 @@ fn record_with_local_vad(
                 pause::mark_voice_seen();
 
                 // A requested gate with an unavailable embedding engine
-                // cannot verify anyone. Wait for a bounded amount of real
-                // voiced audio so capture does not spin, then reject before
-                // speculation or chunk transcription can spend STT on it.
-                if speaker_gate_should_reject_unavailable(
-                    speaker_gate_requested,
-                    speaker_gate.is_some(),
-                    voiced_samples,
-                ) {
-                    tracing::warn!(voiced_samples, "speaker_gate_unavailable_early_reject");
-                    event::global_broadcaster().voice_activity_ended();
-                    flip_to_listening!();
-                    return Ok(RecordResult::DroppedSpeaker { score: -1.0 });
+                // cannot verify anyone. Fail OPEN after a bounded amount of
+                // voiced audio: degrade this utterance to ungated and keep
+                // listening. Dropping here made the app deaf to its own
+                // user whenever the embedder was down — the exact opposite
+                // of "only me".
+                if speaker_gate_requested && speaker_gate.is_none() && voiced_samples >= SPEAKER_GATE_EARLY_SAMPLES
+                {
+                    tracing::warn!(voiced_samples, "speaker_gate_unavailable_fail_open");
+                    speaker_gate_requested = false;
                 }
 
                 // "My Voice" ladder: one check per 0.25s of NEW voiced
@@ -1182,10 +1238,12 @@ fn record_with_local_vad(
                 // threshold verifies the user (as early as ~0.3s of voice
                 // now that MIN_EMBED_SAMPLES is the floor) and only then
                 // raises the listening badge — non-user voices never flash
-                // it. Still unverified at ~2s → decisive
-                // whole-utterance check, ABORT on mismatch — background
+                // it. From ~2s, CONSECUTIVE failing windows build a streak;
+                // at SPEAKER_GATE_REJECT_STREAK (~1s of continuously
+                // not-you audio) the utterance is dropped — background
                 // media dialogue must not hold the recorder hostage for
-                // an entire scene.
+                // an entire scene, but a single noisy window must not
+                // destroy the user's own speech either.
                 //
                 // VERIFIED phase: keep scoring the trailing window. The
                 // generic VAD can never end the utterance while media
@@ -1222,30 +1280,41 @@ fn record_with_local_vad(
                                 tracing::info!("countdown_cancel_on_verified_voice");
                             }
                         } else if voiced_samples >= SPEAKER_GATE_EARLY_SAMPLES {
-                            speaker_checked = true;
-                            let score = speaker_gate_score(gate, &speech_samples);
+                            gate_fail_streak += 1;
+                            // Sustained-mismatch drop: a foreign voice
+                            // (movie dialogue, YouTube) holds the recorder
+                            // hostage — but the cut fires only after
+                            // SPEAKER_GATE_REJECT_STREAK CONSECUTIVE failing
+                            // windows (~1s of continuously not-you audio),
+                            // never on one noisy window. Any earlier pass
+                            // would have verified the user, so reaching here
+                            // means NOTHING has ever matched: this is not
+                            // the user's utterance. One media-polluted
+                            // window at the 2s mark can no longer destroy a
+                            // sentence the user was mid-way through.
                             if SPEAKER_GATE_ENFORCE_DROP
-                                && !speaker_gate_allows_score(score, gate.threshold)
+                                && gate_fail_streak >= SPEAKER_GATE_REJECT_STREAK
                             {
-                                let score = score.unwrap_or(-1.0);
+                                let score = speaker_gate_score(gate, &speech_samples);
                                 tracing::info!(
-                                    score,
+                                    score = ?score,
                                     threshold = gate.threshold,
+                                    streak = gate_fail_streak,
                                     "speaker_gate_early_reject"
                                 );
                                 event::global_broadcaster().voice_activity_ended();
                                 flip_to_listening!();
-                                return Ok(RecordResult::DroppedSpeaker { score });
+                                return Ok(RecordResult::DroppedSpeaker {
+                                    score: score.unwrap_or(-1.0),
+                                });
                             }
-                            // Whole-utterance pass: arm the tail monitor
-                            // and overlay.
-                            confirmed_user_len = speech_samples.len();
-                            tail_fail_streak = 0;
-                            announce_voice_activity!();
-                            if pause::countdown_active() {
-                                pause::countdown_request_cancel();
-                                tracing::info!("countdown_cancel_on_verified_voice");
-                            }
+                            // Not enough consecutive evidence yet — keep
+                            // listening. A later window can still verify
+                            // the user and rescue the utterance.
+                            tracing::debug!(
+                                streak = gate_fail_streak,
+                                "speaker_gate_unverified_mismatch"
+                            );
                         }
                     } else {
                         let tail_threshold = gate.threshold * SPEAKER_TAIL_THRESHOLD_FACTOR;
@@ -1415,6 +1484,7 @@ fn record_with_local_vad(
                     // buffer — rebase to the fresh (empty) one.
                     confirmed_user_len = 0;
                     tail_fail_streak = 0;
+                    gate_fail_streak = 0;
                 }
             }
         } else if in_speech {
@@ -1909,7 +1979,39 @@ fn record_with_local_vad(
         None
     };
 
-    let (result, speculation_used) = match speculation {
+    // Consume the live session BEFORE considering speculation: the
+    // recognizer ran while the user was speaking, so the final text is
+    // typically already available — no speculation wait, no WAV round
+    // trip. This is the path that takes end-of-utterance paste latency
+    // from ~1s down to ~0-300ms. Empty result (no speech recognized)
+    // falls through to the established paths.
+    let streaming_final = match stream_session.take() {
+        Some(session) => {
+            let text = session.finish(APPLE_STREAM_FINISH_MS);
+            match &text {
+                Some(t) => {
+                    tracing::info!(chars = t.chars().count(), "streaming_final_used");
+                }
+                None => {
+                    tracing::info!("streaming_final_empty");
+                }
+            }
+            text.filter(|t| !t.trim().is_empty())
+        }
+        None => None,
+    };
+
+    let (result, speculation_used) = if let Some(text) = streaming_final {
+        event::global_broadcaster().transcribing_stopped();
+        (
+            crate::stt::TranscriptionResult {
+                text,
+                ..Default::default()
+            },
+            true,
+        )
+    } else {
+        match speculation {
         Some(Ok(r)) => {
             event::global_broadcaster().transcribing_stopped();
             (r, true)
@@ -1971,6 +2073,7 @@ fn record_with_local_vad(
                     return Err(err).context("failed to transcribe utterance");
                 }
             }
+        }
         }
     };
     let stt_done_at = std::time::Instant::now();
@@ -2245,8 +2348,7 @@ mod tests {
         chunk_target_secs, early_voice_frame_ok, extended_silence_frames, fast_energy_check,
         fast_normalized_energy, looks_mid_sentence, normal_silence_frames, normalized_energy,
         speaker_gate_allows_score, speaker_gate_allows_stt, speaker_gate_allows_transcription,
-        speaker_gate_dependencies_ready, speaker_gate_should_reject_unavailable,
-        voice_activity_energy_threshold,
+        speaker_gate_dependencies_ready, voice_activity_energy_threshold,
     };
     use crate::always::AlwaysConfig;
 
@@ -2583,22 +2685,6 @@ mod tests {
         assert!(speaker_gate_allows_stt(false, false));
         assert!(speaker_gate_allows_stt(true, true));
         assert!(!speaker_gate_allows_stt(true, false));
-
-        let threshold = super::SPEAKER_GATE_EARLY_SAMPLES;
-        assert!(!speaker_gate_should_reject_unavailable(
-            true,
-            false,
-            threshold - 1
-        ));
-        assert!(speaker_gate_should_reject_unavailable(
-            true, false, threshold
-        ));
-        assert!(!speaker_gate_should_reject_unavailable(
-            false, false, threshold
-        ));
-        assert!(!speaker_gate_should_reject_unavailable(
-            true, true, threshold
-        ));
     }
 
     #[test]
