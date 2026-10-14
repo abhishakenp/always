@@ -56,7 +56,7 @@ impl Transcriber for AppleTranscriber {
         let phrases = context_phrases();
         let result = {
             let _guard = APPLE_STT_MUTEX.lock().unwrap();
-            crate::always::apple_stt::transcribe_wav(
+            crate::always::apple_stt::transcribe_wav_scored(
                 &temp_path,
                 self.language.as_deref(),
                 &phrases,
@@ -66,17 +66,27 @@ impl Transcriber for AppleTranscriber {
 
         let _ = std::fs::remove_file(&temp_path);
 
-        let text = result?;
+        let scored = result?;
+        let text = scored.text;
         if text.is_empty() {
             tracing::warn!(language = ?self.language, "Apple STT returned empty text");
         } else {
-            tracing::info!(language = ?self.language, "Apple STT result: {}", text);
+            tracing::info!(
+                language = ?self.language,
+                confidence = scored.confidence.unwrap_or(-1.0),
+                "Apple STT result: {}",
+                text
+            );
         }
         Ok(TranscriptionResult {
             text: text.trim().to_string(),
             duration: 0.0,
             language: self.language.clone().unwrap_or_default(),
             segments: vec![],
+            evidence: crate::stt::RecognitionEvidence {
+                confidence: scored.confidence,
+                ..Default::default()
+            },
         })
     }
 

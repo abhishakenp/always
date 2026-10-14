@@ -50,6 +50,7 @@ fn bench_config() -> AlwaysConfig {
         speaker_gate_threshold: 0.5,
         audible_status_sound: Default::default(),
         localization: Localization::ENGLISH,
+        ..AlwaysConfig::default()
     }
 }
 
@@ -59,6 +60,7 @@ fn empty_transcription(text: &str) -> TranscriptionResult {
         duration: 1.0,
         language: "en".to_string(),
         segments: vec![],
+        ..Default::default()
     }
 }
 
@@ -102,6 +104,40 @@ fn bench_classify(c: &mut Criterion) {
                 black_box(&tr),
                 black_box(now),
                 black_box(in_cd_last),
+            )
+        });
+    });
+
+    // Foreign-speech gate with full Apple evidence present (the local
+    // backend's hot path): accept and reject branches.
+    let mut apple_cfg = bench_config();
+    apple_cfg.transcriber_backend = TranscriberBackendChoice::Apple;
+    let mut english = empty_transcription("Okay, so do all of that, fix everything,");
+    english.evidence.confidence = Some(0.93);
+    english.evidence.live_stream = always::stt::LiveStreamOutcome::Heard;
+    english.evidence.preview_text = Some("okay so do all of that fix everything".into());
+    c.bench_function("classify_foreign_gate_accept", |b| {
+        b.iter(|| {
+            classify_transcription(
+                black_box(&apple_cfg),
+                black_box("Okay, so do all of that, fix everything,"),
+                black_box(&english),
+                black_box(now),
+                black_box(last),
+            )
+        });
+    });
+    let mut nepali = empty_transcription("And a baggy?");
+    nepali.evidence.live_stream = always::stt::LiveStreamOutcome::NoWords;
+    nepali.evidence.preview_text = Some(String::new());
+    c.bench_function("classify_foreign_gate_reject", |b| {
+        b.iter(|| {
+            classify_transcription(
+                black_box(&apple_cfg),
+                black_box("And a baggy?"),
+                black_box(&nepali),
+                black_box(now),
+                black_box(last),
             )
         });
     });
