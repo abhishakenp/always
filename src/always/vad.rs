@@ -96,11 +96,7 @@ fn own_cue_echo_holds(
 
 /// VAD overlay transition seam. Speculation may flip this repeatedly inside
 /// one utterance; the broadcaster owns the separate audible-cue lifetime.
-fn set_transcribing_overlay(
-    active: &mut bool,
-    next: bool,
-    broadcaster: &event::EventBroadcaster,
-) {
+fn set_transcribing_overlay(active: &mut bool, next: bool, broadcaster: &event::EventBroadcaster) {
     if *active == next {
         return;
     }
@@ -1233,15 +1229,15 @@ fn record_with_local_vad(
     // starting a microphone or recognizer in the regression tests.
     macro_rules! flip_to_transcribing {
         () => {{
-            set_transcribing_overlay(
-                &mut transcribing_overlay, true, event::global_broadcaster(),
-            );
+            set_transcribing_overlay(&mut transcribing_overlay, true, event::global_broadcaster());
         }};
     }
     macro_rules! flip_to_listening {
         () => {{
             set_transcribing_overlay(
-                &mut transcribing_overlay, false, event::global_broadcaster(),
+                &mut transcribing_overlay,
+                false,
+                event::global_broadcaster(),
             );
         }};
     }
@@ -1778,8 +1774,8 @@ fn record_with_local_vad(
         // Listening cue is his only proof he was heard (user request
         // 2026-10-15; measured gate-verified announce p50 602 ms, p90
         // 1.3 s, max 5.2 s that day). A rejected verdict retracts it.
-        let instant_announce_ok = !speaker_gate_requested
-            || crate::always::audio::other_output_quiet();
+        let instant_announce_ok =
+            !speaker_gate_requested || crate::always::audio::other_output_quiet();
         if !in_speech && !voice_activity_announced && instant_announce_ok {
             if early_voice_frame_ok(
                 frame_energy,
@@ -3588,7 +3584,10 @@ mod tests {
 
     #[test]
     fn speculative_overlay_resumes_without_repeated_cues_or_stale_results() {
-        use crate::always::{event::{DaemonEvent, EventBroadcaster}, status_sound::{StatusSound, take_test_cues}};
+        use crate::always::{
+            event::{DaemonEvent, EventBroadcaster},
+            status_sound::{StatusSound, take_test_cues},
+        };
         let b = EventBroadcaster::new();
         let mut rx = b.subscribe();
         let slot = super::SpeculationSlot::new();
@@ -3600,10 +3599,13 @@ mod tests {
             let generation = slot.current_generation();
             super::set_transcribing_overlay(&mut overlay, true, &b);
             super::set_transcribing_overlay(&mut overlay, true, &b); // no duplicate flip
-            slot.store_if_current(generation, Ok(crate::stt::TranscriptionResult {
-                text: "English words before the pause".into(),
-                ..Default::default()
-            }));
+            slot.store_if_current(
+                generation,
+                Ok(crate::stt::TranscriptionResult {
+                    text: "English words before the pause".into(),
+                    ..Default::default()
+                }),
+            );
             assert!(slot.peek_ready());
             slot.invalidate(); // speech resumes: old speculation must be discarded
             super::set_transcribing_overlay(&mut overlay, false, &b);
@@ -3613,18 +3615,41 @@ mod tests {
         }
         assert_eq!(take_test_cues(), vec![StatusSound::Listening]);
         let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() { events.push(ev); }
-        assert_eq!(events.iter().filter(|e| matches!(e, DaemonEvent::TranscribingStarted)).count(), 6);
-        assert_eq!(events.iter().filter(|e| matches!(e, DaemonEvent::TranscribingStopped)).count(), 6);
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, DaemonEvent::TranscribingStarted))
+                .count(),
+            6
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, DaemonEvent::TranscribingStopped))
+                .count(),
+            6
+        );
         // The final, current result is still usable after all the resumes.
-        slot.store_if_current(slot.current_generation(), Ok(crate::stt::TranscriptionResult {
-            text: "English words including the resumed ending".into(),
-            ..Default::default()
-        }));
-        assert_eq!(slot.take().unwrap().unwrap().text, "English words including the resumed ending");
+        slot.store_if_current(
+            slot.current_generation(),
+            Ok(crate::stt::TranscriptionResult {
+                text: "English words including the resumed ending".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            slot.take().unwrap().unwrap().text,
+            "English words including the resumed ending"
+        );
         b.utterance_terminal();
         super::set_transcribing_overlay(&mut overlay, true, &b);
-        assert!(take_test_cues().is_empty(), "transcribing is silent by policy");
+        assert!(
+            take_test_cues().is_empty(),
+            "transcribing is silent by policy"
+        );
     }
 
     /// The 2026-10-15 17:50:43-47Z loop, frame by frame (30 ms): after his
@@ -3666,8 +3691,13 @@ mod tests {
         };
         let (old_end, old_cues, old_resumes) = simulate(false);
         let (new_end, new_cues, new_resumes) = simulate(true);
-        eprintln!("old: end={old_end:?} cues={old_cues} resumes={old_resumes}; new: end={new_end:?} cues={new_cues} resumes={new_resumes}");
-        assert_eq!(old_end, None, "without the guard the echo loop never ends the utterance");
+        eprintln!(
+            "old: end={old_end:?} cues={old_cues} resumes={old_resumes}; new: end={new_end:?} cues={new_cues} resumes={new_resumes}"
+        );
+        assert_eq!(
+            old_end, None,
+            "without the guard the echo loop never ends the utterance"
+        );
         assert!(old_cues > 5);
         assert_eq!((new_cues, new_resumes), (1, 0));
         // Held echo frames (9) delay the cut, never more.
@@ -3690,14 +3720,19 @@ mod tests {
         }));
         let writer_slot = slot.clone();
         let writer = std::thread::spawn(move || {
-            writer_slot.store_if_current(old_generation, Ok(crate::stt::TranscriptionResult {
-                text: "discarded tail from old generation".into(),
-                ..Default::default()
-            }));
+            writer_slot.store_if_current(
+                old_generation,
+                Ok(crate::stt::TranscriptionResult {
+                    text: "discarded tail from old generation".into(),
+                    ..Default::default()
+                }),
+            );
         });
         // Stop the real writer after its optimistic generation check, then
         // complete the real cut before allowing that writer to publish.
-        checked_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        checked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let mut samples = vec![11i16; 4];
         samples.extend([22i16; 4]);
         let mut trimmed = false;
@@ -3708,11 +3743,17 @@ mod tests {
         assert!(!slot.peek_ready());
         resume_tx.send(()).unwrap();
         writer.join().unwrap();
-        assert!(slot.take().is_none(), "old writer published after invalidation returned");
-        slot.store_if_current(slot.current_generation(), Ok(crate::stt::TranscriptionResult {
-            text: "retained English words".into(),
-            ..Default::default()
-        }));
+        assert!(
+            slot.take().is_none(),
+            "old writer published after invalidation returned"
+        );
+        slot.store_if_current(
+            slot.current_generation(),
+            Ok(crate::stt::TranscriptionResult {
+                text: "retained English words".into(),
+                ..Default::default()
+            }),
+        );
         assert_eq!(slot.take().unwrap().unwrap().text, "retained English words");
     }
 
@@ -3729,35 +3770,47 @@ mod tests {
             let mut pending = true;
             let mut trimmed = false;
             if ready {
-                slot.store_if_current(old_generation, Ok(crate::stt::TranscriptionResult {
-                    text: "kept English words plus discarded tail".into(),
-                    ..Default::default()
-                }));
+                slot.store_if_current(
+                    old_generation,
+                    Ok(crate::stt::TranscriptionResult {
+                        text: "kept English words plus discarded tail".into(),
+                        ..Default::default()
+                    }),
+                );
             }
-            super::apply_speaker_tail_cut(
-                &mut samples, 10_320, &mut trimmed, &mut pending, &slot,
-            );
+            super::apply_speaker_tail_cut(&mut samples, 10_320, &mut trimmed, &mut pending, &slot);
             let cached_survived = slot.peek_ready();
-            slot.store_if_current(old_generation, Ok(crate::stt::TranscriptionResult {
-                text: "late result from untrimmed audio".into(),
-                ..Default::default()
-            }));
+            slot.store_if_current(
+                old_generation,
+                Ok(crate::stt::TranscriptionResult {
+                    text: "late result from untrimmed audio".into(),
+                    ..Default::default()
+                }),
+            );
             let late_survived = slot.peek_ready();
-            eprintln!("ready={ready} kept={} trimmed={trimmed} pending={pending} cached_survived={cached_survived} late_survived={late_survived}", samples.len());
+            eprintln!(
+                "ready={ready} kept={} trimmed={trimmed} pending={pending} cached_survived={cached_survived} late_survived={late_survived}",
+                samples.len()
+            );
             assert_eq!(samples, vec![11i16; 10_320], "cut boundary unchanged");
             if !(trimmed && !pending && !cached_survived && !late_survived) {
                 invalidation_failures.push(ready);
                 continue;
             }
             assert!(slot.take().is_none());
-            slot.store_if_current(slot.current_generation(), Ok(crate::stt::TranscriptionResult {
-                text: "kept English words".into(),
-                ..Default::default()
-            }));
+            slot.store_if_current(
+                slot.current_generation(),
+                Ok(crate::stt::TranscriptionResult {
+                    text: "kept English words".into(),
+                    ..Default::default()
+                }),
+            );
             assert_eq!(slot.take().unwrap().unwrap().text, "kept English words");
         }
-        assert!(invalidation_failures.is_empty(),
-            "untrimmed stream/speculation survived; ready cases: {invalidation_failures:?}");
+        assert!(
+            invalidation_failures.is_empty(),
+            "untrimmed stream/speculation survived; ready cases: {invalidation_failures:?}"
+        );
     }
 
     static CHUNK_TARGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

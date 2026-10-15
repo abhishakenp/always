@@ -203,10 +203,14 @@ pub struct AlwaysConfig {
     /// know"), a trailing connector ("and", "the", "to"), a trailing comma
     /// or the recogniser's cut-off "...". A complete sentence still ends at
     /// `silence_secs`; this only holds a cut the speaker is plainly not
-    /// done with (`vad.rs::classify_pause_text`). Default 2.5 s: on
-    /// 2026-10-14 the user resumed after a hesitation-ending fragment within
-    /// 1.21, 1.44, 1.63 and 2.43 s (log upper bounds); a 10.4 s gap was a
-    /// new thought and still ends at 2.5 s.
+    /// done with (`vad.rs::classify_pause_text`). Default 1.2 s (was 2.5 s):
+    /// on 2026-10-14 the user resumed after a hesitation-ending fragment
+    /// within 1.21, 1.44, 1.63 and 2.43 s — a cut before those resumes no
+    /// longer sends half a thought, because auto-Enter waits the 3 s commit
+    /// hold for trailing text and the resume merges into the same message.
+    /// 2.5 s made every trailing "…to" / "…or." wait 2.5 s before its text
+    /// appeared (2026-10-15 21:49:31Z, 21:49:46Z: speech_end_to_paste_ms
+    /// 2653 / 2580).
     /// Env `ALWAYS_HESITATION_SILENCE_SECS` (0-10).
     pub hesitation_silence_secs: f64,
     /// "My Voice" speaker-verification gate. Active only when BOTH
@@ -689,7 +693,7 @@ fn resolve_stt_live_preview(prefs: &Preferences) -> bool {
 }
 
 /// Default hesitation hold — see `AlwaysConfig::hesitation_silence_secs`.
-pub const DEFAULT_HESITATION_SILENCE_SECS: f64 = 2.5;
+pub const DEFAULT_HESITATION_SILENCE_SECS: f64 = 1.2;
 
 /// `ALWAYS_HESITATION_SILENCE_SECS` → clamped 0-10 s; unset/invalid → default.
 fn resolve_hesitation_silence_secs(env: Option<&str>) -> f64 {
@@ -980,7 +984,7 @@ mod tests {
             resolve_hesitation_silence_secs(Some("nope")),
             DEFAULT_HESITATION_SILENCE_SECS
         );
-        assert_eq!(AlwaysConfig::default().hesitation_silence_secs, 2.5);
+        assert_eq!(AlwaysConfig::default().hesitation_silence_secs, 1.2);
     }
 
     #[test]

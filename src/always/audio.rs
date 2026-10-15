@@ -1752,11 +1752,15 @@ mod aec_edge_tracking_tests {
         assert!(quiet());
         note("always-capture: aec engaged (cue) tap=7ch@44100");
         assert!(quiet(), "our own cue is not other output");
-        note("always-capture: aec engaged (output pids [\"1252:com.apple.WebKit.GPU\"]) tap=7ch@44100");
+        note(
+            "always-capture: aec engaged (output pids [\"1252:com.apple.WebKit.GPU\"]) tap=7ch@44100",
+        );
         assert!(!quiet());
         note("always-capture: aec gate on: other output pids now [] (bypassed after 2.0s of none)");
         assert!(quiet());
-        note("always-capture: aec gate on: other output pids now [\"88:node\"] (bypassed after 2.0s of none)");
+        note(
+            "always-capture: aec gate on: other output pids now [\"88:node\"] (bypassed after 2.0s of none)",
+        );
         assert!(!quiet());
     }
 }

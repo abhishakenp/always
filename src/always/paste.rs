@@ -271,6 +271,7 @@ fn post_cmd_key(
 ) -> Result<()> {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
 
+    super::pause::note_synthetic_keys();
     let down = CGEvent::new_keyboard_event(source.clone(), keycode, true)
         .map_err(|_| anyhow::anyhow!("Failed to create key down event"))?;
     down.set_flags(CGEventFlags::CGEventFlagCommand);
@@ -335,6 +336,7 @@ pub fn paste_text(auto_enter: bool) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))?;
 
     // Simulate Cmd+V
+    super::pause::note_synthetic_keys();
     let v_keycode: CGKeyCode = 9; // 'v' key
     let key_down = CGEvent::new_keyboard_event(source.clone(), v_keycode, true)
         .map_err(|_| anyhow::anyhow!("Failed to create key down event"))?;
@@ -573,6 +575,7 @@ pub fn press_return() -> Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))?;
     let enter_keycode: CGKeyCode = 36;
+    super::pause::note_synthetic_keys();
     let enter_down = CGEvent::new_keyboard_event(source.clone(), enter_keycode, true)
         .map_err(|_| anyhow::anyhow!("Failed to create enter key down event"))?;
     enter_down.set_flags(CGEventFlags::empty());

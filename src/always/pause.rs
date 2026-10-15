@@ -589,6 +589,30 @@ pub fn countdown_remaining_ms() -> u32 {
 static COUNTDOWN_DEFER_UNTIL: std::sync::LazyLock<Mutex<Option<std::time::Instant>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
+/// Until when key events seen by the keyboard tap are our OWN synthetic
+/// Cmd+V / Cmd+Z / Return (see `paste.rs`). The tap sees posted events
+/// like real ones, ~ms after they are posted — after the auto-enter
+/// countdown was scheduled — and treated the paste's own Cmd+V as "the
+/// user typed": it cancelled every countdown ~100 ms in and cleared the
+/// buffer, so auto-Enter never fired (2026-10-15 21:49:20-46Z, 0.1.0).
+static SYNTHETIC_KEYS_UNTIL: std::sync::LazyLock<Mutex<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// How long after posting synthetic keys their tap echoes are ignored.
+pub const SYNTHETIC_KEYS_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Called right before Always posts synthetic key events.
+pub fn note_synthetic_keys() {
+    *SYNTHETIC_KEYS_UNTIL.lock() = Some(std::time::Instant::now() + SYNTHETIC_KEYS_WINDOW);
+}
+
+/// True while a key event may be the tap echo of our own synthetic keys.
+pub fn in_synthetic_keys_window() -> bool {
+    SYNTHETIC_KEYS_UNTIL
+        .lock()
+        .is_some_and(|until| std::time::Instant::now() < until)
+}
+
 /// How long one voiced frame keeps the countdown frozen.
 pub const COUNTDOWN_VOICE_DEFER: std::time::Duration = std::time::Duration::from_millis(300);
 

@@ -788,6 +788,11 @@ pub fn start_keyboard_listener() -> Result<()> {
                     if matches!(key, Key::Function) {
                         return;
                     }
+                    // Our own Cmd+V / Cmd+Z / Return echo back through this
+                    // tap: never treat them as the user taking over.
+                    if is_own_synthetic_key(key, pause::in_synthetic_keys_window()) {
+                        return;
+                    }
                     // Any user keystroke ends "right after a paste".
                     crate::always::voice_edit::note_user_input();
                     let Some(name) = key_to_shortcut_name(key) else {
@@ -1322,5 +1327,41 @@ mod tests {
         for own in crate::always::per_app::ALWAYS_OWN_BUNDLE_IDS {
             assert_eq!(pause_chord_action(Some(own)), ChordAction::NoFocusedApp);
         }
+    }
+}
+
+/// A key the daemon itself posts (`paste.rs`: Cmd+V, Cmd+Z, Return) seen
+/// inside the window right after posting it.
+fn is_own_synthetic_key(key: &rdev::Key, in_window: bool) -> bool {
+    use rdev::Key;
+    in_window && matches!(key, Key::KeyV | Key::KeyZ | Key::Return)
+}
+
+#[cfg(test)]
+mod synthetic_key_tests {
+    use super::is_own_synthetic_key;
+    use rdev::Key;
+
+    /// 2026-10-15 21:49:20.389Z: countdown started, then the tap echo of
+    /// the paste's own Cmd+V cancelled it at the first tick (.491Z).
+    #[test]
+    fn own_paste_keys_do_not_cancel_the_countdown() {
+        for k in [Key::KeyV, Key::KeyZ, Key::Return] {
+            assert!(is_own_synthetic_key(&k, true), "{k:?}");
+            assert!(!is_own_synthetic_key(&k, false), "{k:?}");
+        }
+        // Real typing right after a paste still cancels.
+        assert!(!is_own_synthetic_key(&Key::KeyA, true));
+        assert!(!is_own_synthetic_key(&Key::Space, true));
+    }
+
+    #[test]
+    fn window_opens_on_post_and_closes() {
+        crate::always::pause::note_synthetic_keys();
+        assert!(crate::always::pause::in_synthetic_keys_window());
+        std::thread::sleep(
+            crate::always::pause::SYNTHETIC_KEYS_WINDOW + std::time::Duration::from_millis(20),
+        );
+        assert!(!crate::always::pause::in_synthetic_keys_window());
     }
 }

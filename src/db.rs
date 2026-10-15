@@ -387,7 +387,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             .prepare(&format!("SELECT {column} FROM preferences LIMIT 0"))
             .is_err()
         {
-            conn.execute_batch(&format!("ALTER TABLE preferences ADD COLUMN {column} TEXT;"))?;
+            conn.execute_batch(&format!(
+                "ALTER TABLE preferences ADD COLUMN {column} TEXT;"
+            ))?;
         }
     }
 
@@ -650,7 +652,9 @@ pub fn set_preference(conn: &Connection, key: &str, value: &str) -> Result<()> {
         }
         "listen_cue" | "fail_cue" => {
             if !value.is_empty() && !std::path::Path::new(value).is_file() {
-                anyhow::bail!("{key} must be an existing audio file path (or empty for the built-in cue)");
+                anyhow::bail!(
+                    "{key} must be an existing audio file path (or empty for the built-in cue)"
+                );
             }
         }
         "per_app_settings_json" => {
