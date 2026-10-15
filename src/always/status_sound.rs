@@ -18,8 +18,9 @@
 //! the audio/event paths never block on audio APIs.
 
 use std::str::FromStr;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use std::sync::mpsc;
 
 static AUDIBLE_STATUS_SOUND: AtomicU8 = AtomicU8::new(StatusSoundSetting::Off as u8);
@@ -168,9 +169,30 @@ pub(crate) fn take_test_cues() -> Vec<StatusSound> {
     TEST_CUES.with(|cues| std::mem::take(&mut *cues.borrow_mut()))
 }
 
-/// Play `sound` if cues are enabled. Never blocks: the request is posted
-/// to the playback worker.
+/// Utterance cue policy (user request 2026-10-15: "I hear the sound like
+/// 5 times when I speak once"). One utterance = ONE audible cue, the
+/// Listening cue at his first word — his only proof he was heard when he
+/// is not looking at the screen. A distinct Failure cue plays only when
+/// the words were really lost (STT error). Transcribing / Success / Cancel
+/// / Command stay silent here: the overlay and menu-bar icon carry those
+/// states. Explicit client requests go through [`cue_requested`].
+pub fn audible_in_utterance(sound: StatusSound) -> bool {
+    matches!(sound, StatusSound::Listening | StatusSound::Failure)
+}
+
+/// Play `sound` from the daemon's own utterance state machine, subject to
+/// [`audible_in_utterance`]. Never blocks.
 pub fn cue(sound: StatusSound) {
+    if !audible_in_utterance(sound) {
+        return;
+    }
+    cue_requested(sound);
+}
+
+/// Play `sound` if cues are enabled, regardless of the utterance policy
+/// (UDS `PlayStatusCue`: a client asked for this cue explicitly). Never
+/// blocks: the request is posted to the playback worker.
+pub fn cue_requested(sound: StatusSound) {
     // Unit tests never make a sound: a test that briefly enables cues
     // (`can_set_runtime_setting`) must not let a concurrent test's event
     // broadcast play through the speakers.
@@ -183,7 +205,97 @@ pub fn cue(sound: StatusSound) {
     if !setting.is_enabled() {
         return;
     }
+    // Mark the window in which the mic may hear this cue BEFORE it is
+    // posted, so the VAD never counts our own sound as the user resuming.
+    mark_echo_window(cue_duration(sound));
     post(Msg::Play(sound, setting, std::time::Instant::now()));
+}
+
+// ---- custom cue files (`listenCue` / `failCue`) ---------------------------
+
+static CUSTOM_CUES: Mutex<[Option<std::path::PathBuf>; 2]> = Mutex::new([None, None]);
+
+fn custom_slot(sound: StatusSound) -> Option<usize> {
+    match sound {
+        StatusSound::Listening => Some(0),
+        StatusSound::Failure => Some(1),
+        _ => None,
+    }
+}
+
+/// Use the user's own audio files for the Listening / Failure cues
+/// (`None`/empty = built-in). Played as-is through the same echo-cancelled
+/// route; never bundled with the app.
+pub fn set_custom_cues(listen: Option<&str>, fail: Option<&str>) {
+    let pick = |p: Option<&str>| p.filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+    let mut cues = CUSTOM_CUES.lock().unwrap_or_else(|p| p.into_inner());
+    *cues = [pick(listen), pick(fail)];
+    tracing::info!(listen = ?cues[0], fail = ?cues[1], "status_sound_custom_cues");
+}
+
+fn custom_cue(sound: StatusSound) -> Option<std::path::PathBuf> {
+    let slot = custom_slot(sound)?;
+    let cues = CUSTOM_CUES.lock().unwrap_or_else(|p| p.into_inner());
+    cues[slot].clone().filter(|p| p.is_file())
+}
+
+// ---- own-cue echo window ----------------------------------------------------
+
+/// Room echo + output/input latency after a cue ends. The 2026-10-15 log
+/// shows the VAD reporting "speech resumed" 200-300 ms after each cue
+/// started (`speech_resumed_after_pause` right after `cue_played`).
+const ECHO_TAIL: Duration = Duration::from_millis(250);
+/// A custom cue's length is unknown without decoding it: assume this.
+const CUSTOM_CUE_ASSUMED: Duration = Duration::from_millis(600);
+
+fn echo_clock() -> &'static Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now)
+}
+
+static ECHO_UNTIL_US: AtomicU64 = AtomicU64::new(0);
+
+/// Our own cue may be audible in the mic until `now + len + ECHO_TAIL`.
+pub(crate) fn mark_echo_window(len: Duration) {
+    let until = (echo_clock().elapsed() + len + ECHO_TAIL).as_micros() as u64;
+    ECHO_UNTIL_US.fetch_max(until, Ordering::Relaxed);
+}
+
+/// True while a cue we played may still be reaching the microphone.
+pub fn echo_window_active() -> bool {
+    (echo_clock().elapsed().as_micros() as u64) < ECHO_UNTIL_US.load(Ordering::Relaxed)
+}
+
+fn cue_duration(sound: StatusSound) -> Duration {
+    if custom_cue(sound).is_some() {
+        return CUSTOM_CUE_ASSUMED;
+    }
+    aiff_duration(sound_bytes(sound)).unwrap_or(CUSTOM_CUE_ASSUMED)
+}
+
+/// Duration of an AIFF from its COMM chunk (frames / 80-bit sample rate).
+pub fn aiff_duration(aiff: &[u8]) -> Option<Duration> {
+    if aiff.len() < 12 || &aiff[0..4] != b"FORM" || &aiff[8..12] != b"AIFF" {
+        return None;
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= aiff.len() {
+        let size = u32::from_be_bytes(aiff[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let body = pos + 8;
+        if &aiff[pos..pos + 4] == b"COMM" && size >= 18 && body + 18 <= aiff.len() {
+            let frames = u32::from_be_bytes(aiff[body + 2..body + 6].try_into().ok()?) as f64;
+            let ext = &aiff[body + 8..body + 18];
+            let exp = (u16::from_be_bytes([ext[0], ext[1]]) & 0x7fff) as i32 - 16383;
+            let mant = u64::from_be_bytes(ext[2..10].try_into().ok()?) as f64;
+            let rate = mant * 2f64.powi(exp - 63);
+            if rate <= 0.0 {
+                return None;
+            }
+            return Some(Duration::from_secs_f64(frames / rate));
+        }
+        pos = body.checked_add(size)? + (size & 1);
+    }
+    None
 }
 
 /// File name of the cue inside `resources/sounds/halo/`.
@@ -286,6 +398,9 @@ fn dry_run() -> bool {
 /// Gained AIFF for `sound` at `setting`, written once per process to the
 /// cache dir (the capture helper plays files, not bytes).
 fn cue_file(sound: StatusSound, setting: StatusSoundSetting) -> Option<std::path::PathBuf> {
+    if let Some(custom) = custom_cue(sound) {
+        return Some(custom);
+    }
     let dir = std::env::temp_dir()
         .join(format!("always-cues-{}", std::process::id()))
         .join(setting.as_str());
@@ -490,6 +605,54 @@ mod tests {
     /// The setting is process-global; tests that flip it must not
     /// interleave (they raced before this lock existed).
     static SETTING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn one_audible_cue_per_utterance_policy() {
+        take_test_cues();
+        for sound in StatusSound::ALL {
+            cue(sound);
+        }
+        assert_eq!(take_test_cues(), vec![StatusSound::Listening, StatusSound::Failure]);
+        // An explicit client request still plays any cue.
+        cue_requested(StatusSound::Command);
+        assert_eq!(take_test_cues(), vec![StatusSound::Command]);
+    }
+
+    #[test]
+    fn aiff_duration_matches_afinfo() {
+        // afinfo resources/sounds/halo/stop.aiff: 0.474146 s; start.aiff 0.520833 s.
+        let stop = aiff_duration(sound_bytes(StatusSound::Transcribing)).unwrap();
+        let start = aiff_duration(sound_bytes(StatusSound::Listening)).unwrap();
+        assert!((stop.as_secs_f64() - 0.474146).abs() < 0.001, "{stop:?}");
+        assert!((start.as_secs_f64() - 0.520833).abs() < 0.001, "{start:?}");
+        assert!(aiff_duration(b"not an aiff").is_none());
+    }
+
+    #[test]
+    fn echo_window_opens_and_expires() {
+        mark_echo_window(Duration::from_millis(0));
+        assert!(echo_window_active(), "ECHO_TAIL keeps it open right after");
+        std::thread::sleep(ECHO_TAIL + Duration::from_millis(30));
+        assert!(!echo_window_active());
+    }
+
+    #[test]
+    fn custom_cue_file_replaces_listening_only_when_present() {
+        let dir = std::env::temp_dir().join(format!("always-custom-cue-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("crinkle.wav");
+        std::fs::write(&file, b"RIFF").unwrap();
+        set_custom_cues(Some(file.to_str().unwrap()), Some(""));
+        assert_eq!(custom_cue(StatusSound::Listening), Some(file.clone()));
+        assert_eq!(custom_cue(StatusSound::Failure), None);
+        assert_eq!(custom_cue(StatusSound::Transcribing), None);
+        assert_eq!(cue_file(StatusSound::Listening, StatusSoundSetting::High), Some(file.clone()));
+        assert_eq!(cue_duration(StatusSound::Listening), CUSTOM_CUE_ASSUMED);
+        std::fs::remove_file(&file).unwrap();
+        // A deleted file falls back to the built-in cue, never silence.
+        assert_eq!(custom_cue(StatusSound::Listening), None);
+        set_custom_cues(None, None);
+    }
 
     #[test]
     fn defaults_disabled() {

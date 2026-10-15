@@ -389,6 +389,8 @@ mod tests {
             localization: Localization::ENGLISH,
             transcript_stream_enabled: false,
             audible_status_sound: crate::always::status_sound::StatusSoundSetting::default(),
+            listen_cue: None,
+            fail_cue: None,
             stt_live_preview: true,
             foreign_speech_confidence_enforce: false,
             mic_conflict_exclusion_bundles: Vec::new(),

@@ -659,6 +659,12 @@ pub enum DaemonCommand {
         /// Optional so payloads from older GUI builds still decode.
         #[serde(default)]
         stt_live_preview: Option<bool>,
+        /// `listenCue` file path; `Some("")` restores the built-in cue.
+        #[serde(default)]
+        listen_cue: Option<String>,
+        /// `failCue` file path; `Some("")` restores the built-in cue.
+        #[serde(default)]
+        fail_cue: Option<String>,
     },
     /// Approve a pending correction in the queue and apply it to the
     /// glossary. The daemon emits `CorrectionLogged` on success.
@@ -1428,7 +1434,9 @@ mod tests {
         assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscribingStarted)).count(), 12);
         assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscribingStopped)).count(), 6);
         assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscriptChunk { .. })).count(), 6);
-        assert_eq!(transcribing, 1);
+        // One utterance = one audible cue (Listening); Transcribing is
+        // silent by policy (user report 2026-10-15: "5 times").
+        assert_eq!(transcribing, 0);
         assert_eq!(cues.iter().filter(|&&cue| cue == StatusSound::Listening).count(), 1);
     }
 

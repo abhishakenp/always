@@ -95,6 +95,11 @@ pub struct Preferences {
     /// while the cut is tuned on real data. The "live recognizer heard no
     /// words" rule is always enforced.
     pub foreign_speech_confidence_enforce: Option<bool>,
+    /// User-chosen audio file for the one-per-utterance Listening cue
+    /// (`listenCue`). Played as-is, never bundled. Empty/unset = built-in.
+    pub listen_cue: Option<String>,
+    /// User-chosen audio file for the Failure cue (`failCue`).
+    pub fail_cue: Option<String>,
 }
 
 pub fn open() -> Result<Connection> {
@@ -377,6 +382,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    for column in ["listen_cue", "fail_cue"] {
+        if conn
+            .prepare(&format!("SELECT {column} FROM preferences LIMIT 0"))
+            .is_err()
+        {
+            conn.execute_batch(&format!("ALTER TABLE preferences ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+
     let has_mic_conflict_exclusion_bundles = conn
         .prepare("SELECT mic_conflict_exclusion_bundles FROM preferences LIMIT 0")
         .is_ok();
@@ -417,7 +431,7 @@ fn encode_plaintext_groq_key(conn: &Connection) -> Result<()> {
 
 pub fn get_preferences(conn: &Connection) -> Result<Preferences> {
     let mut stmt = conn.prepare(
-        "SELECT lang, stt_threshold, stt_energy_threshold, stt_cooldown_ms, always_log_path, hear_energy_threshold, stt_silence, stt_trim_silence, stt_auto_enter, deepgram_api_key, groq_api_key, deepgram_model, silero_threshold, shortcut_pause, shortcut_auto_enter, shortcut_force_paste, postprocess_enabled, shortcut_log_correction, passive_correction_capture, auto_enter_delay_ms, idle_pause_secs, shortcut_correction_dialog, per_app_settings_json, transcriber_backend, shortcut_master_pause, transcript_stream, stt_adaptive_silence, speaker_gate_enabled, speaker_gate_threshold, audible_status_sound, stt_live_preview, auto_learn_corrections, correction_model, postprocess_provider, mic_conflict_exclusion_bundles, postprocess_mode, capture_aec, foreign_speech_confidence_enforce FROM preferences WHERE id = 1",
+        "SELECT lang, stt_threshold, stt_energy_threshold, stt_cooldown_ms, always_log_path, hear_energy_threshold, stt_silence, stt_trim_silence, stt_auto_enter, deepgram_api_key, groq_api_key, deepgram_model, silero_threshold, shortcut_pause, shortcut_auto_enter, shortcut_force_paste, postprocess_enabled, shortcut_log_correction, passive_correction_capture, auto_enter_delay_ms, idle_pause_secs, shortcut_correction_dialog, per_app_settings_json, transcriber_backend, shortcut_master_pause, transcript_stream, stt_adaptive_silence, speaker_gate_enabled, speaker_gate_threshold, audible_status_sound, stt_live_preview, auto_learn_corrections, correction_model, postprocess_provider, mic_conflict_exclusion_bundles, postprocess_mode, capture_aec, foreign_speech_confidence_enforce, listen_cue, fail_cue FROM preferences WHERE id = 1",
     )?;
     let result = stmt.query_row([], |row| {
         Ok(Preferences {
@@ -459,6 +473,8 @@ pub fn get_preferences(conn: &Connection) -> Result<Preferences> {
             postprocess_mode: row.get(35)?,
             capture_aec: row.get::<_, Option<i64>>(36)?.map(|v| v != 0),
             foreign_speech_confidence_enforce: row.get::<_, Option<i64>>(37)?.map(|v| v != 0),
+            listen_cue: row.get(38)?,
+            fail_cue: row.get(39)?,
         })
     });
     match result {
@@ -512,6 +528,8 @@ pub fn set_preference(conn: &Connection, key: &str, value: &str) -> Result<()> {
         "postprocess_mode",
         "capture_aec",
         "foreign_speech_confidence_enforce",
+        "listen_cue",
+        "fail_cue",
     ];
     if !valid_keys.contains(&key) {
         anyhow::bail!(
@@ -629,6 +647,11 @@ pub fn set_preference(conn: &Connection, key: &str, value: &str) -> Result<()> {
         }
         "audible_status_sound" => {
             let _: crate::always::status_sound::StatusSoundSetting = value.parse()?;
+        }
+        "listen_cue" | "fail_cue" => {
+            if !value.is_empty() && !std::path::Path::new(value).is_file() {
+                anyhow::bail!("{key} must be an existing audio file path (or empty for the built-in cue)");
+            }
         }
         "per_app_settings_json" => {
             if !value.is_empty() {

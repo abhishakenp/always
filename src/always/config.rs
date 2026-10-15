@@ -264,6 +264,10 @@ pub struct AlwaysConfig {
     pub transcript_stream_enabled: bool,
     /// Status sounds for the four sleep-coding states. Off by default.
     pub audible_status_sound: StatusSoundSetting,
+    /// `listenCue`: user audio file for the Listening cue (None = built-in).
+    pub listen_cue: Option<String>,
+    /// `failCue`: user audio file for the Failure cue (None = built-in).
+    pub fail_cue: Option<String>,
     /// Live provisional transcript while the user is still talking, on
     /// NON-streaming backends (Groq): periodically re-transcribe the
     /// growing utterance and push the partial text to the overlay via
@@ -552,6 +556,8 @@ impl AlwaysConfig {
                 .as_deref()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_default(),
+            listen_cue: prefs.listen_cue.clone().filter(|p| !p.is_empty()),
+            fail_cue: prefs.fail_cue.clone().filter(|p| !p.is_empty()),
             stt_live_preview: resolve_stt_live_preview(&prefs),
             foreign_speech_confidence_enforce: resolve_foreign_speech_confidence_enforce(&prefs),
             mic_conflict_exclusion_bundles: resolve_mic_conflict_exclusion_bundles(&prefs),
@@ -654,6 +660,8 @@ impl Default for AlwaysConfig {
             localization: Localization::ENGLISH,
             transcript_stream_enabled: false,
             audible_status_sound: StatusSoundSetting::default(),
+            listen_cue: None,
+            fail_cue: None,
             stt_live_preview: true,
             foreign_speech_confidence_enforce: false,
             mic_conflict_exclusion_bundles: DEFAULT_MIC_CONFLICT_EXCLUSION_BUNDLES

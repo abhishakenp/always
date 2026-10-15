@@ -706,7 +706,7 @@ fn execute_command(cmd: DaemonCommand, ctx: &ModelCommandCtx, consume_lease: &At
         }
         DaemonCommand::PlayStatusCue { cue } => {
             match crate::always::status_sound::StatusSound::from_name(&cue) {
-                Some(sound) => crate::always::status_sound::cue(sound),
+                Some(sound) => crate::always::status_sound::cue_requested(sound),
                 None => tracing::warn!(cue = %cue, "uds_play_status_cue_unknown"),
             }
         }
@@ -732,6 +732,8 @@ fn execute_command(cmd: DaemonCommand, ctx: &ModelCommandCtx, consume_lease: &At
             adaptive_silence,
             audible_status_sound,
             stt_live_preview,
+            listen_cue,
+            fail_cue,
         } => {
             apply_runtime_preferences(
                 ctx,
@@ -743,6 +745,8 @@ fn execute_command(cmd: DaemonCommand, ctx: &ModelCommandCtx, consume_lease: &At
                 adaptive_silence,
                 audible_status_sound,
                 stt_live_preview,
+                listen_cue,
+                fail_cue,
             );
         }
         DaemonCommand::ApproveCorrection { id } => handle_approve_correction(&id),
@@ -1241,8 +1245,19 @@ fn apply_runtime_preferences(
     adaptive_silence: Option<bool>,
     audible_status_sound: Option<String>,
     stt_live_preview: Option<bool>,
+    listen_cue: Option<String>,
+    fail_cue: Option<String>,
 ) {
     let mut cfg = ctx.cfg.write();
+    if listen_cue.is_some() || fail_cue.is_some() {
+        if let Some(path) = listen_cue {
+            cfg.listen_cue = Some(path).filter(|p| !p.is_empty());
+        }
+        if let Some(path) = fail_cue {
+            cfg.fail_cue = Some(path).filter(|p| !p.is_empty());
+        }
+        crate::always::status_sound::set_custom_cues(cfg.listen_cue.as_deref(), cfg.fail_cue.as_deref());
+    }
     cfg.auto_enter_delay_ms = auto_enter_delay_ms.min(60_000);
     cfg.energy_threshold = energy_threshold.clamp(0.0001, 0.5);
     cfg.silence_secs = silence_secs.clamp(

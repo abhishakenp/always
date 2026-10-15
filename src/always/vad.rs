@@ -83,6 +83,17 @@ impl SpeculationSlot {
     }
 }
 
+/// Own-cue echo guard: a speech-like frame inside a pause while one of our
+/// cues may still be audible holds the pause (no resume, no silence count).
+fn own_cue_echo_holds(
+    is_speech: bool,
+    in_speech: bool,
+    consecutive_silence: usize,
+    echo_active: bool,
+) -> bool {
+    is_speech && in_speech && consecutive_silence > 0 && echo_active
+}
+
 /// VAD overlay transition seam. Speculation may flip this repeatedly inside
 /// one utterance; the broadcaster owns the separate audible-cue lifetime.
 fn set_transcribing_overlay(
@@ -1216,6 +1227,8 @@ fn record_with_local_vad(
     // energy dip — that mismatch made paste feel ~2s slower than the UI.
     // Final cut also guarantees the state. Resume mid-silence flips back.
     let mut transcribing_overlay = false;
+    // Frames held by the own-cue echo guard in the current pause.
+    let mut own_cue_echo_frames = 0u32;
     // Keep call sites concise; the transition seam is exercised without
     // starting a microphone or recognizer in the regression tests.
     macro_rules! flip_to_transcribing {
@@ -1759,7 +1772,15 @@ fn record_with_local_vad(
         if is_speech && first_voice_at.is_none() {
             first_voice_at = Some(frame_captured_at);
         }
-        if !in_speech && !voice_activity_announced && !speaker_gate_requested {
+        // With "My Voice" on, the instant announce is still allowed when
+        // NOTHING else on the Mac is playing (no media, no Iris TTS): the
+        // only voice in a quiet room is almost always his, and the
+        // Listening cue is his only proof he was heard (user request
+        // 2026-10-15; measured gate-verified announce p50 602 ms, p90
+        // 1.3 s, max 5.2 s that day). A rejected verdict retracts it.
+        let instant_announce_ok = !speaker_gate_requested
+            || crate::always::audio::other_output_quiet();
+        if !in_speech && !voice_activity_announced && instant_announce_ok {
             if early_voice_frame_ok(
                 frame_energy,
                 last_prob,
@@ -1796,6 +1817,28 @@ fn record_with_local_vad(
             event::global_broadcaster().voice_activity_detected();
         }
 
+        // Our own status cue reaching the mic during a pause is not the
+        // user resuming (2026-10-15: each cue's echo re-opened the pause
+        // ~300 ms later, the next pause re-cued, 5-6 cues per utterance,
+        // and the echo windows scored as a foreign speaker cut the
+        // utterance). Hold the pause: keep the audio (if he really did
+        // resume, nothing is lost), but neither reset nor advance the
+        // silence count while the cue may still be audible.
+        if own_cue_echo_holds(
+            is_speech,
+            in_speech,
+            consecutive_silence,
+            crate::always::status_sound::echo_window_active(),
+        ) {
+            utt_preview.frame(samples, false, !speaker_gate_requested || speaker_checked);
+            speech_samples.extend_from_slice(samples);
+            own_cue_echo_frames += 1;
+            continue;
+        }
+        if own_cue_echo_frames > 0 {
+            tracing::info!(frames = own_cue_echo_frames, "own_cue_echo_held");
+            own_cue_echo_frames = 0;
+        }
         if is_speech {
             tentative_voice_silence = 0;
             // Mid-utterance "still thinking" pause: the user had already
@@ -2075,9 +2118,11 @@ fn record_with_local_vad(
                     last_preview_at = Some(std::time::Instant::now());
                     samples_at_last_preview = committed_samples + speech_samples.len();
                     preview_pending.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if cadence.flip_overlay {
-                        flip_to_transcribing!();
-                    }
+                    // No overlay flip here: one utterance = one Listening
+                    // entry and one Transcribing entry at the final cut
+                    // (the menu-bar icon cycled ~5x per utterance,
+                    // user report 2026-10-15).
+                    let _ = cadence.flip_overlay;
                     // Cap to the last N seconds so a long chunk's preview stays
                     // cheap and can't monopolize the single STT engine ahead of
                     // the final transcription.
@@ -2315,8 +2360,8 @@ fn record_with_local_vad(
                 speculation_pending = true;
                 speculation_slot.invalidate();
                 let captured_gen = speculation_slot.current_generation();
-                // Overlay → Transcribing when speculative STT starts.
-                flip_to_transcribing!();
+                // No overlay flip at speculation (see the preview path):
+                // the icon goes to Transcribing once, at the final cut.
                 // Same edges the final paste will use (see
                 // `speaker_trim`): foreign lead-in/tail never transcribed.
                 spec_trim = speaker_timeline.plan(committed_samples, speech_samples.len());
@@ -3566,7 +3611,7 @@ mod tests {
             slot.store_if_current(generation, Err(anyhow::anyhow!("late stale result")));
             assert!(slot.take().is_none());
         }
-        assert_eq!(take_test_cues(), vec![StatusSound::Listening, StatusSound::Transcribing]);
+        assert_eq!(take_test_cues(), vec![StatusSound::Listening]);
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() { events.push(ev); }
         assert_eq!(events.iter().filter(|e| matches!(e, DaemonEvent::TranscribingStarted)).count(), 6);
@@ -3579,7 +3624,58 @@ mod tests {
         assert_eq!(slot.take().unwrap().unwrap().text, "English words including the resumed ending");
         b.utterance_terminal();
         super::set_transcribing_overlay(&mut overlay, true, &b);
-        assert_eq!(take_test_cues(), vec![StatusSound::Transcribing]);
+        assert!(take_test_cues().is_empty(), "transcribing is silent by policy");
+    }
+
+    /// The 2026-10-15 17:50:43-47Z loop, frame by frame (30 ms): after his
+    /// last word a cue is posted at the tentative mark (8 frames) and its
+    /// echo is speech-like from ~200 ms to ~460 ms after it started (the
+    /// logged `speech_resumed_after_pause` came 200-300 ms after each
+    /// `cue_played`). Old: the echo resumed the utterance and the next
+    /// tentative mark re-cued, forever. New: the pause is held, and the
+    /// final 20-frame cut lands.
+    #[test]
+    fn own_cue_echo_does_not_resume_the_pause() {
+        let simulate = |guard: bool| {
+            let (tentative, cut) = (8usize, 20usize);
+            let echo_len = (474 + 250) / 30; // stop.aiff + ECHO_TAIL, frames
+            let mut silence = 0usize;
+            let mut cue_at: Vec<usize> = Vec::new();
+            let mut resumes = 0;
+            for frame in 0..400usize {
+                let since_cue = cue_at.last().map(|&c| frame - c);
+                let echo_speech = since_cue.is_some_and(|d| (7..=15).contains(&d));
+                let echo_active = since_cue.is_some_and(|d| d < echo_len);
+                if guard && super::own_cue_echo_holds(echo_speech, true, silence, echo_active) {
+                    continue;
+                }
+                if echo_speech {
+                    resumes += 1;
+                    silence = 0;
+                    continue;
+                }
+                silence += 1;
+                if silence == tentative {
+                    cue_at.push(frame);
+                }
+                if silence >= cut {
+                    return (Some(frame), cue_at.len(), resumes);
+                }
+            }
+            (None, cue_at.len(), resumes)
+        };
+        let (old_end, old_cues, old_resumes) = simulate(false);
+        let (new_end, new_cues, new_resumes) = simulate(true);
+        eprintln!("old: end={old_end:?} cues={old_cues} resumes={old_resumes}; new: end={new_end:?} cues={new_cues} resumes={new_resumes}");
+        assert_eq!(old_end, None, "without the guard the echo loop never ends the utterance");
+        assert!(old_cues > 5);
+        assert_eq!((new_cues, new_resumes), (1, 0));
+        // Held echo frames (9) delay the cut, never more.
+        assert_eq!(new_end, Some(19 + 9));
+        // Real speech outside the echo window still resumes immediately.
+        assert!(!super::own_cue_echo_holds(true, true, 5, false));
+        // Speech that is not in a pause is never held.
+        assert!(!super::own_cue_echo_holds(true, true, 0, true));
     }
 
     #[test]

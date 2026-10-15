@@ -578,7 +578,31 @@ fn note_capture_helper_line(line: &str) {
     if line.contains("aec engaged (output pids") {
         let us = aec_clock().elapsed().as_micros() as u64;
         AEC_OUTPUT_ENGAGED_US.store(us.max(1), Ordering::Relaxed);
+        OTHER_OUTPUT.store(OUTPUT_PLAYING, Ordering::Relaxed);
+    } else if line.contains("aec bypassed (") {
+        // The helper only bypasses after its hangover with NO other
+        // process playing (2 s after short sounds, 120 s after media).
+        OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
+    } else if line.contains("aec gate on: other output pids now []") {
+        OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
+    } else if line.contains("aec gate on: other output pids now [") {
+        OTHER_OUTPUT.store(OUTPUT_PLAYING, Ordering::Relaxed);
     }
+}
+
+const OUTPUT_UNKNOWN: u8 = 0;
+const OUTPUT_QUIET: u8 = 1;
+const OUTPUT_PLAYING: u8 = 2;
+/// Whether any OTHER process is (or recently was) playing audio, from the
+/// capture helper's echo-canceller gate. Unknown (no helper, `--aec-always`)
+/// counts as not quiet.
+static OTHER_OUTPUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(OUTPUT_UNKNOWN);
+
+/// True only when the capture helper reported that no other process on
+/// the Mac is playing audio (media, Iris TTS, calls). Our own cues don't
+/// count — they are played by the helper itself.
+pub(crate) fn other_output_quiet() -> bool {
+    OTHER_OUTPUT.load(Ordering::Relaxed) == OUTPUT_QUIET
 }
 
 /// Instant of the last bypass→engaged edge caused by other playback.
@@ -1719,5 +1743,20 @@ mod aec_edge_tracking_tests {
         );
         let got = aec_output_engaged_at().expect("edge recorded");
         assert!(got + std::time::Duration::from_millis(5) >= t && got <= std::time::Instant::now());
+
+        // Quiet-room state (instant Listening cue with My Voice on), from
+        // the exact helper lines logged 2026-10-15. Same test: one global.
+        use super::other_output_quiet as quiet;
+        assert!(!quiet(), "media just engaged");
+        note("always-capture: aec bypassed (no other output for 120s) tap=7ch@44100");
+        assert!(quiet());
+        note("always-capture: aec engaged (cue) tap=7ch@44100");
+        assert!(quiet(), "our own cue is not other output");
+        note("always-capture: aec engaged (output pids [\"1252:com.apple.WebKit.GPU\"]) tap=7ch@44100");
+        assert!(!quiet());
+        note("always-capture: aec gate on: other output pids now [] (bypassed after 2.0s of none)");
+        assert!(quiet());
+        note("always-capture: aec gate on: other output pids now [\"88:node\"] (bypassed after 2.0s of none)");
+        assert!(!quiet());
     }
 }

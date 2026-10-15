@@ -60,6 +60,7 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     let _ = paste::pasteboard_change_count();
     crate::always::status_sound::set_setting(cfg.audible_status_sound);
+    crate::always::status_sound::set_custom_cues(cfg.listen_cue.as_deref(), cfg.fail_cue.as_deref());
     // Spawn + warm the Parakeet live-preview helper now (model load and
     // first ANE inference), so the user's first word is never cold.
     crate::always::preview_asr::prewarm(&cfg.lang, cfg.transcriber_backend.is_apple());
@@ -1835,12 +1836,11 @@ mod tests {
                 let final_ = events.iter().position(|e| matches!(e, event::DaemonEvent::TranscriptFinal { .. })).unwrap();
                 assert!(held < final_);
             }
-            let mut expected = vec![StatusSound::Listening, StatusSound::Transcribing];
-            match boundary {
-                "success" => expected.push(StatusSound::Success),
-                "cancel" => expected.push(StatusSound::Cancel),
-                "error" => expected.push(StatusSound::Failure),
-                _ => {},
+            // Exactly one audible cue per utterance (Listening at the
+            // first word); only a real failure adds the distinct Failure.
+            let mut expected = vec![StatusSound::Listening];
+            if boundary == "error" {
+                expected.push(StatusSound::Failure);
             }
             assert_eq!(take_test_cues(), expected, "{boundary}");
             super::emit_utterance_terminal(); // duplicate reset must stay quiet
@@ -1849,7 +1849,7 @@ mod tests {
         }
         b.voice_activity_detected();
         b.transcribing_started();
-        assert_eq!(take_test_cues(), vec![StatusSound::Listening, StatusSound::Transcribing]);
+        assert_eq!(take_test_cues(), vec![StatusSound::Listening]);
         super::emit_utterance_terminal();
     }
 
