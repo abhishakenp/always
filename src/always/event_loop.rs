@@ -682,6 +682,7 @@ pub fn paste_rejected(id: u64) -> bool {
             let now = Instant::now();
             let lat = PasteLatency {
                 speech_end_at: now,
+                voice_end_at: now,
                 stt_done_at: now,
                 grammar_started: now,
                 grammar_ms: 0,
@@ -1025,6 +1026,7 @@ fn handle_speech(
             // word instead of dictating it normally.
             let lat = PasteLatency {
                 speech_end_at: timing.speech_end_at,
+                voice_end_at: timing.voice_end_at,
                 stt_done_at: timing.stt_done_at,
                 grammar_started,
                 grammar_ms,
@@ -1110,6 +1112,8 @@ fn handle_speech(
 #[derive(Clone, Copy)]
 struct PasteLatency {
     speech_end_at: Instant,
+    /// Last voiced frame (see `UtteranceTiming::voice_end_at`).
+    voice_end_at: Instant,
     stt_done_at: Instant,
     grammar_started: Instant,
     grammar_ms: u64,
@@ -1347,6 +1351,16 @@ fn deliver_paste(
         total_ms = pasted_at
             .saturating_duration_since(lat.speech_end_at)
             .as_millis() as u64,
+        // The user-perceived number: last voiced frame → text pasted.
+        // `total_ms` above starts at the silence cut and so hides the
+        // endpoint hold; this one includes it. Budget: 200 ms.
+        speech_end_to_paste_ms = pasted_at
+            .saturating_duration_since(lat.voice_end_at)
+            .as_millis() as u64,
+        endpoint_hold_ms = lat
+            .speech_end_at
+            .saturating_duration_since(lat.voice_end_at)
+            .as_millis() as u64,
         paste_us = pasted_at
             .saturating_duration_since(paste_started)
             .as_micros() as u64,
@@ -1370,7 +1384,8 @@ fn deliver_paste(
         // fires. Set BEFORE schedule() so even a 0-delay
         // immediate-Return path sees the buffer for clearing.
         pause::dictation_buffer_set(buffer_text.clone());
-        let delay = per_app::effective_auto_enter_delay_ms(cfg.auto_enter_delay_ms);
+        let configured = per_app::effective_auto_enter_delay_ms(cfg.auto_enter_delay_ms);
+        let delay = configured.max(commit_hold_ms(&cfg.localization, &buffer_text));
         auto_enter_countdown::schedule(rt, delay);
         if delay == 0 {
             // 0-delay presses Return synchronously inside schedule().
@@ -1507,6 +1522,30 @@ pub const GRAMMAR_MAX_CHARS: usize = 4000;
 // left one-word utterances stranded without a newline. `>= 1` still excludes
 // the empty/whitespace case (word_count 0).
 const AUTO_ENTER_MIN_WORDS: usize = 1;
+
+/// Commit window before auto-Enter for text that reads finished. The
+/// paste itself is never delayed — only the Return that SENDS it. Picked
+/// from his own history (always.2026-10-12..15: of the dictations he
+/// resumed within 3 s of a paste, 162 of 207 resumed within 1.5 s). Voice
+/// heard inside the window freezes it (`pause::countdown_defer_for_voice`),
+/// and a verified resume cancels it so the new words merge into the same
+/// message instead of arriving as a second one.
+pub(crate) const COMMIT_HOLD_COMPLETE_MS: u32 = 1_500;
+/// Commit window when the text trails off (no terminator, or a trailing
+/// connector/filler): he is more likely mid-thought, so wait longer.
+pub(crate) const COMMIT_HOLD_OPEN_MS: u32 = 3_000;
+
+/// How long auto-Enter waits after a paste of `text` (see the constants).
+/// 2026-10-15 18:56:06Z: "…and this is about all." was pasted and Entered
+/// 50 ms later; he resumed 0.7 s after the paste and his thought arrived as
+/// two messages.
+fn commit_hold_ms(loc: &crate::always::localization::Localization, text: &str) -> u32 {
+    if crate::always::vad::text_reads_complete(loc, text) {
+        COMMIT_HOLD_COMPLETE_MS
+    } else {
+        COMMIT_HOLD_OPEN_MS
+    }
+}
 
 fn should_auto_enter_for_text(text: &str) -> bool {
     word_count(text) >= AUTO_ENTER_MIN_WORDS
@@ -1757,9 +1796,9 @@ mod tests {
     // decision logic can be exercised in isolation.
 
     use super::{
-        AUTO_ENTER_MIN_WORDS, SHORT_UTTERANCE_MAX_CHARS, SHORT_UTTERANCE_MAX_WORDS,
-        is_short_utterance, should_auto_enter_for_text, should_refetch_speaker_model,
-        snippet_utterance_for_log,
+        AUTO_ENTER_MIN_WORDS, COMMIT_HOLD_COMPLETE_MS, COMMIT_HOLD_OPEN_MS,
+        SHORT_UTTERANCE_MAX_CHARS, SHORT_UTTERANCE_MAX_WORDS, commit_hold_ms, is_short_utterance,
+        should_auto_enter_for_text, should_refetch_speaker_model, snippet_utterance_for_log,
     };
 
     #[test]
@@ -1837,6 +1876,25 @@ mod tests {
         // Sanity: thresholds are at the documented values.
         assert_eq!(SHORT_UTTERANCE_MAX_WORDS, 2);
         assert_eq!(SHORT_UTTERANCE_MAX_CHARS, 8);
+    }
+
+    #[test]
+    fn commit_hold_waits_longer_for_unfinished_text() {
+        let loc = &crate::always::localization::Localization::ENGLISH;
+        // 2026-10-15 18:56:06Z: complete-looking, yet he resumed 0.7 s
+        // after the paste — inside the window, so it merges.
+        let a = "This, I'm not sure if this is the exact code you have to check, test, and fix, and this is about all.";
+        assert_eq!(commit_hold_ms(loc, a), COMMIT_HOLD_COMPLETE_MS);
+        assert!(700 < COMMIT_HOLD_COMPLETE_MS);
+        assert_eq!(
+            commit_hold_ms(loc, "Takes a while to do that and"),
+            COMMIT_HOLD_OPEN_MS
+        );
+        assert_eq!(commit_hold_ms(loc, "so I think, uh,"), COMMIT_HOLD_OPEN_MS);
+        assert_eq!(
+            commit_hold_ms(loc, "What time is it?"),
+            COMMIT_HOLD_COMPLETE_MS
+        );
     }
 
     #[test]

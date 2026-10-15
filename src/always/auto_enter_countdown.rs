@@ -12,6 +12,10 @@ use super::event::global_broadcaster;
 use super::pause;
 
 const TICK_MS: u32 = 100;
+/// Ceiling on how long voice that is never verified as the user's (a
+/// video, a colleague) may freeze one countdown: past it Return fires as
+/// scheduled.
+const MAX_VOICE_DEFER_MS: u32 = 5_000;
 
 /// Schedule the auto-enter Return key for `delay_ms` from now. Spawns a
 /// tokio task on `rt` so the daemon main loop is free to record the next
@@ -46,6 +50,7 @@ pub fn schedule(rt: &Handle, delay_ms: u32) {
 
     rt.spawn(async move {
         let mut remaining = delay_ms;
+        let mut deferred_ms = 0u32;
         loop {
             tokio::time::sleep(Duration::from_millis(TICK_MS as u64)).await;
 
@@ -59,6 +64,11 @@ pub fn schedule(rt: &Handle, delay_ms: u32) {
                 global_broadcaster().auto_enter_countdown_cancelled();
                 tracing::info!("auto_enter_countdown_cancelled");
                 return;
+            }
+
+            if deferred_ms < MAX_VOICE_DEFER_MS && pause::countdown_deferred() {
+                deferred_ms += TICK_MS;
+                continue;
             }
 
             remaining = remaining.saturating_sub(TICK_MS);

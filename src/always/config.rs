@@ -576,6 +576,26 @@ impl AlwaysConfig {
             .is_some_and(|pp| pp.can_correct())
     }
 
+    /// The post-processor for grammar work done WHILE the user is still
+    /// dictating (per-chunk corrections, speculative / joined-text cache
+    /// warms). `None` for an on-device provider: Apple Intelligence shares
+    /// the Neural Engine with the speech recogniser, and logs from
+    /// 2026-10-13..15 show chunk STT 2.4-4x slower whenever one of those
+    /// calls was in flight (p50 ~0.5 s → ~2 s per 10 s of audio, in every
+    /// time window compared) — which landed directly on the end-of-speech
+    /// → paste wait, since the last chunk is transcribed after he stops.
+    /// The warms reached a paste 4 times in 499; the paste path already
+    /// never waits on the LLM. A network provider (Groq) costs no local
+    /// compute and keeps them.
+    pub fn recording_grammar(&self) -> Option<Arc<crate::always::postprocess::PostProcessor>> {
+        if !self.postprocess_available() {
+            return None;
+        }
+        self.post_processor
+            .clone()
+            .filter(|pp| !pp.runs_on_device())
+    }
+
     /// Whether deterministic CONTENT filtering (hard phrase filter +
     /// hallucination heuristics) may reject a transcript.
     ///

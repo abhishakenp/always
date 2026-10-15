@@ -70,6 +70,12 @@ impl PostProcessor {
         }
     }
 
+    /// True when correction runs on this Mac (Apple Intelligence) and so
+    /// competes with on-device speech recognition for the Neural Engine.
+    pub fn runs_on_device(&self) -> bool {
+        matches!(self.config.provider, PostprocessProvider::Apple)
+    }
+
     /// Single optional cleanup pass.
     ///
     /// Just the LLM call when `grammar_correction_enabled` is true;

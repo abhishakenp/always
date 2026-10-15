@@ -581,6 +581,29 @@ pub fn countdown_remaining_ms() -> u32 {
     COUNTDOWN_REMAINING_MS.load(Ordering::Relaxed)
 }
 
+/// Voice heard while an auto-enter countdown runs, not yet verified as
+/// the user's (the "My Voice" gate needs ~0.4-0.8 s). The countdown stops
+/// ticking until this passes, so Return can't fire while he may be
+/// resuming the same thought; a verified resume then cancels it outright
+/// and the new utterance merges (see `event_loop::commit_hold_ms`).
+static COUNTDOWN_DEFER_UNTIL: std::sync::LazyLock<Mutex<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// How long one voiced frame keeps the countdown frozen.
+pub const COUNTDOWN_VOICE_DEFER: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Called per voiced frame while a countdown is active.
+pub fn countdown_defer_for_voice() {
+    *COUNTDOWN_DEFER_UNTIL.lock() = Some(std::time::Instant::now() + COUNTDOWN_VOICE_DEFER);
+}
+
+/// True while recent voice is freezing the countdown.
+pub fn countdown_deferred() -> bool {
+    COUNTDOWN_DEFER_UNTIL
+        .lock()
+        .is_some_and(|until| std::time::Instant::now() < until)
+}
+
 /// Bundle identifier of the currently-focused macOS application
 /// (Swift app pushes this via `NotifyFocusedAppChanged`). `None` on
 /// non-mac builds or before the first event arrives.

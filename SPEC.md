@@ -175,15 +175,31 @@ VPIO's noise suppression was not measurable on a single-speaker machine.
    applies to the **whole utterance**: committing a chunk of a long
    dictation (step 4) must never shorten it. Only an utterance that is
    itself under 400 ms in total gets the short 200 ms cut.
+   A live partial ending on a filler ("uh") holds the cut for the
+   hesitation window only until the deciding text (speculation, or the
+   chunk flushed at this pause) lands: decided text that reads complete
+   ends the pause at once — the partial lags the audio and its "uh" is
+   often seconds old (2026-10-15: a stale partial held 2.5 s after "…We
+   have to send a PR.").
 7. **Transcribe** — the speculative result is used if still valid, otherwise a
    fresh transcription runs.
 8. **Post-process** — filters, glossary corrections, grammar cleanup (§9).
    A rule-filtered utterance (not a hallucination) is still copied to the
    clipboard — no paste, no auto-Enter — so a wrong filter verdict costs a
    manual ⌘V instead of the whole utterance.
-9. **Paste** — text is typed into the focused application. If auto-Enter is on,
-   Return follows after `auto_enter_delay_ms`. With a 0 ms delay, Return is
-   posted 50 ms after Cmd+V (the Cmd-flag guard in `auto_enter_countdown`);
+9. **Paste** — text is typed into the focused application. The paste is
+   never held back. If auto-Enter is on, Return follows after
+   `max(auto_enter_delay_ms, commit hold)`: the **commit hold** is 1.5 s
+   when the pasted text reads complete (terminator after a non-connector
+   word) and 3 s when it trails off. Voice heard during the hold freezes it
+   (per voiced frame, ≤ 5 s total for voice never verified as the user's);
+   a verified resume cancels it and the new utterance is pasted as a
+   continuation of the same text, so a thinking pause no longer sends half
+   a thought (2026-10-15 18:56:06Z: "…and this is about all." was Entered
+   50 ms after the paste, he resumed 0.7 s later). 1.5 s covers 162 of the
+   207 resumes within 3 s of a paste in his logs of 2026-10-12..15. Only
+   with the commit hold at 0 (not reachable from settings today) would
+   Return be posted 50 ms after Cmd+V (the Cmd-flag guard in `auto_enter_countdown`);
    the 100 ms post-paste settle that holds the paste-in-flight lock runs
    *after* Return, not before it (2026-10-13, user request: "make it insanely
    fast" — previously Return landed ~155 ms after the paste). The clipboard is
@@ -876,6 +892,14 @@ Between transcription and the keyboard:
      cached at paste time, otherwise skipped silently (no timeout wait).
      With today's latencies this almost never lands in time — it is kept
      as an option, not a dependency.
+     **Apple Intelligence never runs while he is dictating** (no per-chunk
+     corrections, no speculative or join warms; `AlwaysConfig::
+     recording_grammar`): it shares the Neural Engine with the speech
+     recogniser, and chunk STT was 2.4–4x slower whenever one of its calls
+     was in flight (logs 2026-10-13..15, p50 ~0.5 s → ~2 s per 10 s of
+     audio, same result in every time window compared) — directly on the
+     end-of-speech → paste wait. Its warms had reached a paste 4 times in
+     499. Groq (network) keeps the warms and per-chunk corrections below.
    - **Off** (`off`) — raw transcript + `local_cleanup` only.
    - **Leading wake normalisation** (all modes, before the mode branch and
      the short-utterance/snippet paths, so the consume-mode handoff sees it
@@ -1210,7 +1234,10 @@ auto-enter `ctrl+alt+a` · force paste `ctrl+alt+v` · log correction
 - Audio frames carry their estimated capture time (§4). Measured from it:
   `listening_overlay_shown.latency_ms` (first speech frame → badge) and
   `latency_breakdown` (`speech_end_at` = capture time of the frame on which
-  the silence window elapsed). `voice_detected.audio_delivery_lag_ms` is how
+  the silence window elapsed). The same line carries the user-perceived
+  number, `speech_end_to_paste_ms` (capture time of the LAST voiced frame →
+  paste; budget 200 ms), and its endpoint part `endpoint_hold_ms` (last
+  voiced frame → silence cut). `voice_detected.audio_delivery_lag_ms` is how
   far behind real time the onset frame was processed — near zero when
   capture flows; a regression to burst delivery shows there first.
   `rec_first_audio.ms_since_spawn` is the recorder's real cold start.

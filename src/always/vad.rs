@@ -76,6 +76,11 @@ pub struct UtteranceTiming {
     /// When the final-silence (or max-frames) cut fired — the moment the
     /// user is considered done speaking.
     pub speech_end_at: std::time::Instant,
+    /// Capture time of the user's LAST voiced frame — the real end of
+    /// speech, before the final-silence window. `speech_end_to_paste_ms`
+    /// in the latency line is measured from here: it is what the user
+    /// perceives as "I stopped talking → text appeared".
+    pub voice_end_at: std::time::Instant,
     /// When the transcription result became available to the main loop
     /// (speculation slot taken or fresh transcription returned).
     pub stt_done_at: std::time::Instant,
@@ -1274,6 +1279,9 @@ fn record_with_local_vad(
     // decides whether a chunked tail is transcribed (see
     // `chunked_tail_has_voice`).
     let mut tail_voiced_samples = 0usize;
+    // Capture time of the most recent voiced frame (see
+    // `UtteranceTiming::voice_end_at`).
+    let mut last_voiced_at: Option<std::time::Instant> = None;
     // End of the last hard-cut chunk, fed as lead-in to the NEXT committed
     // chunk (never the tail) — see `chunker::SEAM_CONTEXT_SAMPLES`.
     let mut seam_context: Vec<i16> = Vec::new();
@@ -1901,6 +1909,14 @@ fn record_with_local_vad(
             if in_speech {
                 speech_samples.extend_from_slice(samples);
                 voiced_since_flush = true;
+                last_voiced_at = Some(frame_captured_at);
+                // Voice during a pending auto-enter: freeze its countdown
+                // until the speaker gate decides (it cancels on a verified
+                // resume). Without this the gate's ~0.4-0.8 s let Return
+                // fire on the first half of a thought he was resuming.
+                if pause::countdown_active() {
+                    pause::countdown_defer_for_voice();
+                }
                 voiced_samples += samples.len();
                 tail_voiced_samples += samples.len();
                 // Live recognition: feed the frame and broadcast any new
@@ -2107,11 +2123,7 @@ fn record_with_local_vad(
                         "chunk_hard_flush"
                     );
                     committed_samples += speech_samples.len();
-                    let grammar = if cfg.postprocess_available() {
-                        cfg.post_processor.clone()
-                    } else {
-                        None
-                    };
+                    let grammar = cfg.recording_grammar();
                     let head = std::mem::replace(&mut speech_samples, carry);
                     let context = std::mem::replace(
                         &mut seam_context,
@@ -2198,11 +2210,7 @@ fn record_with_local_vad(
                 && speaker_gate_allows_stt(speaker_gate_requested, speaker_checked)
             {
                 committed_samples += speech_samples.len();
-                let grammar = if cfg.postprocess_available() {
-                    cfg.post_processor.clone()
-                } else {
-                    None
-                };
+                let grammar = cfg.recording_grammar();
                 chunker.flush_with_context(
                     std::mem::take(&mut seam_context),
                     std::mem::take(&mut speech_samples),
@@ -2278,11 +2286,7 @@ fn record_with_local_vad(
                 // For the speculative grammar warm below: the post-processor
                 // and runtime handle must be owned by the thread (the `cfg`
                 // borrow can't cross it).
-                let grammar_warm = if cfg.postprocess_available() {
-                    cfg.post_processor.clone()
-                } else {
-                    None
-                };
+                let grammar_warm = cfg.recording_grammar();
                 let rt_for_warm = rt.clone();
                 // For the warm's target text: a chunked utterance pastes
                 // the JOIN of the committed chunks + this tail, so the
@@ -2542,6 +2546,7 @@ fn record_with_local_vad(
     // on which the final-silence cut fired — i.e. when the user's silence
     // window actually elapsed, not when the loop got around to it.
     let speech_end_at = frame_captured_at;
+    let voice_end_at = last_voiced_at.unwrap_or(speech_end_at);
     // Capture is over: end the live preview + Parakeet feed and send the
     // terminal zero level now, not after transcription.
     let preview_text = utt_preview.parakeet_snapshot();
@@ -2768,6 +2773,7 @@ fn record_with_local_vad(
             committed_samples,
             speech_energy.max(cfg.energy_threshold),
             speech_end_at,
+            voice_end_at,
             false,
         )
         .map(|r| apply_mic_conflict_preemption(r, mic_conflict_preempted));
@@ -2983,6 +2989,7 @@ fn record_with_local_vad(
             committed_samples + speech_samples.len(),
             speech_energy.max(cfg.energy_threshold),
             speech_end_at,
+            voice_end_at,
             speculation_used,
         )
         .map(|r| apply_mic_conflict_preemption(r, mic_conflict_preempted));
@@ -3022,6 +3029,7 @@ fn record_with_local_vad(
             transcription: result,
             timing: UtteranceTiming {
                 speech_end_at,
+                voice_end_at,
                 stt_done_at,
                 speculation_used,
             },
@@ -3185,6 +3193,7 @@ fn finalize_chunked(
     total_samples: usize,
     energy: f64,
     speech_end_at: std::time::Instant,
+    voice_end_at: std::time::Instant,
     speculation_used: bool,
 ) -> Result<RecordResult> {
     // "Transcribing" stays up through grammar and paste — see the note
@@ -3243,6 +3252,7 @@ fn finalize_chunked(
         transcription,
         timing: UtteranceTiming {
             speech_end_at,
+            voice_end_at,
             stt_done_at,
             speculation_used,
         },
@@ -3348,6 +3358,16 @@ fn looks_mid_sentence(loc: &crate::always::localization::Localization, text: &st
     classify_pause_text(loc, text) != PauseText::Complete
 }
 
+/// Does this pasted text read as a finished thought? Same rules as the
+/// end-of-turn decision (`classify_pause_text`): only a sentence
+/// terminator after a non-connector, non-filler word counts.
+pub(crate) fn text_reads_complete(
+    loc: &crate::always::localization::Localization,
+    text: &str,
+) -> bool {
+    classify_pause_text(loc, text) == PauseText::Complete
+}
+
 /// What the words before a pause say about whether the speaker is done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PauseText {
@@ -3448,7 +3468,17 @@ fn final_silence_cut_frames(
     v: PauseVerdict,
 ) -> usize {
     let extended = extended_silence_frames(normal_frames);
-    if v.partial_hesitating || v.text == Some(PauseText::Hesitating) {
+    // Decided text outranks the live partial. The partial lags the audio
+    // (Apple's recogniser is still catching up when the pause starts), so
+    // an "uh" it shows is often a word from seconds ago; the deciding text
+    // covers the audio up to the pause. 2026-10-15 18:53:10Z / 18:53:48Z:
+    // the chunk text "…We have to send a PR." decided Complete at frame
+    // 70, but a stale partial "uh" held the cut to frame 84 (2.5 s after
+    // he stopped). A premature cut is no longer a split message either:
+    // auto-Enter waits for the commit window and a resumed utterance
+    // merges into the same text (see `commit_hold_ms` in event_loop).
+    let partial_counts = v.partial_hesitating && v.text != Some(PauseText::Complete);
+    if partial_counts || v.text == Some(PauseText::Hesitating) {
         return extended.max(hesitation_frames);
     }
     match v.text {
@@ -3822,6 +3852,7 @@ mod tests {
             transcription: crate::stt::TranscriptionResult::default(),
             timing: UtteranceTiming {
                 speech_end_at: std::time::Instant::now(),
+                voice_end_at: std::time::Instant::now(),
                 stt_done_at: std::time::Instant::now(),
                 speculation_used: false,
             },

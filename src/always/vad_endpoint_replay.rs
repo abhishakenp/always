@@ -271,3 +271,51 @@ fn complete_sentence_then_resume_still_cuts() {
         TEXT_LATENCY_MS
     ));
 }
+
+/// 2026-10-15 18:53:48Z: a stale live partial ("…uh") set the hesitation
+/// hold at frame 28; the flushed chunk's text "…We have to send a PR."
+/// decided Complete at frame 70, yet the cut waited for frame 84 (2.5 s
+/// after he stopped). Decided Complete text now ends the pause at once.
+#[test]
+fn decided_complete_text_overrides_stale_partial_hesitation() {
+    let loc = &Localization::ENGLISH;
+    let text = "check out to the main branch and do the work and everything and also after \
+                making changes and installing locally and testing and everything. We have to send a PR.";
+    let v = PauseVerdict {
+        text_pending: false,
+        text: Some(classify_pause_text(loc, text)),
+        partial_hesitating: true,
+    };
+    assert_eq!(v.text, Some(PauseText::Complete));
+    assert_eq!(final_silence_cut_frames(BASE, BASE, hesitation(), v), BASE);
+    // Text still in flight: the partial's hold stands (nothing better yet).
+    let pending = PauseVerdict {
+        text_pending: true,
+        text: None,
+        partial_hesitating: true,
+    };
+    assert_eq!(
+        final_silence_cut_frames(BASE, BASE, hesitation(), pending),
+        hesitation()
+    );
+    // Decided text that is itself unfinished keeps the partial's hold.
+    let mid = PauseVerdict {
+        text_pending: false,
+        text: Some(classify_pause_text(loc, "and then we")),
+        partial_hesitating: true,
+    };
+    assert_eq!(
+        final_silence_cut_frames(BASE, BASE, hesitation(), mid),
+        extended_silence_frames(BASE).max(hesitation())
+    );
+    // The decided text itself trailing off on a filler still holds.
+    let hes = PauseVerdict {
+        text_pending: false,
+        text: Some(classify_pause_text(loc, "I think it's that, uh,")),
+        partial_hesitating: false,
+    };
+    assert_eq!(
+        final_silence_cut_frames(BASE, BASE, hesitation(), hes),
+        extended_silence_frames(BASE).max(hesitation())
+    );
+}
