@@ -1599,6 +1599,11 @@ fn record_with_local_vad(
     // round trip. `None` on other backends or when the engine is
     // unavailable — everything below degrades to the existing paths.
     let mut stream_session: Option<crate::always::apple_stt::StreamSession> = None;
+    // Live session for the open TAIL of a chunked utterance: restarted at
+    // every hard chunk flush (fed the carried audio), so at the end its final
+    // covers exactly the audio not yet committed — the paste no longer
+    // waits for a file pass over up to 15 s of tail after he stops.
+    let mut tail_session: Option<crate::always::apple_stt::StreamSession> = None;
     // Live preview (both engines push into it) + Parakeet feed + voice
     // level. Declared AFTER `stream_session` so it drops FIRST on every
     // exit path: the preview closes before the Apple session is freed.
@@ -2008,6 +2013,9 @@ fn record_with_local_vad(
                 if let Some(session) = stream_session.as_mut() {
                     session.feed(samples);
                 }
+                if let Some(tail) = tail_session.as_mut() {
+                    tail.feed(samples);
+                }
                 utt_preview.frame(samples, true, !speaker_gate_requested || speaker_checked);
                 // Same anchor refresh for the case where we were already in
                 // speech (consecutive_speech overflows min_speech_frames
@@ -2214,6 +2222,20 @@ fn record_with_local_vad(
                             .to_vec(),
                     );
                     chunker.flush_with_context(context, head, transcriber, grammar, rt);
+                    if stream_session.is_some() {
+                        tail_session = crate::always::apple_stt::StreamSession::start(
+                            stream_session_lang,
+                            &crate::always::stt_apple::context_phrases(),
+                        );
+                        if let Some(tail) = tail_session.as_mut() {
+                            tail.feed(&speech_samples);
+                        }
+                        tracing::info!(
+                            started = tail_session.is_some(),
+                            carry_ms = speech_samples.len() / 16,
+                            "tail_stream_restarted"
+                        );
+                    }
                     speculation_pending = false;
                     speculation_slot.invalidate();
                     // The carried audio is the start of the user's next
@@ -2285,7 +2307,14 @@ fn record_with_local_vad(
             // transcription (never discarded — see chunker.rs) and keep
             // recording into a fresh buffer. The seam lands inside a
             // silence region at a frame boundary, so no word is split.
+            // Not while a live session hears this stretch: then the open
+            // buffer's text comes from that session at the end (no file
+            // pass), and a pause flush here would put a fresh file pass of
+            // the whole tail between his last word and the paste — the
+            // dominant wait on 2026-10-15 (12-15 s tails, 0.8-3 s STT).
+            // Long speech still commits at the hard ceiling.
             if voice_logged
+                && stream_session.is_none()
                 && consecutive_silence >= eff_tentative_frames
                 && speech_samples.len() >= chunk_target_secs() as usize * 16_000
                 && speaker_gate_allows_stt(speaker_gate_requested, speaker_checked)
@@ -2537,7 +2566,8 @@ fn record_with_local_vad(
                 );
             }
 
-            let eff_final_frames = final_silence_cut_frames(
+            let eff_final_frames = endpoint_cut_frames(
+                !pause::is_consume_mode(),
                 eff_silence_frames,
                 silence_frames,
                 hesitation_frames,
@@ -2860,44 +2890,6 @@ fn record_with_local_vad(
         .map(|r| apply_mic_conflict_preemption(r, mic_conflict_preempted));
     }
 
-    // Try to use the speculative transcription if it was kicked off and
-    // wasn't invalidated by a speech resume. Wait if it's still in
-    // flight — it has been running for up to (silence_secs - tentative)
-    // seconds already, so it's likely complete or close to it. The wait
-    // cap scales with utterance length: a flat 10s meant a 2-minute
-    // monologue routinely timed out, threw the near-done speculative
-    // result away, and re-transcribed the ENTIRE audio from scratch —
-    // doubling the worst wait exactly when it was already longest.
-    let speculation = if speculation_pending {
-        let started_wait = std::time::Instant::now();
-        let audio_secs = speech_samples.len() as f64 / 16_000.0;
-        // Floor lowered 10s → 2s: a local re-transcribe costs ~300ms, so waiting
-        // a full 10s for a stalled speculative result before falling back is
-        // pure dead time. 2s is plenty for a healthy speculation to land.
-        let max_wait = std::time::Duration::from_secs_f64((audio_secs * 0.5).clamp(2.0, 60.0));
-        let mut taken: Option<Result<crate::stt::TranscriptionResult>> = None;
-        let mut last_heartbeat = std::time::Instant::now();
-        loop {
-            if let Some(r) = speculation_slot.take() {
-                taken = Some(r);
-                break;
-            }
-            if started_wait.elapsed() >= max_wait {
-                break;
-            }
-            // Keep the GUI's transcribing lease fresh during long waits
-            // (TranscribingStarted re-emits double as the heartbeat).
-            if last_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
-                last_heartbeat = std::time::Instant::now();
-                event::global_broadcaster().transcribing_started();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        taken
-    } else {
-        None
-    };
-
     // Speech-to-text finishing is NOT the end of "Transcribing" for the
     // HUD: grammar and paste still follow, and ending the state here
     // flipped the badge back to "Listening" for that stretch. The state
@@ -2918,9 +2910,17 @@ fn record_with_local_vad(
     // whole utterance pasted twice), because `finalize_chunked` appends it
     // after the chunk join. Drop it and let the tail be transcribed from
     // its own samples (speculation or a fresh pass) like before streaming.
+    // Since 2026-10-16 a TAIL session restarts at every hard flush and
+    // hears only the open buffer, so its final is exactly the tail.
     if has_chunks && let Some(session) = stream_session.take() {
         drop(session);
-        tracing::info!("streaming_final_skipped_chunked");
+        match tail_session.take() {
+            Some(tail) => {
+                stream_session = Some(tail);
+                tracing::info!("streaming_tail_session_used");
+            }
+            None => tracing::info!("streaming_final_skipped_chunked"),
+        }
     }
     // The live session heard the foreign audio the speaker trim removed:
     // its text would paste it back. Speculation / a fresh pass over the
@@ -2946,6 +2946,50 @@ fn record_with_local_vad(
         }
         None => None,
     };
+    // Try to use the speculative transcription if it was kicked off and
+    // wasn't invalidated by a speech resume. Wait if it's still in
+    // flight — it has been running for up to (silence_secs - tentative)
+    // seconds already, so it's likely complete or close to it. The wait
+    // cap scales with utterance length: a flat 10s meant a 2-minute
+    // monologue routinely timed out, threw the near-done speculative
+    // result away, and re-transcribed the ENTIRE audio from scratch —
+    // doubling the worst wait exactly when it was already longest.
+    let speculation = if speculation_pending && streaming_final.is_none() {
+        let started_wait = std::time::Instant::now();
+        let audio_secs = speech_samples.len() as f64 / 16_000.0;
+        // Floor lowered 10s → 2s: a local re-transcribe costs ~300ms, so waiting
+        // a full 10s for a stalled speculative result before falling back is
+        // pure dead time. 2s is plenty for a healthy speculation to land.
+        let max_wait = std::time::Duration::from_secs_f64((audio_secs * 0.5).clamp(2.0, 60.0));
+        let mut taken: Option<Result<crate::stt::TranscriptionResult>> = None;
+        let mut last_heartbeat = std::time::Instant::now();
+        loop {
+            if let Some(r) = speculation_slot.take() {
+                taken = Some(r);
+                break;
+            }
+            if started_wait.elapsed() >= max_wait {
+                break;
+            }
+            // Keep the GUI's transcribing lease fresh during long waits
+            // (TranscribingStarted re-emits double as the heartbeat).
+            if last_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
+                last_heartbeat = std::time::Instant::now();
+                event::global_broadcaster().transcribing_started();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        taken
+    } else if speculation_pending {
+        // The live session already supplied the text: take the speculative
+        // pass only if it has landed (its confidence feeds the foreign-
+        // speech gate) — never wait on it. Waiting here put a file-STT
+        // round trip back in front of a paste whose text was ready.
+        speculation_slot.take()
+    } else {
+        None
+    };
+
     // The speculative file pass (already finished or awaited above — no
     // extra wait) carries the engine's acoustic confidence for nearly the
     // same audio; keep it for the foreign-speech gate even when the
@@ -3533,6 +3577,32 @@ struct PauseVerdict {
     text: Option<PauseText>,
     /// A live partial already ended on a hesitation.
     partial_hesitating: bool,
+}
+
+/// Where this pause ends the utterance, by delivery mode.
+///
+/// Pasting (no stream consumer): always the base window. A cut there is
+/// cheap now — the paste only shows text; auto-Enter waits the commit hold
+/// (1.5 s complete / 3 s trailing off) and a resume merges into the same
+/// message — so holding the cut for text or hesitation only delayed text
+/// he could already see in the preview ("the transcript is already there
+/// but I wait seconds for it to be pasted", 2026-10-15 22:0xZ;
+/// `endpoint_hold_ms` 1019-2518 on 0.1.0).
+///
+/// Consume mode (Iris takes the utterance, nothing is pasted, no commit
+/// hold or merge exists): the adaptive holds below still apply.
+fn endpoint_cut_frames(
+    pasting: bool,
+    base_frames: usize,
+    normal_frames: usize,
+    hesitation_frames: usize,
+    v: PauseVerdict,
+) -> usize {
+    if pasting {
+        base_frames
+    } else {
+        final_silence_cut_frames(base_frames, normal_frames, hesitation_frames, v)
+    }
 }
 
 /// Frames of silence after which this pause ends the utterance.

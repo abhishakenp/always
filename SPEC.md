@@ -175,6 +175,15 @@ VPIO's noise suppression was not measurable on a single-speaker machine.
    applies to the **whole utterance**: committing a chunk of a long
    dictation (step 4) must never shorten it. Only an utterance that is
    itself under 400 ms in total gets the short 200 ms cut.
+   **When pasting** (no stream consumer) the cut is always the base
+   window: the paste only shows text, auto-Enter waits the commit hold and
+   a resume merges, so no hold may delay text he can already see. The
+   holds below apply in consume mode (Iris takes the utterance; nothing
+   is pasted, nothing merges). Long speech commits chunks only at the
+   15 s ceiling while the Apple live session runs; a TAIL live session
+   restarts at each such flush, and its final is the tail's text — no
+   file pass over the tail after he stops (2026-10-15: 12-15 s tails took
+   0.8-3 s after his last word).
    Text that trails off (a filler, a connector — "…need to", "…or.")
    holds the cut for the hesitation window, 1.2 s
    (`ALWAYS_HESITATION_SILENCE_SECS`; was 2.5 s, which made every such

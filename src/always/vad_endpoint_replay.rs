@@ -14,8 +14,8 @@
 
 use super::{
     FRAME_MS, MIDSENTENCE_DECISION_GRACE_FRAMES, PauseText, PauseVerdict, classify_pause_text,
-    extended_silence_frames, final_silence_cut_frames, hesitation_silence_frames,
-    partial_says_hesitating,
+    endpoint_cut_frames, extended_silence_frames, final_silence_cut_frames,
+    hesitation_silence_frames, partial_says_hesitating,
 };
 use crate::always::AlwaysConfig;
 use crate::always::localization::Localization;
@@ -390,4 +390,44 @@ fn replay_185606_complete_looking_thinking_pause_is_one_enter() {
         ("Takes a while to do that and while I was speaking.", None),
     ];
     assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
+}
+
+/// Paste mode never holds the cut past the base window, whatever the text
+/// or partial says; consume mode (Iris) keeps the adaptive holds.
+#[test]
+fn paste_mode_cuts_at_base_window_consume_mode_keeps_holds() {
+    let loc = &Localization::ENGLISH;
+    let verdicts = [
+        PauseVerdict {
+            text_pending: true,
+            text: None,
+            partial_hesitating: true,
+        },
+        PauseVerdict {
+            text_pending: false,
+            text: Some(classify_pause_text(loc, "Everything that you need to")),
+            partial_hesitating: false,
+        },
+        PauseVerdict {
+            text_pending: false,
+            text: Some(classify_pause_text(loc, "and then we")),
+            partial_hesitating: false,
+        },
+        PauseVerdict {
+            text_pending: true,
+            text: None,
+            partial_hesitating: false,
+        },
+    ];
+    for v in verdicts {
+        assert_eq!(
+            endpoint_cut_frames(true, BASE, BASE, hesitation(), v),
+            BASE,
+            "{v:?}"
+        );
+        assert!(
+            endpoint_cut_frames(false, BASE, BASE, hesitation(), v) > BASE,
+            "{v:?}"
+        );
+    }
 }
