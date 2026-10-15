@@ -16,7 +16,8 @@
 //
 // 2026-10-15: default path is now TAP mode (see "Echo cancellation against
 // what the Mac is PLAYING" below) — VPIO turned out not to cancel other
-// processes' audio at all; VPIO remains the fallback without permission.
+// processes' audio at all, and it alters system output — so without the
+// permission the mic is captured plain (VPIO only with --vp).
 //
 // Usage: always-capture [--no-vp] [--vp] [--tap] [--aec-always] [--agc] [--duck]
 //   --vp / --tap  force the VPIO / tap-reference canceller (env ALWAYS_CAPTURE_AEC)
@@ -334,10 +335,10 @@ if !args.contains("--no-vp") && !args.contains("--vp") && aecPref != "vp" {
         let perm = tapPermission()
         if perm == "authorized" || args.contains("--tap") || aecPref == "tap" {
             let t = OutputTap()
-            if let err = t.start() { log("ref tap unavailable (\(err), permission=\(perm)) — using VPIO") }
+            if let err = t.start() { log("ref tap unavailable (\(err), permission=\(perm)) — plain mic, no echo cancelling") }
             else { outputTap = t; tapMode = true }
         } else {
-            log("ref tap needs System Audio Recording (permission=\(perm)) — using VPIO")
+            log("ref tap needs System Audio Recording (permission=\(perm)) — plain mic, no echo cancelling")
             // The Always app is the sole requester (Settings / onboarding
             // "System Audio Recording"). Here: watch for the grant (a cheap
             // TCC preflight every 10 s) and exit once it lands, so the
@@ -354,7 +355,13 @@ if !args.contains("--no-vp") && !args.contains("--vp") && aecPref != "vp" {
         }
     }
 }
-let useVP = !args.contains("--no-vp") && !tapMode
+// VPIO only on explicit request (`--vp` / ALWAYS_CAPTURE_AEC=vp). Running
+// it changes what EVERYONE hears: macOS puts the output through voice
+// processing and ducks other apps even at the minimum ducking level — with
+// Always quit his music was "fuller and louder" (2026-10-15). Without the
+// System Audio Recording grant the mic is captured plain; the "My Voice"
+// gate already rejects other voices.
+let useVP = (args.contains("--vp") || aecPref == "vp") && !args.contains("--no-vp") && !tapMode
 
 // Tap teardown on EVERY exit path (EPIPE, parent death, device change,
 // SIGTERM/SIGINT): destroy the aggregate device and the process tap

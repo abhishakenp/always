@@ -579,12 +579,27 @@ fn note_capture_helper_line(line: &str) {
         let us = aec_clock().elapsed().as_micros() as u64;
         AEC_OUTPUT_ENGAGED_US.store(us.max(1), Ordering::Relaxed);
         OTHER_OUTPUT.store(OUTPUT_PLAYING, Ordering::Relaxed);
+        note_output_playing();
+    } else if line.contains("aec engaged (tap reference playing)") {
+        // Tap-referenced AEC (System Audio Recording granted): the helper
+        // reports the global output tap, not pids. Missing this left the
+        // state QUIET through music, so the quiet-room instant Listening
+        // cue fired every ~200 ms on music (2026-10-15 22:12Z: 110 cues,
+        // 35 voice detections).
+        OTHER_OUTPUT.store(OUTPUT_PLAYING, Ordering::Relaxed);
+        note_output_playing();
+    } else if line.contains("aec bypassed (tap reference silent)") {
+        // The tap goes silent in every gap between songs/phrases: quiet
+        // only once nothing has played for OUTPUT_QUIET_AFTER.
+        OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
     } else if line.contains("aec bypassed (") {
         // The helper only bypasses after its hangover with NO other
         // process playing (2 s after short sounds, 120 s after media).
         OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
+        OUTPUT_LAST_PLAYING_US.store(0, Ordering::Relaxed);
     } else if line.contains("aec gate on: other output pids now []") {
         OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
+        OUTPUT_LAST_PLAYING_US.store(0, Ordering::Relaxed);
     } else if line.contains("aec gate on: other output pids now [") {
         OTHER_OUTPUT.store(OUTPUT_PLAYING, Ordering::Relaxed);
     }
@@ -603,6 +618,25 @@ static OTHER_OUTPUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::
 /// count — they are played by the helper itself.
 pub(crate) fn other_output_quiet() -> bool {
     OTHER_OUTPUT.load(Ordering::Relaxed) == OUTPUT_QUIET
+        && match OUTPUT_LAST_PLAYING_US.load(Ordering::Relaxed) {
+            0 => true,
+            us => {
+                aec_clock().elapsed().as_micros() as u64
+                    >= us + OUTPUT_QUIET_AFTER.as_micros() as u64
+            }
+        }
+}
+
+/// Last time any output was reported playing (µs on [`aec_clock`]; 0 =
+/// never).
+static OUTPUT_LAST_PLAYING_US: AtomicU64 = AtomicU64::new(0);
+/// Quiet needs this long with nothing playing (gaps inside music are not a
+/// quiet room).
+const OUTPUT_QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn note_output_playing() {
+    let us = aec_clock().elapsed().as_micros() as u64;
+    OUTPUT_LAST_PLAYING_US.store(us.max(1), Ordering::Relaxed);
 }
 
 /// Instant of the last bypass→engaged edge caused by other playback.
@@ -1756,11 +1790,18 @@ mod aec_edge_tracking_tests {
             "always-capture: aec engaged (output pids [\"1252:com.apple.WebKit.GPU\"]) tap=7ch@44100",
         );
         assert!(!quiet());
-        note("always-capture: aec gate on: other output pids now [] (bypassed after 2.0s of none)");
-        assert!(quiet());
         note(
             "always-capture: aec gate on: other output pids now [\"88:node\"] (bypassed after 2.0s of none)",
         );
         assert!(!quiet());
+        note("always-capture: aec gate on: other output pids now [] (bypassed after 2.0s of none)");
+        assert!(quiet());
+
+        // Tap-referenced mode (22:12Z): music = "tap reference playing";
+        // a gap = "tap reference silent" — not quiet until 3 s pass.
+        note("always-capture: aec engaged (tap reference playing)");
+        assert!(!quiet(), "music via the output tap");
+        note("always-capture: aec bypassed (tap reference silent)");
+        assert!(!quiet(), "a gap in the music is not a quiet room");
     }
 }

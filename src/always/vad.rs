@@ -742,6 +742,26 @@ const NORMAL_SILENCE_FLOOR_SECS: f64 = 0.30;
 /// back before any transcription work starts.
 const EARLY_VOICE_ENERGY_RATIO: f64 = 0.60;
 const EARLY_VOICE_FALSE_START_MS: u32 = 150;
+/// No new instant (pre-verification) announce for this long after one was
+/// retracted. Real speech still announces through confirmed onset or the
+/// speaker gate; only the cue-on-first-sound shortcut waits.
+const INSTANT_ANNOUNCE_RETRACT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// May the overlay + Listening cue fire on the first speech-like frames,
+/// before onset/verification? Without "My Voice" always; with it only in a
+/// quiet room (nothing else playing) and never during the backoff after a
+/// retraction.
+fn instant_announce_allowed(
+    speaker_gate_requested: bool,
+    other_output_quiet: bool,
+    blocked_until: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if blocked_until.is_some_and(|t| now < t) {
+        return false;
+    }
+    !speaker_gate_requested || other_output_quiet
+}
 /// Consecutive qualifying frames required before the early-voice
 /// announcement fires. A single 30ms frame was enough before, and
 /// keyboard clacks / door thumps / mouse clicks are near-always exactly
@@ -1201,6 +1221,11 @@ fn record_with_local_vad(
     let mut in_speech = false;
     let mut voice_logged = false;
     let mut voice_activity_announced = false;
+    // After a retracted instant announce (a sound that never became
+    // speech), no new instant announce until this passes: music read as a
+    // "quiet room" announced → retracted → re-announced every ~200 ms,
+    // each with a Listening cue (2026-10-15 22:12Z, 110 cues / 35 voices).
+    let mut instant_announce_blocked_until: Option<std::time::Instant> = None;
     let mut voice_activity_announced_at: Option<std::time::Instant> = None;
     let mut last_voice_heartbeat: Option<std::time::Instant> = None;
     // Capture time of the first frame of this utterance that looked like
@@ -1779,8 +1804,12 @@ fn record_with_local_vad(
         // Listening cue is his only proof he was heard (user request
         // 2026-10-15; measured gate-verified announce p50 602 ms, p90
         // 1.3 s, max 5.2 s that day). A rejected verdict retracts it.
-        let instant_announce_ok =
-            !speaker_gate_requested || crate::always::audio::other_output_quiet();
+        let instant_announce_ok = instant_announce_allowed(
+            speaker_gate_requested,
+            crate::always::audio::other_output_quiet(),
+            instant_announce_blocked_until,
+            std::time::Instant::now(),
+        );
         if !in_speech && !voice_activity_announced && instant_announce_ok {
             if early_voice_frame_ok(
                 frame_energy,
@@ -2614,6 +2643,9 @@ fn record_with_local_vad(
                     // not exist.
                     first_voice_at = None;
                     tentative_voice_silence = 0;
+                    instant_announce_blocked_until =
+                        Some(std::time::Instant::now() + INSTANT_ANNOUNCE_RETRACT_BACKOFF);
+                    tracing::info!("instant_announce_retracted");
                     event::global_broadcaster().voice_activity_ended();
                 }
             }
@@ -3637,6 +3669,41 @@ fn final_silence_cut_frames(
         Some(_) => base_frames,
         None if v.text_pending => base_frames + MIDSENTENCE_DECISION_GRACE_FRAMES,
         None => base_frames,
+    }
+}
+
+#[cfg(test)]
+mod instant_announce_tests {
+    use super::{INSTANT_ANNOUNCE_RETRACT_BACKOFF, instant_announce_allowed};
+    use std::time::{Duration, Instant};
+
+    /// 22:12:10-13Z: Listening cue every ~200 ms on music. After one
+    /// retraction the shortcut stays off for the backoff.
+    #[test]
+    fn retraction_blocks_the_instant_announce_for_the_backoff() {
+        let now = Instant::now();
+        let blocked = Some(now + INSTANT_ANNOUNCE_RETRACT_BACKOFF);
+        assert!(!instant_announce_allowed(true, true, blocked, now));
+        assert!(!instant_announce_allowed(
+            false,
+            true,
+            blocked,
+            now + Duration::from_millis(200)
+        ));
+        assert!(instant_announce_allowed(
+            true,
+            true,
+            blocked,
+            now + INSTANT_ANNOUNCE_RETRACT_BACKOFF + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn my_voice_on_needs_a_quiet_room() {
+        let now = Instant::now();
+        assert!(!instant_announce_allowed(true, false, None, now));
+        assert!(instant_announce_allowed(true, true, None, now));
+        assert!(instant_announce_allowed(false, false, None, now));
     }
 }
 

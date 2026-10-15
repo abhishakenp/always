@@ -93,6 +93,22 @@ The GUI spawns the daemon and talks to it over a Unix domain socket at
 `~/Library/Caches/always/always.sock`. Messages are newline-delimited JSON; the
 daemon broadcasts events, the GUI sends commands.
 
+**Always never changes what the Mac plays (2026-10-15, user report: with
+Always quit his music was "fuller and louder").** Voice-processing I/O (VPIO)
+alters system output and ducks other apps even at `duckingLevel = .min`, and
+it never cancelled other apps' audio anyway. The capture helper therefore uses
+VPIO only on explicit request (`--vp` / `ALWAYS_CAPTURE_AEC=vp`). With System
+Audio Recording granted it cancels from the global output tap (tap-aec, no
+VPIO); without the grant it captures the mic plain (no echo cancelling — the
+"My Voice" gate rejects other voices). The paragraphs below describe the VPIO
+path as it was.
+**Quiet room vs music for the instant Listening cue.** The tap-mode lines
+`aec engaged (tap reference playing)` / `aec bypassed (tap reference silent)`
+count as other output playing / stopped, and "quiet" needs 3 s with nothing
+playing (gaps between songs are not a quiet room). After an instant announce
+is retracted (a sound that never became speech) no new instant announce
+fires for 3 s: music read as "quiet" had cued Listening every ~200 ms
+(2026-10-15 22:12Z, 110 cues for 35 voice detections).
 **Echo-cancelled capture (2026-10-14, user request: "When a YouTube video is
 playing she does not hear me at all — I should never have to pause a video to
 dictate").** When the bundled `always-capture` helper is present, it is the
