@@ -150,7 +150,13 @@ final class OutputTap {
         sz = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         guard AudioObjectGetPropertyData(outDev, &a, 0, nil, &sz, &uidRef) == noErr, let outUID = uidRef?.takeRetainedValue()
         else { return "no output uid" }
-        let d = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        // Iris's duck-tap replays every other app's audio while she speaks
+        // (it mutes the originals): tapping it too would put the media into
+        // the reference twice. Excluded by name when running now; the
+        // watcher below respawns the helper once if it appears later.
+        let excluded = audioProcesses().filter { obj in caPid(obj).map { procName($0) == "duck-tap" } ?? false }
+        if !excluded.isEmpty { log("ref tap excludes duck-tap (\(excluded.count) process object(s))") }
+        let d = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
         d.uuid = UUID()
         d.name = "always-capture-ref"
         d.isPrivate = true
@@ -336,7 +342,23 @@ if !args.contains("--no-vp") && !args.contains("--vp") && aecPref != "vp" {
         if perm == "authorized" || args.contains("--tap") || aecPref == "tap" {
             let t = OutputTap()
             if let err = t.start() { log("ref tap unavailable (\(err), permission=\(perm)) — plain mic, no echo cancelling") }
-            else { outputTap = t; tapMode = true }
+            else {
+                outputTap = t; tapMode = true
+                // duck-tap (Iris) started after this tap: respawn once so the
+                // new tap excludes it (the daemon restarts the helper).
+                let excludedAtStart = audioProcesses().contains { obj in caPid(obj).map { procName($0) == "duck-tap" } ?? false }
+                if !excludedAtStart {
+                    let w = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+                    w.schedule(deadline: .now() + 10, repeating: 10)
+                    w.setEventHandler {
+                        if audioProcesses().contains(where: { obj in caPid(obj).map { procName($0) == "duck-tap" } ?? false }) {
+                            log("duck-tap appeared — respawning so the reference tap excludes it"); exit(0)
+                        }
+                    }
+                    w.resume()
+                    grantWatch = w
+                }
+            }
         } else {
             log("ref tap needs System Audio Recording (permission=\(perm)) — plain mic, no echo cancelling")
             // The Always app is the sole requester (Settings / onboarding
