@@ -301,6 +301,7 @@ final class TapPipeline {
 }
 
 var tapStatsHolder: DispatchSourceTimer?
+var signalSources: [DispatchSourceSignal] = []
 let aecPref = ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_AEC"] ?? ""
 if args.contains("--request-tap-permission") {
     log("tap permission before: \(tapPermission())")
@@ -316,6 +317,9 @@ if args.contains("--ref-only") {
     guard #available(macOS 14.2, *) else { exit(5) }
     let t = OutputTap()
     if let err = t.start() { log("ref tap unavailable: \(err)"); exit(5) }
+    outputTap = t
+    atexit { if #available(macOS 14.2, *), let t = outputTap as? OutputTap { t.stop() } }
+    for sig in [SIGTERM, SIGINT, SIGHUP] { signal(sig, { _ in exit(0) }) }
     var f = [Float](repeating: 0, count: 160), pcm = [Int16](repeating: 0, count: 160)
     while true {
         usleep(10_000)
@@ -347,6 +351,27 @@ if !args.contains("--no-vp") && !args.contains("--vp") && aecPref != "vp" {
     }
 }
 let useVP = !args.contains("--no-vp") && !tapMode
+
+// Tap teardown on EVERY exit path (EPIPE, parent death, device change,
+// SIGTERM/SIGINT): destroy the aggregate device and the process tap
+// explicitly rather than leaving it to coreaudiod's client cleanup. If
+// coreaudiod is wedged and the teardown blocks, a 2 s watchdog _exits anyway
+// (2026-10-15 19:27Z: a hung coreaudiod left a tap helper unkillable).
+var tapTornDown = false
+func tearDownTap() {
+    guard !tapTornDown else { return }
+    tapTornDown = true
+    Thread { sleep(2); _exit(0) }.start()
+    if #available(macOS 14.2, *), let t = outputTap as? OutputTap { t.stop() }
+}
+atexit { tearDownTap() }
+for sig in [SIGTERM, SIGINT, SIGHUP] {
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+    src.setEventHandler { exit(0) }
+    src.resume()
+    signalSources.append(src)
+}
 let tapPipeline: TapPipeline? = tapMode ? TapPipeline() : nil
 
 let engine = AVAudioEngine()

@@ -14,7 +14,11 @@ extern "C" {
 
 typedef struct aec_core aec_core;
 
+#ifndef AEC_FRAME
 #define AEC_FRAME 160  // 10 ms at 16 kHz
+#endif
+/// Cap on stationary-noise attenuation inside the residual echo suppressor.
+#define AEC_NOISE_SUPPRESS_DB -3
 
 /// tail_samples: echo path length the filter models (e.g. 4096 = 256 ms).
 /// echo_suppress_db / active_db: residual echo suppression (negative dB;

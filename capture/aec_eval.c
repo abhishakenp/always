@@ -35,7 +35,7 @@ static void write_wav(const char *path, const int16_t *d, long n) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: aec_eval MIC REF OUT [tail] [supp] [supp_active] [agc_init_db|-] [noaec] [mic_pregain_db]\n"); return 1; }
+    if (argc < 4) { fprintf(stderr, "usage: aec_eval MIC REF OUT [tail] [supp] [supp_active] [agc_init_db|-] [noaec] [mic_pregain_db] [warm_prefix]\n"); return 1; }
     long nm, nr;
     int16_t *mic = read_wav(argv[1], &nm), *ref = read_wav(argv[2], &nr);
     int tail = argc > 4 ? atoi(argv[4]) : 4096;
@@ -45,6 +45,18 @@ int main(int argc, char **argv) {
     // argv[7]: AGC initial gain dB ("-" = no AGC); argv[8]: 1 = bypass AEC (AGC only)
     aec_agc *g = (argc > 7 && argv[7][0] != '-') ? aec_agc_new(-26, 35 - pre, atof(argv[7])) : NULL;
     int noaec = argc > 8 && atoi(argv[8]);
+    if (argc > 10) {  // warm-up: run WARM.mic.wav/WARM.ref.wav through first, discard output
+        char pm[4096], pr[4096];
+        snprintf(pm, sizeof pm, "%s.mic.wav", argv[10]); snprintf(pr, sizeof pr, "%s.ref.wav", argv[10]);
+        long wn, wr_;
+        int16_t *wm = read_wav(pm, &wn), *wrf = read_wav(pr, &wr_);
+        float m[AEC_FRAME], r[AEC_FRAME], o[AEC_FRAME];
+        for (long i = 0; i + AEC_FRAME <= wn; i += AEC_FRAME) {
+            for (int k = 0; k < AEC_FRAME; k++) { m[k] = wm[i + k] / 32768.0f; r[k] = (i + k < wr_) ? wrf[i + k] / 32768.0f : 0; }
+            aec_process(a, m, r, o);
+        }
+        free(wm); free(wrf);
+    }
     int16_t *out = calloc(nm, 2);
     float m[AEC_FRAME], r[AEC_FRAME], o[AEC_FRAME];
     clock_t t0 = clock();

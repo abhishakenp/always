@@ -23,7 +23,7 @@ def ir(rt60, n, direct=1.0, seed=0):
 SPK = ir(0.25, 4000, direct=1.5, seed=1)     # speaker -> mic path (laptop, small room)
 ROOM = ir(0.5, 8000, direct=0.6, seed=2)     # far-field talker -> mic (reverberant)
 def echo(ref):
-    y = np.tanh(DRIVE * ref / (np.abs(ref).max() + 1e-9)) * (np.abs(ref).max())  # speaker nonlinearity
+    y = ref.copy() if DRIVE == 0 else np.tanh(DRIVE * ref / (np.abs(ref).max() + 1e-9)) * (np.abs(ref).max())  # speaker nonlinearity
     y = ss.fftconvolve(y, SPK)[:len(ref)]
     return np.concatenate([np.zeros(480, np.float32), y[:-480]])         # +30 ms
 NEAR_DB = float(os.environ.get("NEAR_DB", "-28"))
@@ -37,6 +37,14 @@ conds = {  # name: (media, SER dB, far_field, slow)
     'far_iris': ('iris', -14, True, False),
     'slow_video': ('narr', -3, False, True),
 }
+# Warm-up pair: 30 s of a DIFFERENT track through the same echo path. In real
+# use the canceller's filter persists across playback (same speakers, same mic),
+# so it is already converged when he talks over a new video or Iris; aec_eval
+# processes this pair first (output discarded) when given WARM_PREFIX.
+wm = rd(os.path.join(src, 'music2.wav'))[SR*60:SR*90]
+we = echo(wm); we = we * db(NEAR_DB) / active_rms(we)
+wr(os.path.join(out, 'warm.mic.wav'), we + rng.standard_normal(len(we)).astype(np.float32) * db(-70))
+wr(os.path.join(out, 'warm.ref.wav'), wm * db(-20) / active_rms(wm))
 for c in clips:
     base = os.path.splitext(os.path.basename(c))[0]
     near0 = rd(c)

@@ -14,6 +14,7 @@ struct aec_core {
     int idle_limit;        // frames after which no echo can remain
     int engaged;           // canceller ran on the previous frame
     float mic_gain;        // fixed pre-gain into the int16 canceller
+    int no_res;            // skip residual echo suppression (echo_suppress_db > 0)
     uint64_t processed, passed;
     spx_int16_t mic16[AEC_FRAME], ref16[AEC_FRAME], out16[AEC_FRAME];
 };
@@ -32,22 +33,26 @@ aec_core *aec_new(int tail_samples, int echo_suppress_db, int echo_suppress_acti
     aec_core *a = calloc(1, sizeof *a);
     if (!a) return NULL;
     a->mic_gain = powf(10, mic_gain_db / 20);
+    a->no_res = echo_suppress_db > 0;
     int rate = 16000;
     a->echo = speex_echo_state_init(AEC_FRAME, tail_samples);
     speex_echo_ctl(a->echo, SPEEX_ECHO_SET_SAMPLING_RATE, &rate);
     a->pre = speex_preprocess_state_init(AEC_FRAME, rate);
     int off = 0, on = 1;
-    // Only residual-echo suppression: no denoise, no AGC, no VAD — the
-    // daemon's thresholds and recognizers are calibrated on un-gained,
-    // un-denoised mic audio.
-    speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_DENOISE, &off);
+    // Residual-echo suppression lives inside speex's denoiser gain (with
+    // DENOISE off it computes the echo gains and then applies 1.0 — measured
+    // offline: identical output for any echo_suppress setting). So the
+    // denoiser is ON but its stationary-noise attenuation is capped at
+    // AEC_NOISE_SUPPRESS_DB (env-free; see aec_core.h). No AGC, no dereverb.
+    speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_DENOISE, &on);
+    int ns = getenv("AEC_NOISE_SUPPRESS_DB") ? atoi(getenv("AEC_NOISE_SUPPRESS_DB")) : AEC_NOISE_SUPPRESS_DB;
+    speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &ns);
     speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_AGC, &off);
     speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_DEREVERB, &off);
     speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_ECHO_STATE, a->echo);
-    if (echo_suppress_db) speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &echo_suppress_db);
+    if (echo_suppress_db < 0) speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &echo_suppress_db);
     if (echo_suppress_active_db)
         speex_preprocess_ctl(a->pre, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &echo_suppress_active_db);
-    (void)on;
     a->idle_limit = (tail_samples + 8000) / AEC_FRAME;  // tail + 500 ms
     a->idle_frames = a->idle_limit;                     // start idle
     return a;
@@ -73,7 +78,7 @@ int aec_process(aec_core *a, const float *mic, const float *ref, float *out) {
     }
     for (int i = 0; i < AEC_FRAME; i++) { a->mic16[i] = to16(mic[i] * a->mic_gain); a->ref16[i] = to16(ref[i]); }
     speex_echo_cancellation(a->echo, a->mic16, a->ref16, a->out16);
-    speex_preprocess_run(a->pre, a->out16);
+    if (!a->no_res) speex_preprocess_run(a->pre, a->out16);
     for (int i = 0; i < AEC_FRAME; i++) out[i] = a->out16[i] * (1.0f / 32768.0f);
     a->engaged = 1;
     a->processed++;
