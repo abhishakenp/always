@@ -1338,12 +1338,21 @@ caller, play start 11–21 ms. Every cue logs `status_sound_played {cue, level, 
 
 | Cue | File | When |
 |---|---|---|
-| Listening | start | listening badge raised (first VoiceActivityDetected) |
-| Transcribing | stop | first TranscribingStarted per utterance; speculative resume/silence cycles and heartbeats stay quiet |
-| Success | done | final delivered (not for consume-mode held finals — silent handoff) |
-| Failure | error | transcription failed |
-| Cancel | cancel | transcription filtered |
+| Listening | start (or `listen_cue`) | listening badge raised (first VoiceActivityDetected) — the ONE audible cue per utterance; with My Voice on it fires at onset when no other process plays audio, else at verification |
+| Transcribing | stop | silent (policy `audible_in_utterance`, 2026-10-15) |
+| Success | done | silent (policy) |
+| Failure | error (or `fail_cue`) | transcription failed — the only other audible utterance cue |
+| Cancel | cancel | silent (policy) |
 | Command | command | reserved; not played on `DiscardHeld` (handoffs are silent, user request 2026-10-14) |
+
+One utterance = one audible cue (user report 2026-10-15: "I hear the sound
+like 5 times when I speak once"). `UDS PlayStatusCue` still plays any cue on
+explicit request. Every cue marks its own echo window (cue length + 250 ms);
+a speech-like frame inside a pause during that window holds the pause
+(`own_cue_echo_held`) instead of resuming it. The overlay/menu-bar icon enters
+Transcribing once, at the final cut — never at speculation or preview.
+`listen_cue` / `fail_cue` preferences point at a user audio file (played as-is,
+never bundled; a missing file falls back to the built-in cue).
 
 The transcribing cue rearms only when `process_one` finishes its utterance
 cycle (delivered or held final, filtered/drop/cancel, silence/reset, or error).
