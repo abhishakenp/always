@@ -322,9 +322,14 @@ if args.contains("--ref-only") {
     atexit { if #available(macOS 14.2, *), let t = outputTap as? OutputTap { t.stop() } }
     for sig in [SIGTERM, SIGINT, SIGHUP] { signal(sig, { _ in exit(0) }) }
     var f = [Float](repeating: 0, count: 160), pcm = [Int16](repeating: 0, count: 160)
+    // Continuous timeline: frame n covers host time t0 + n·10 ms, read 200 ms late
+    // so the tap has delivered it; never skips or repeats a frame.
+    let step = UInt64(0.01 * hostTicksPerSec), lagT = UInt64(0.2 * hostTicksPerSec)
+    var tk = mach_absolute_time() - lagT
     while true {
-        usleep(10_000)
-        f.withUnsafeMutableBufferPointer { refRing.read($0.baseAddress!, 160, host: mach_absolute_time() - UInt64(0.2 * hostTicksPerSec)) }
+        while mach_absolute_time() - lagT < tk + step { usleep(2_000) }
+        f.withUnsafeMutableBufferPointer { refRing.read($0.baseAddress!, 160, host: tk) }
+        tk += step
         for i in 0..<160 { pcm[i] = Int16(max(-32768, min(32767, f[i] * 32768))) }
         pcm.withUnsafeBytes { p in var o = 0; while o < 320 { let n = write(1, p.baseAddress! + o, 320 - o); if n <= 0 { exit(0) }; o += n } }
     }
