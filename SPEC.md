@@ -222,8 +222,9 @@ VPIO's noise suppression was not measurable on a single-speaker machine.
    never held back. If auto-Enter is on, Return follows after
    `max(auto_enter_delay_ms, commit hold)`: the **commit hold** is 1.5 s
    when the pasted text reads complete (terminator after a non-connector
-   word) and 3 s when it trails off. Voice heard during the hold freezes it
-   (per voiced frame, ≤ 5 s total for voice never verified as the user's);
+   word) and 3 s when it trails off. Voice plausibly his (verified, no
+   "My Voice" gate, or a quiet room) freezes it per voiced frame, ≤ 3 s in
+   total; music never does (22:11:46Z: a countdown frozen 48 s by music);
    a verified resume cancels it and the new utterance is pasted as a
    continuation of the same text, so a thinking pause no longer sends half
    a thought (2026-10-15 18:56:06Z: "…and this is about all." was Entered

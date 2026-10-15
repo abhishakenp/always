@@ -747,6 +747,18 @@ const EARLY_VOICE_FALSE_START_MS: u32 = 150;
 /// speaker gate; only the cue-on-first-sound shortcut waits.
 const INSTANT_ANNOUNCE_RETRACT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// May voice during a pending auto-Enter freeze its countdown? Only voice
+/// plausibly his: no "My Voice" gate, or this utterance already verified,
+/// or a quiet room (nothing else playing). Music kept the VAD "in speech"
+/// and froze the countdown (2026-10-15 22:11:46Z: no Return for 48 s).
+fn countdown_defer_allowed(
+    speaker_gate_requested: bool,
+    speaker_verified: bool,
+    other_output_quiet: bool,
+) -> bool {
+    !speaker_gate_requested || speaker_verified || other_output_quiet
+}
+
 /// May the overlay + Listening cue fire on the first speech-like frames,
 /// before onset/verification? Without "My Voice" always; with it only in a
 /// quiet room (nothing else playing) and never during the backoff after a
@@ -2027,7 +2039,13 @@ fn record_with_local_vad(
                 // until the speaker gate decides (it cancels on a verified
                 // resume). Without this the gate's ~0.4-0.8 s let Return
                 // fire on the first half of a thought he was resuming.
-                if pause::countdown_active() {
+                if pause::countdown_active()
+                    && countdown_defer_allowed(
+                        speaker_gate_requested,
+                        speaker_checked,
+                        crate::always::audio::other_output_quiet(),
+                    )
+                {
                     pause::countdown_defer_for_voice();
                 }
                 voiced_samples += samples.len();
@@ -3696,6 +3714,17 @@ mod instant_announce_tests {
             blocked,
             now + INSTANT_ANNOUNCE_RETRACT_BACKOFF + Duration::from_millis(1)
         ));
+    }
+
+    #[test]
+    fn music_never_freezes_the_auto_enter_countdown() {
+        use super::countdown_defer_allowed as allowed;
+        // My Voice on, unverified voice, music playing: no freeze.
+        assert!(!allowed(true, false, false));
+        // Verified as him, or a quiet room, or no gate: freeze.
+        assert!(allowed(true, true, false));
+        assert!(allowed(true, false, true));
+        assert!(allowed(false, false, false));
     }
 
     #[test]

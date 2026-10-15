@@ -15,7 +15,7 @@ const TICK_MS: u32 = 100;
 /// Ceiling on how long voice that is never verified as the user's (a
 /// video, a colleague) may freeze one countdown: past it Return fires as
 /// scheduled.
-const MAX_VOICE_DEFER_MS: u32 = 5_000;
+const MAX_VOICE_DEFER_MS: u32 = 3_000;
 
 /// Schedule the auto-enter Return key for `delay_ms` from now. Spawns a
 /// tokio task on `rt` so the daemon main loop is free to record the next
@@ -80,8 +80,11 @@ pub fn schedule(rt: &Handle, delay_ms: u32) {
             }
         }
 
-        if let Err(error) = press_return_now() {
-            tracing::error!(?error, "auto_enter_countdown_press_return_failed");
+        match press_return_now() {
+            Ok(()) => tracing::info!(delay_ms, deferred_ms, "auto_enter_return_pressed"),
+            Err(error) => {
+                tracing::error!(?error, "auto_enter_countdown_press_return_failed")
+            }
         }
         // Return committed — the dictation buffer (used to merge follow-up
         // utterances) is no longer valid; the next utterance starts fresh.
