@@ -154,6 +154,20 @@ pub fn is_enabled() -> bool {
     setting().is_enabled()
 }
 
+#[cfg(test)]
+thread_local! {
+    // Per-test-thread fake sink: observe real cue requests without opening
+    // an audio device or sharing mutable observations across parallel tests.
+    static TEST_CUES: std::cell::RefCell<Vec<StatusSound>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_cues() -> Vec<StatusSound> {
+    TEST_CUES.with(|cues| std::mem::take(&mut *cues.borrow_mut()))
+}
+
 /// Play `sound` if cues are enabled. Never blocks: the request is posted
 /// to the playback worker.
 pub fn cue(sound: StatusSound) {
@@ -161,7 +175,8 @@ pub fn cue(sound: StatusSound) {
     // (`can_set_runtime_setting`) must not let a concurrent test's event
     // broadcast play through the speakers.
     if cfg!(test) {
-        let _ = sound;
+        #[cfg(test)]
+        TEST_CUES.with(|cues| cues.borrow_mut().push(sound));
         return;
     }
     let setting = setting();

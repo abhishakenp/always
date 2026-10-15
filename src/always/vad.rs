@@ -21,6 +21,8 @@ use crate::stt::Transcriber;
 struct SpeculationSlot {
     generation: AtomicU32,
     result: Mutex<Option<Result<crate::stt::TranscriptionResult>>>,
+    #[cfg(test)]
+    before_store: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl SpeculationSlot {
@@ -28,12 +30,15 @@ impl SpeculationSlot {
         Arc::new(Self {
             generation: AtomicU32::new(0),
             result: Mutex::new(None),
+            #[cfg(test)]
+            before_store: Mutex::new(None),
         })
     }
 
     fn invalidate(&self) {
+        let mut result = self.result.lock();
         self.generation.fetch_add(1, Ordering::Release);
-        *self.result.lock() = None;
+        *result = None;
     }
 
     fn current_generation(&self) -> u32 {
@@ -42,7 +47,16 @@ impl SpeculationSlot {
 
     fn store_if_current(&self, captured_gen: u32, value: Result<crate::stt::TranscriptionResult>) {
         if captured_gen == self.generation.load(Ordering::Acquire) {
-            *self.result.lock() = Some(value);
+            #[cfg(test)]
+            if let Some(before_store) = self.before_store.lock().take() {
+                before_store();
+            }
+            // Invalidation may finish after the optimistic check, before
+            // this writer gets the slot. Serialize its generation with data.
+            let mut result = self.result.lock();
+            if captured_gen == self.generation.load(Ordering::Acquire) {
+                *result = Some(value);
+            }
         }
     }
 
@@ -67,6 +81,41 @@ impl SpeculationSlot {
     fn peek_ready(&self) -> bool {
         self.result.lock().is_some()
     }
+}
+
+/// VAD overlay transition seam. Speculation may flip this repeatedly inside
+/// one utterance; the broadcaster owns the separate audible-cue lifetime.
+fn set_transcribing_overlay(
+    active: &mut bool,
+    next: bool,
+    broadcaster: &event::EventBroadcaster,
+) {
+    if *active == next {
+        return;
+    }
+    *active = next;
+    if next {
+        broadcaster.transcribing_started();
+    } else {
+        broadcaster.transcribing_stopped();
+    }
+}
+
+/// Apply the score-only tail endpoint to the live buffer. Kept separate
+/// from the verdict policy so result invalidation can be tested silently.
+fn apply_speaker_tail_cut(
+    samples: &mut Vec<i16>,
+    keep: usize,
+    speaker_trimmed: &mut bool,
+    speculation_pending: &mut bool,
+    speculation_slot: &SpeculationSlot,
+) {
+    samples.truncate(keep);
+    // Both the live stream and speculation heard audio beyond this cut.
+    // Match the cohort-tail path: only the retained buffer may supply text.
+    *speaker_trimmed = true;
+    *speculation_pending = false;
+    speculation_slot.invalidate();
 }
 
 /// Per-utterance latency capture points, consumed by the
@@ -1166,36 +1215,21 @@ fn record_with_local_vad(
     // at speculative STT kickoff (~60% of silence_secs), not on a early
     // energy dip — that mismatch made paste feel ~2s slower than the UI.
     // Final cut also guarantees the state. Resume mid-silence flips back.
-    // (`allow(unused_assignments)` covers terminal flips before return.)
     let mut transcribing_overlay = false;
-    // Helper: flip overlay to transcribing if not already.
-    // The `#[allow(unused_assignments)]` covers terminal flips that
-    // happen on the final iteration of the loop: the assignment is
-    // observable by *subsequent* macro calls (which is exactly what
-    // makes it correct), but on the last invocation before `return`
-    // there's no subsequent reader, so the lint fires at the
-    // expansion site. Scoping the allow into the macro body keeps
-    // the surrounding code under the project-wide `-D warnings` gate.
+    // Keep call sites concise; the transition seam is exercised without
+    // starting a microphone or recognizer in the regression tests.
     macro_rules! flip_to_transcribing {
         () => {{
-            if !transcribing_overlay {
-                #[allow(unused_assignments)]
-                {
-                    transcribing_overlay = true;
-                }
-                event::global_broadcaster().transcribing_started();
-            }
+            set_transcribing_overlay(
+                &mut transcribing_overlay, true, event::global_broadcaster(),
+            );
         }};
     }
     macro_rules! flip_to_listening {
         () => {{
-            if transcribing_overlay {
-                #[allow(unused_assignments)]
-                {
-                    transcribing_overlay = false;
-                }
-                event::global_broadcaster().transcribing_stopped();
-            }
+            set_transcribing_overlay(
+                &mut transcribing_overlay, false, event::global_broadcaster(),
+            );
         }};
     }
     macro_rules! announce_voice_activity {
@@ -1430,7 +1464,13 @@ fn record_with_local_vad(
                                             / 16_000.0,
                                         "speaker_gate_tail_cut"
                                     );
-                                    speech_samples.truncate(confirmed_user_len);
+                                    apply_speaker_tail_cut(
+                                        &mut speech_samples,
+                                        confirmed_user_len,
+                                        &mut speaker_trimmed,
+                                        &mut speculation_pending,
+                                        &speculation_slot,
+                                    );
                                     break;
                                 }
                             }
@@ -3500,6 +3540,129 @@ mod tests {
         speaker_gate_dependencies_ready, voice_activity_energy_threshold,
     };
     use crate::always::AlwaysConfig;
+
+    #[test]
+    fn speculative_overlay_resumes_without_repeated_cues_or_stale_results() {
+        use crate::always::{event::{DaemonEvent, EventBroadcaster}, status_sound::{StatusSound, take_test_cues}};
+        let b = EventBroadcaster::new();
+        let mut rx = b.subscribe();
+        let slot = super::SpeculationSlot::new();
+        let mut overlay = false;
+        take_test_cues();
+        b.voice_activity_detected();
+        for _ in 0..6 {
+            slot.invalidate(); // tentative silence kicks off a new generation
+            let generation = slot.current_generation();
+            super::set_transcribing_overlay(&mut overlay, true, &b);
+            super::set_transcribing_overlay(&mut overlay, true, &b); // no duplicate flip
+            slot.store_if_current(generation, Ok(crate::stt::TranscriptionResult {
+                text: "English words before the pause".into(),
+                ..Default::default()
+            }));
+            assert!(slot.peek_ready());
+            slot.invalidate(); // speech resumes: old speculation must be discarded
+            super::set_transcribing_overlay(&mut overlay, false, &b);
+            assert!(!slot.peek_ready());
+            slot.store_if_current(generation, Err(anyhow::anyhow!("late stale result")));
+            assert!(slot.take().is_none());
+        }
+        assert_eq!(take_test_cues(), vec![StatusSound::Listening, StatusSound::Transcribing]);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
+        assert_eq!(events.iter().filter(|e| matches!(e, DaemonEvent::TranscribingStarted)).count(), 6);
+        assert_eq!(events.iter().filter(|e| matches!(e, DaemonEvent::TranscribingStopped)).count(), 6);
+        // The final, current result is still usable after all the resumes.
+        slot.store_if_current(slot.current_generation(), Ok(crate::stt::TranscriptionResult {
+            text: "English words including the resumed ending".into(),
+            ..Default::default()
+        }));
+        assert_eq!(slot.take().unwrap().unwrap().text, "English words including the resumed ending");
+        b.utterance_terminal();
+        super::set_transcribing_overlay(&mut overlay, true, &b);
+        assert_eq!(take_test_cues(), vec![StatusSound::Transcribing]);
+    }
+
+    #[test]
+    fn speculative_store_cannot_cross_completed_invalidation() {
+        let slot = super::SpeculationSlot::new();
+        let old_generation = slot.current_generation();
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *slot.before_store.lock() = Some(Box::new(move || {
+            checked_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let writer_slot = slot.clone();
+        let writer = std::thread::spawn(move || {
+            writer_slot.store_if_current(old_generation, Ok(crate::stt::TranscriptionResult {
+                text: "discarded tail from old generation".into(),
+                ..Default::default()
+            }));
+        });
+        // Stop the real writer after its optimistic generation check, then
+        // complete the real cut before allowing that writer to publish.
+        checked_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mut samples = vec![11i16; 4];
+        samples.extend([22i16; 4]);
+        let mut trimmed = false;
+        let mut pending = true;
+        super::apply_speaker_tail_cut(&mut samples, 4, &mut trimmed, &mut pending, &slot);
+        assert!(trimmed && !pending);
+        assert_eq!(samples, vec![11i16; 4]);
+        assert!(!slot.peek_ready());
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(slot.take().is_none(), "old writer published after invalidation returned");
+        slot.store_if_current(slot.current_generation(), Ok(crate::stt::TranscriptionResult {
+            text: "retained English words".into(),
+            ..Default::default()
+        }));
+        assert_eq!(slot.take().unwrap().unwrap().text, "retained English words");
+    }
+
+    #[test]
+    fn score_only_tail_cut_invalidates_untrimmed_results() {
+        // Synthetic sample labels, not played or captured: kept prefix then
+        // a discarded tail. Exercise the same cut seam the verdict calls.
+        let mut invalidation_failures = Vec::new();
+        for ready in [false, true] {
+            let mut samples = vec![11i16; 10_320];
+            samples.extend(vec![22i16; 53_760]);
+            let slot = super::SpeculationSlot::new();
+            let old_generation = slot.current_generation();
+            let mut pending = true;
+            let mut trimmed = false;
+            if ready {
+                slot.store_if_current(old_generation, Ok(crate::stt::TranscriptionResult {
+                    text: "kept English words plus discarded tail".into(),
+                    ..Default::default()
+                }));
+            }
+            super::apply_speaker_tail_cut(
+                &mut samples, 10_320, &mut trimmed, &mut pending, &slot,
+            );
+            let cached_survived = slot.peek_ready();
+            slot.store_if_current(old_generation, Ok(crate::stt::TranscriptionResult {
+                text: "late result from untrimmed audio".into(),
+                ..Default::default()
+            }));
+            let late_survived = slot.peek_ready();
+            eprintln!("ready={ready} kept={} trimmed={trimmed} pending={pending} cached_survived={cached_survived} late_survived={late_survived}", samples.len());
+            assert_eq!(samples, vec![11i16; 10_320], "cut boundary unchanged");
+            if !(trimmed && !pending && !cached_survived && !late_survived) {
+                invalidation_failures.push(ready);
+                continue;
+            }
+            assert!(slot.take().is_none());
+            slot.store_if_current(slot.current_generation(), Ok(crate::stt::TranscriptionResult {
+                text: "kept English words".into(),
+                ..Default::default()
+            }));
+            assert_eq!(slot.take().unwrap().unwrap().text, "kept English words");
+        }
+        assert!(invalidation_failures.is_empty(),
+            "untrimmed stream/speculation survived; ready cases: {invalidation_failures:?}");
+    }
 
     static CHUNK_TARGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

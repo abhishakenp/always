@@ -712,8 +712,7 @@ pub fn paste_rejected(id: u64) -> bool {
 /// puts these on the wire when the matching start event is still open,
 /// so calling this unconditionally is free on idle cycles.
 fn emit_utterance_terminal() {
-    event::global_broadcaster().voice_activity_ended();
-    event::global_broadcaster().transcribing_stopped();
+    event::global_broadcaster().utterance_terminal();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1800,6 +1799,59 @@ mod tests {
         SHORT_UTTERANCE_MAX_CHARS, SHORT_UTTERANCE_MAX_WORDS, commit_hold_ms, is_short_utterance,
         should_auto_enter_for_text, should_refetch_speaker_model, snippet_utterance_for_log,
     };
+
+    #[test]
+    fn utterance_terminal_rearms_cue_after_success_held_cancel_error_and_reset() {
+        use crate::always::{event, status_sound::{StatusSound, take_test_cues}};
+        let b = event::global_broadcaster();
+        super::emit_utterance_terminal();
+        take_test_cues();
+        let mut rx = b.subscribe();
+        for boundary in ["success", "held", "cancel", "error", "reset"] {
+            b.voice_activity_detected();
+            b.transcribing_started();
+            b.transcribing_stopped(); // speculation invalidated, not a boundary
+            b.clone().transcribing_started(); // latch must be shared by clones
+            b.voice_activity_ended(); // capture ends before final ASR completes
+            b.transcribing_stopped();
+            b.transcribing_started(); // still no new cue
+            match boundary {
+                "success" => b.transcript_final("English dictation".into()),
+                "held" => {
+                    b.transcript_held(42, "Iris check this".into());
+                    b.transcript_final_quiet("Iris check this".into());
+                }
+                "cancel" => b.transcription_filtered("cancelled transcription"),
+                "error" => b.transcription_failed("stt", "test failure"),
+                "reset" => {}, // silent/drop/aborted recording cycle
+                _ => unreachable!(),
+            }
+            super::emit_utterance_terminal();
+            let mut events = Vec::new();
+            while let Ok(ev) = rx.try_recv() { events.push(ev); }
+            assert!(matches!(events.last(), Some(event::DaemonEvent::TranscribingStopped)));
+            if boundary == "held" {
+                let held = events.iter().position(|e| matches!(e, event::DaemonEvent::TranscriptHeld { .. })).unwrap();
+                let final_ = events.iter().position(|e| matches!(e, event::DaemonEvent::TranscriptFinal { .. })).unwrap();
+                assert!(held < final_);
+            }
+            let mut expected = vec![StatusSound::Listening, StatusSound::Transcribing];
+            match boundary {
+                "success" => expected.push(StatusSound::Success),
+                "cancel" => expected.push(StatusSound::Cancel),
+                "error" => expected.push(StatusSound::Failure),
+                _ => {},
+            }
+            assert_eq!(take_test_cues(), expected, "{boundary}");
+            super::emit_utterance_terminal(); // duplicate reset must stay quiet
+            assert!(rx.try_recv().is_err());
+            assert!(take_test_cues().is_empty());
+        }
+        b.voice_activity_detected();
+        b.transcribing_started();
+        assert_eq!(take_test_cues(), vec![StatusSound::Listening, StatusSound::Transcribing]);
+        super::emit_utterance_terminal();
+    }
 
     #[test]
     fn refetches_speaker_model_only_when_gate_requested_and_model_absent() {

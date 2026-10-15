@@ -1339,11 +1339,18 @@ caller, play start 11–21 ms. Every cue logs `status_sound_played {cue, level, 
 | Cue | File | When |
 |---|---|---|
 | Listening | start | listening badge raised (first VoiceActivityDetected) |
-| Transcribing | stop | first TranscribingStarted |
+| Transcribing | stop | first TranscribingStarted per utterance; speculative resume/silence cycles and heartbeats stay quiet |
 | Success | done | final delivered (not for consume-mode held finals — silent handoff) |
 | Failure | error | transcription failed |
 | Cancel | cancel | transcription filtered |
 | Command | command | reserved; not played on `DiscardHeld` (handoffs are silent, user request 2026-10-14) |
+
+The transcribing cue rearms only when `process_one` finishes its utterance
+cycle (delivered or held final, filtered/drop/cancel, silence/reset, or error).
+`TranscribingStopped` during resumed speech is not that boundary. Overlay
+transitions, watchdog heartbeats, speculative ASR invalidation and dictation
+remain unchanged; held finals keep their silent handoff. Requested 2026-10-15
+for the repeated sounds after English speech.
 
 ### 10.2 Voice level
 

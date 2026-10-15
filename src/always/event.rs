@@ -832,6 +832,9 @@ pub struct EventBroadcaster {
     voice_active: Arc<AtomicBool>,
     /// Same transition guard for `TranscribingStarted`/`TranscribingStopped`.
     transcribing_active: Arc<AtomicBool>,
+    /// Audio cue lifetime is the entire process_one cycle, not a speculative
+    /// overlay interval. Shared by clones, reset only at the terminal boundary.
+    transcribing_cued: Arc<AtomicBool>,
 }
 
 impl EventBroadcaster {
@@ -848,6 +851,7 @@ impl EventBroadcaster {
             tx,
             voice_active: Arc::new(AtomicBool::new(false)),
             transcribing_active: Arc::new(AtomicBool::new(false)),
+            transcribing_cued: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -884,7 +888,8 @@ impl EventBroadcaster {
     /// Send transcribing started event. Always broadcast (re-emits double
     /// as a keep-alive heartbeat for the GUI's stale-state watchdog).
     pub fn transcribing_started(&self) {
-        if !self.transcribing_active.swap(true, Ordering::SeqCst) {
+        self.transcribing_active.store(true, Ordering::SeqCst);
+        if !self.transcribing_cued.swap(true, Ordering::SeqCst) {
             crate::always::status_sound::cue(
                 crate::always::status_sound::StatusSound::Transcribing,
             );
@@ -898,6 +903,15 @@ impl EventBroadcaster {
         if self.transcribing_active.swap(false, Ordering::SeqCst) {
             self.send(DaemonEvent::TranscribingStopped);
         }
+    }
+
+    /// Close one capture/process cycle (success, held final, cancel/drop or
+    /// error). Speculative stops and early voice-ended events are NOT this
+    /// boundary: ASR may still start again before process_one returns.
+    pub(crate) fn utterance_terminal(&self) {
+        self.voice_activity_ended();
+        self.transcribing_stopped();
+        self.transcribing_cued.store(false, Ordering::SeqCst);
     }
 
     /// Send partial transcript chunk (speculative / streaming preview)
@@ -1390,6 +1404,32 @@ mod tests {
         let events = drain(&mut rx);
         assert_eq!(events.len(), 4);
         assert!(matches!(events[3], DaemonEvent::VoiceActivityEnded));
+    }
+
+    #[test]
+    fn speculative_transcribing_cue_is_once_per_utterance() {
+        use crate::always::status_sound::{StatusSound, take_test_cues};
+        take_test_cues();
+        let b = EventBroadcaster::new();
+        let mut rx = b.subscribe();
+        b.voice_activity_detected();
+        // The VAD's tentative silence -> speculation -> speech-resume
+        // transitions, six times inside the same captured utterance.
+        for _ in 0..6 {
+            b.transcribing_started();
+            b.transcribing_started(); // watchdog heartbeat is still sent
+            b.transcript_chunk("still speaking".into());
+            b.transcribing_stopped();
+        }
+        let cues = take_test_cues();
+        let transcribing = cues.iter().filter(|&&cue| cue == StatusSound::Transcribing).count();
+        eprintln!("six speculative cycles: {transcribing} transcribing cue requests");
+        let events = drain(&mut rx);
+        assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscribingStarted)).count(), 12);
+        assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscribingStopped)).count(), 6);
+        assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscriptChunk { .. })).count(), 6);
+        assert_eq!(transcribing, 1);
+        assert_eq!(cues.iter().filter(|&&cue| cue == StatusSound::Listening).count(), 1);
     }
 
     #[test]
