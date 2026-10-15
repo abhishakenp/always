@@ -67,6 +67,18 @@ struct PermissionsPanel: View {
                 actionTitle: permissions.accessibilityStatus.isOK ? nil : "Open Settings",
                 action: handleAccessibilityAction
             )
+
+            permissionRow(
+                icon: "speaker.wave.2.fill",
+                title: "System Audio Recording",
+                status: permissions.systemAudioStatus.isOK ? "Granted"
+                    : permissions.systemAudioStatus == .denied ? "Denied" : "Not requested",
+                detail: "Recommended. Removes what your Mac is playing (videos, music, voice assistants) from your dictation so you are heard over it.",
+                granted: permissions.systemAudioStatus.isOK,
+                actionTitle: permissions.systemAudioStatus.isOK ? nil
+                    : permissions.systemAudioStatus == .notDetermined ? "Allow" : "Open Settings",
+                action: { permissions.requestSystemAudioIfNeeded() }
+            )
         }
     }
 

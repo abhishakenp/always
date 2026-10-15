@@ -302,6 +302,7 @@ final class TapPipeline {
 
 var tapStatsHolder: DispatchSourceTimer?
 var signalSources: [DispatchSourceSignal] = []
+var grantWatch: DispatchSourceTimer?
 let aecPref = ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_AEC"] ?? ""
 if args.contains("--request-tap-permission") {
     log("tap permission before: \(tapPermission())")
@@ -337,15 +338,18 @@ if !args.contains("--no-vp") && !args.contains("--vp") && aecPref != "vp" {
             else { outputTap = t; tapMode = true }
         } else {
             log("ref tap needs System Audio Recording (permission=\(perm)) — using VPIO")
-            // Ask once (the prompt names Always, the responsible app). VPIO
-            // keeps capturing meanwhile; on "Allow" exit so the daemon
-            // respawns this helper straight into tap mode.
-            if perm == "undetermined" && ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_TAP_REQUEST"] != "0" {
-                Thread {
-                    let ok = requestTapPermission()
-                    log("tap permission request answered: granted=\(ok)")
-                    if ok { log("respawning into tap mode"); exit(0) }
-                }.start()
+            // The Always app is the sole requester (Settings / onboarding
+            // "System Audio Recording"). Here: watch for the grant (a cheap
+            // TCC preflight every 10 s) and exit once it lands, so the
+            // daemon respawns this helper straight into tap mode.
+            do {
+                let w = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+                w.schedule(deadline: .now() + 10, repeating: 10)
+                w.setEventHandler {
+                    if tapPermission() == "authorized" { log("System Audio Recording granted — respawning into tap mode"); exit(0) }
+                }
+                w.resume()
+                grantWatch = w
             }
         }
     }

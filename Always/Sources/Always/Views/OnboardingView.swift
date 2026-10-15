@@ -81,6 +81,7 @@ struct OnboardingView: View {
     // Permission state
     @State private var micStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
     @State private var accessibilityStatus: Bool = AXIsProcessTrusted()
+    @ObservedObject private var systemAudio = PermissionsManager.shared
     @State private var inputMonitoringGranted: Bool =
         IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
 
@@ -414,6 +415,18 @@ struct OnboardingView: View {
             if speech.isOnDeviceEngineAvailable {
                 speechModelRow
             }
+
+            permissionCard(
+                icon: "speaker.wave.2.fill",
+                iconColor: .teal,
+                title: "System Audio Recording",
+                detail: "Recommended — so you are heard over videos, music and voice assistants playing on this Mac.",
+                granted: systemAudio.systemAudioStatus.isOK,
+                waiting: false,
+                actionTitle: systemAudio.systemAudioStatus.isOK ? nil
+                    : systemAudio.systemAudioStatus == .notDetermined ? "Allow" : "Open System Settings",
+                action: { PermissionsManager.shared.requestSystemAudioIfNeeded() }
+            )
 
             if !requiredPermissionsGranted {
                 Text("macOS may need you to toggle Always on in System Settings. This window updates on its own once you do.")

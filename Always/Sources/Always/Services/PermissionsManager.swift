@@ -31,6 +31,12 @@ final class PermissionsManager: ObservableObject {
     /// GUI process's own TCC check — the two can disagree when the grant
     /// is keyed to a different responsible process.
     @Published private(set) var daemonShortcutsGranted: Bool?
+    /// "System Audio Recording" (kTCCServiceAudioCapture). Optional: with
+    /// it, the capture helper cancels everything the Mac plays (videos,
+    /// music, voice assistants) from the microphone using a process tap as
+    /// the echo reference; without it, it falls back to Apple's voice
+    /// processing, which only cancels its own output.
+    @Published private(set) var systemAudioStatus: SystemAudioStatus = .notDetermined
 
     /// When the user just navigated away to grant a permission via
     /// `openSystemSettings`, we keep track of which one so we can
@@ -79,6 +85,52 @@ final class PermissionsManager: ObservableObject {
         }
     }
 
+    enum SystemAudioStatus: Equatable, CustomStringConvertible {
+        case granted
+        case denied
+        case notDetermined
+        var isOK: Bool { self == .granted }
+        var description: String {
+            switch self {
+            case .granted: return "granted"
+            case .denied: return "denied"
+            case .notDetermined: return "notDetermined"
+            }
+        }
+    }
+
+    // TCC has no public preflight/request API for system audio capture;
+    // the private TCC calls are what AudioCap-style apps use. Resolved once.
+    private typealias TCCPreflight = @convention(c) (CFString, CFDictionary?) -> Int
+    private typealias TCCRequest = @convention(c) (CFString, CFDictionary?, @escaping (Bool) -> Void) -> Void
+    private static let tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+
+    private static func systemAudioPreflight() -> SystemAudioStatus {
+        guard let tcc, let sym = dlsym(tcc, "TCCAccessPreflight") else { return .notDetermined }
+        switch unsafeBitCast(sym, to: TCCPreflight.self)("kTCCServiceAudioCapture" as CFString, nil) {
+        case 0: return .granted
+        case 1: return .denied
+        default: return .notDetermined
+        }
+    }
+
+    /// Show the macOS "System Audio Recording" prompt (attributed to
+    /// Always) when not yet decided; otherwise open its Settings pane.
+    /// The capture helper polls the grant and switches to tap-referenced
+    /// echo cancellation on its own.
+    func requestSystemAudioIfNeeded() {
+        refresh()
+        guard Self.systemAudioPreflight() == .notDetermined,
+              let tcc = Self.tcc, let sym = dlsym(tcc, "TCCAccessRequest") else {
+            openSystemSettings(for: .systemAudio)
+            return
+        }
+        unsafeBitCast(sym, to: TCCRequest.self)("kTCCServiceAudioCapture" as CFString, nil) { [weak self] granted in
+            self?.logger.info("system audio recording request answered granted=\(granted, privacy: .public)")
+            self?.refresh()
+        }
+    }
+
     private let logger = Logger(subsystem: "com.always.app", category: "permissions")
     private var pollTimer: Timer?
 
@@ -109,6 +161,7 @@ final class PermissionsManager: ObservableObject {
         let newInputMon: InputMonitoringStatus =
             IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
             ? .granted : .notGranted
+        let newSysAudio = Self.systemAudioPreflight()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let changed = self.micStatus != newMic
@@ -120,6 +173,10 @@ final class PermissionsManager: ObservableObject {
             self.micStatus = newMic
             self.accessibilityStatus = newAccess
             self.inputMonitoringStatus = newInputMon
+            if self.systemAudioStatus != newSysAudio {
+                self.logger.info("permissions: system audio \(self.systemAudioStatus)→\(newSysAudio, privacy: .public)")
+                self.systemAudioStatus = newSysAudio
+            }
         }
     }
 
@@ -215,6 +272,10 @@ final class PermissionsManager: ObservableObject {
                 return URL(
                     string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
                 )
+            case .systemAudio:
+                return URL(
+                    string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+                )
             }
         }()
         if let url {
@@ -222,7 +283,7 @@ final class PermissionsManager: ObservableObject {
         }
     }
 
-    enum Permission { case microphone, accessibility, inputMonitoring }
+    enum Permission { case microphone, accessibility, inputMonitoring, systemAudio }
 
     /// Re-check status whenever the app comes to the foreground —
     /// this is the moment the user has likely just toggled a switch

@@ -18,7 +18,7 @@ struct PermissionsBanner: View {
     /// onboarding — they already know.
     private var isHidden: Bool {
         perms.micStatus.isOK && perms.accessibilityStatus.isOK && perms.inputMonitoringStatus.isOK
-            && perms.daemonShortcutsGranted != false
+            && perms.daemonShortcutsGranted != false && perms.systemAudioStatus.isOK
     }
 
     /// The daemon reports its tap is dead while the GUI's own check looks
@@ -76,6 +76,15 @@ struct PermissionsBanner: View {
                         detail: "Required for the global keyboard shortcuts (pause ⌃⌥P, auto-enter, force-paste). Click to add Always under Privacy & Security → Input Monitoring, then enable it.",
                         action: .inputMonitoring,
                         actionTitle: "Open System Settings"
+                    )
+                }
+
+                if !perms.systemAudioStatus.isOK {
+                    permissionRow(
+                        title: "System Audio Recording",
+                        detail: "Recommended — lets Always remove videos, music and voice assistants playing on this Mac from your dictation, so you are heard over them. Until then, Always uses basic echo cancellation.",
+                        action: .systemAudio,
+                        actionTitle: perms.systemAudioStatus == .notDetermined ? "Allow" : "Open System Settings"
                     )
                 }
 
@@ -147,6 +156,8 @@ struct PermissionsBanner: View {
             // the system setting pane so the user can toggle it ON.
             // The banner will auto-refresh (1.5s after focus returns).
             _ = perms.requestInputMonitoringIfNeeded()
+        case .systemAudio:
+            perms.requestSystemAudioIfNeeded()
         }
     }
 
