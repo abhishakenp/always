@@ -33,6 +33,7 @@ node_modules/
 preview-asr/.build/
 preview-asr/.swiftpm/
 capture/always-capture
+capture/aec_eval
 
 scripts/launch-smoke/AlwaysSmoke.app/
 scripts/launch-smoke/events.jsonl

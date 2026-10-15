@@ -14,7 +14,15 @@
 // polling. Measured 2026-10-14 on the user's MacBook Air (60 s windows, same
 // room): VPIO active 15.1 CPU-s/min, VPIO bypassed 3.0 CPU-s/min.
 //
-// Usage: always-capture [--no-vp] [--aec-always] [--agc] [--duck]
+// 2026-10-15: default path is now TAP mode (see "Echo cancellation against
+// what the Mac is PLAYING" below) — VPIO turned out not to cancel other
+// processes' audio at all; VPIO remains the fallback without permission.
+//
+// Usage: always-capture [--no-vp] [--vp] [--tap] [--aec-always] [--agc] [--duck]
+//   --vp / --tap  force the VPIO / tap-reference canceller (env ALWAYS_CAPTURE_AEC)
+//   --tap-status  print the System Audio Recording permission and exit
+//   --request-tap-permission  show the permission prompt and exit
+//   --ref-only    diagnostics: write the 16 kHz tap reference (no mic) to stdout
 //   --no-vp  plain capture (no echo cancellation) — measurement baseline
 //   --aec-always  never bypass the echo canceller (pre-2026-10-14 behaviour)
 //   --agc    keep VPIO's automatic gain control on (default off: the daemon's
@@ -29,7 +37,6 @@ import Foundation
 
 signal(SIGPIPE, SIG_IGN)
 let args = Set(CommandLine.arguments.dropFirst())
-let useVP = !args.contains("--no-vp")
 let parentPid = getppid()
 
 func log(_ s: String) {
@@ -37,6 +44,310 @@ func log(_ s: String) {
     // when the daemon has gone (same crash as Iris's pcm-play/brief-fm).
     _ = "always-capture: \(s)\n".withCString { fputs($0, stderr) }
 }
+
+// ---- Echo cancellation against what the Mac is PLAYING ----------------------
+// Measured 2026-10-15 (prod logs, built-in speakers): with Apple's voice-
+// processing unit "engaged" for a YouTube/Music tab (17:11–17:38Z) the song's
+// lyrics were transcribed 235 times, and Iris's own TTS ("hit a snag, rate
+// limit. Want to take a look?", 15:31:52Z) came through at −11 dBFS peak —
+// VPIO only cancels audio rendered through ITS OWN output, never another
+// process's, yet cost 15 CPU-s/min. Anything he said over it was scored as
+// one mixed segment and dropped by the speaker gate.
+//
+// Tap mode (default when "System Audio Recording" is granted): a CoreAudio
+// process tap of ALL output (every app, Iris's speech, our own cues) is the
+// far-end reference for a SpeexDSP MDF adaptive canceller + residual echo
+// suppressor (capture/aec_core.c), on the plain microphone. The canceller
+// does no work while nothing plays (silent reference). Without the
+// permission (or on any tap failure) the helper keeps the VPIO path.
+// Force a path: --vp / --tap, or ALWAYS_CAPTURE_AEC=vp|tap.
+
+typealias TCCPreflightFn = @convention(c) (CFString, CFDictionary?) -> Int
+typealias TCCRequestFn = @convention(c) (CFString, CFDictionary?, @escaping (Bool) -> Void) -> Void
+let tccLib = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+/// "authorized" | "denied" | "undetermined" | "unknown" for System Audio Recording.
+func tapPermission() -> String {
+    guard let tccLib, let sym = dlsym(tccLib, "TCCAccessPreflight") else { return "unknown" }
+    let r = unsafeBitCast(sym, to: TCCPreflightFn.self)("kTCCServiceAudioCapture" as CFString, nil)
+    return r == 0 ? "authorized" : r == 1 ? "denied" : "undetermined"
+}
+/// Shows the system prompt (attributed to the responsible app, Always).
+func requestTapPermission() -> Bool {
+    guard let tccLib, let sym = dlsym(tccLib, "TCCAccessRequest") else { return false }
+    let sem = DispatchSemaphore(value: 0)
+    var ok = false
+    unsafeBitCast(sym, to: TCCRequestFn.self)("kTCCServiceAudioCapture" as CFString, nil) { g in ok = g; sem.signal() }
+    _ = sem.wait(timeout: .now() + 120)
+    return ok
+}
+
+let hostTicksPerSec: Double = {
+    var tb = mach_timebase_info_data_t()
+    mach_timebase_info(&tb)
+    return 1e9 * Double(tb.denom) / Double(tb.numer)
+}()
+
+/// 16 kHz reference samples indexed by host time, so the mic frame captured
+/// at host time T reads what was being played at T (the echo of it arrives
+/// later — output latency + air — which the adaptive filter models). Writer:
+/// the tap IOProc. Reader: the mic tap thread.
+final class RefRing {
+    private var lock = os_unfair_lock()
+    private let cap = 1 << 16  // 4.1 s
+    private var buf: [Float]
+    private var base: UInt64 = 0      // host time of index 0
+    private var writeIdx: Int64 = 0   // next index to write
+    init() { buf = [Float](repeating: 0, count: 1 << 16) }
+    private func index(_ host: UInt64) -> Int64 {
+        Int64((Double(Int64(bitPattern: host &- base)) / hostTicksPerSec * 16_000).rounded())
+    }
+    func write(_ p: UnsafePointer<Float>, _ n: Int, host: UInt64) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        if base == 0 { base = host }
+        var idx = index(host)
+        // Stay continuous through timestamp jitter (< 2 ms); re-sync otherwise.
+        if abs(idx - writeIdx) < 32 { idx = writeIdx }
+        if idx > writeIdx {  // gap: what played then is unknown → silence
+            var j = max(writeIdx, idx - Int64(cap))
+            while j < idx { buf[Int(j & Int64(cap - 1))] = 0; j += 1 }
+        }
+        for i in 0..<n { buf[Int((idx + Int64(i)) & Int64(cap - 1))] = p[i] }
+        writeIdx = idx + Int64(n)
+    }
+    func read(_ out: UnsafeMutablePointer<Float>, _ n: Int, host: UInt64) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        let idx = base == 0 ? Int64.min / 2 : index(host)
+        for i in 0..<n {
+            let j = idx + Int64(i)
+            out[i] = (j < writeIdx && j >= writeIdx - Int64(cap)) ? buf[Int(j & Int64(cap - 1))] : 0
+        }
+    }
+}
+let refRing = RefRing()
+
+/// Global tap of every process's output (nothing muted, nothing rerouted) on
+/// a private aggregate device; its IOProc downmixes to mono, resamples to
+/// 16 kHz and fills `refRing`.
+@available(macOS 14.2, *)
+final class OutputTap {
+    var tapID = AudioObjectID(kAudioObjectUnknown)
+    var aggID = AudioObjectID(kAudioObjectUnknown)
+    var procID: AudioDeviceIOProcID?
+    var resampler: OpaquePointer?
+    var mono = [Float](repeating: 0, count: 8192)
+    var res = [Float](repeating: 0, count: 8192)
+    var rate: Double = 0
+
+    func start() -> String? {
+        var outDev = AudioObjectID(kAudioObjectUnknown)
+        var a = caAddr(kAudioHardwarePropertyDefaultOutputDevice)
+        var sz = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &sz, &outDev) == noErr
+        else { return "no default output" }
+        var uidRef: Unmanaged<CFString>?
+        a = caAddr(kAudioDevicePropertyDeviceUID)
+        sz = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(outDev, &a, 0, nil, &sz, &uidRef) == noErr, let outUID = uidRef?.takeRetainedValue()
+        else { return "no output uid" }
+        let d = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        d.uuid = UUID()
+        d.name = "always-capture-ref"
+        d.isPrivate = true
+        d.muteBehavior = .unmuted
+        var st = AudioHardwareCreateProcessTap(d, &tapID)
+        if st != noErr { return "AudioHardwareCreateProcessTap \(st)" }
+        let desc: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "always-capture-ref",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: outUID as String,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outUID as String]],
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true,
+                                               kAudioSubTapUIDKey: d.uuid.uuidString]],
+        ]
+        st = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &aggID)
+        if st != noErr { stop(); return "AudioHardwareCreateAggregateDevice \(st)" }
+        // Tap stream format (the IOProc's input).
+        var asbd = AudioStreamBasicDescription()
+        a = caAddr(kAudioTapPropertyFormat)
+        sz = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        st = AudioObjectGetPropertyData(tapID, &a, 0, nil, &sz, &asbd)
+        if st != noErr || asbd.mSampleRate <= 0 { stop(); return "tap format \(st)" }
+        rate = asbd.mSampleRate
+        var err: Int32 = 0
+        resampler = speex_resampler_init(1, UInt32(rate), 16_000, 4, &err)
+        if resampler == nil { stop(); return "resampler \(err)" }
+        st = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, nil) { [unowned self] _, inData, inTime, _, _ in
+            self.ioProc(inData, inTime)
+        }
+        if st != noErr { stop(); return "AudioDeviceCreateIOProcIDWithBlock \(st)" }
+        st = AudioDeviceStart(aggID, procID)
+        if st != noErr { stop(); return "AudioDeviceStart \(st)" }
+        log("ref tap on: global output tap \(Int(rate)) Hz \(asbd.mChannelsPerFrame)ch via \(outUID)")
+        return nil
+    }
+
+    private func ioProc(_ inData: UnsafePointer<AudioBufferList>, _ inTime: UnsafePointer<AudioTimeStamp>) {
+        let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
+        guard let b = ins.first, let p = b.mData else { return }
+        let f = p.assumingMemoryBound(to: Float.self)
+        var n = 0
+        if b.mNumberChannels >= 2 {
+            let ch = Int(b.mNumberChannels)
+            n = min(Int(b.mDataByteSize) / 4 / ch, mono.count)
+            for i in 0..<n { mono[i] = 0.5 * (f[i * ch] + f[i * ch + 1]) }
+        } else if ins.count >= 2, let p2 = ins[1].mData {
+            let g = p2.assumingMemoryBound(to: Float.self)
+            n = min(Int(b.mDataByteSize) / 4, mono.count)
+            for i in 0..<n { mono[i] = 0.5 * (f[i] + g[i]) }
+        } else {
+            n = min(Int(b.mDataByteSize) / 4, mono.count)
+            for i in 0..<n { mono[i] = f[i] }
+        }
+        guard n > 0 else { return }
+        var inLen = UInt32(n), outLen = UInt32(res.count)
+        mono.withUnsafeBufferPointer { mp in
+            res.withUnsafeMutableBufferPointer { rp in
+                _ = speex_resampler_process_float(resampler, 0, mp.baseAddress, &inLen, rp.baseAddress, &outLen)
+            }
+        }
+        let host = (inTime.pointee.mFlags.contains(.hostTimeValid)) ? inTime.pointee.mHostTime : mach_absolute_time()
+        res.withUnsafeBufferPointer { refRing.write($0.baseAddress!, Int(outLen), host: host) }
+    }
+
+    func stop() {
+        if let procID { AudioDeviceStop(aggID, procID); AudioDeviceDestroyIOProcID(aggID, procID) }
+        procID = nil
+        if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID) }
+        if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID) }
+        aggID = AudioObjectID(kAudioObjectUnknown); tapID = AudioObjectID(kAudioObjectUnknown)
+        if let resampler { speex_resampler_destroy(resampler) }
+        resampler = nil
+    }
+}
+
+/// Mic → 10 ms frames → canceller (against the reference at the same host
+/// time) → speech AGC → s16 on stdout. Tap thread only.
+final class TapPipeline {
+    let aec: OpaquePointer
+    let agc: OpaquePointer
+    var acc = [Float](repeating: 0, count: 8192)
+    var accN = 0
+    var accHost: UInt64 = 0          // host time of acc[0]
+    var ref = [Float](repeating: 0, count: Int(AEC_FRAME))
+    var out = [Float](repeating: 0, count: Int(AEC_FRAME))
+    var pcm = [Int16](repeating: 0, count: Int(AEC_FRAME))
+    var engaged = false
+    // Stats for the 10 s summary log line.
+    var framesRun = 0, framesPassed = 0, maxRefRms: Float = 0
+    init() {
+        let env = ProcessInfo.processInfo.environment
+        let tail = Int32(env["ALWAYS_CAPTURE_AEC_TAIL"] ?? "") ?? 4096
+        // Canceller on the raw mic, then a speech AGC on its output starting
+        // at 22 dB — the measured raw-vs-VPIO level offset — so the daemon's
+        // levels do not drop when the path changes.
+        let pre = Float(env["ALWAYS_CAPTURE_PREGAIN_DB"] ?? "") ?? 0
+        aec = aec_new(tail, 0, 0, pre)
+        let g0 = Float(env["ALWAYS_CAPTURE_GAIN_DB"] ?? "") ?? 22
+        agc = aec_agc_new(-26, 35 - pre, max(0, g0 - pre))
+    }
+    func feed(_ p: UnsafePointer<Float>, _ n: Int, host: UInt64) {
+        let frame = Int(AEC_FRAME)
+        // The buffer's first sample is at `host`; anything still accumulated
+        // is the 16 kHz audio just before it.
+        accHost = host &- UInt64(Double(accN) / 16_000 * hostTicksPerSec)
+        var i = 0
+        while i < n {
+            let k = min(n - i, acc.count - accN)
+            for j in 0..<k { acc[accN + j] = p[i + j] }
+            accN += k; i += k
+            var off = 0
+            while accN - off >= frame {
+                let fh = accHost &+ UInt64(Double(off) / 16_000 * hostTicksPerSec)
+                ref.withUnsafeMutableBufferPointer { refRing.read($0.baseAddress!, frame, host: fh) }
+                var e: Float = 0
+                for r in ref { e += r * r }
+                maxRefRms = max(maxRefRms, sqrtf(e / Float(frame)))
+                let ran = acc.withUnsafeBufferPointer { a in
+                    ref.withUnsafeBufferPointer { r in
+                        out.withUnsafeMutableBufferPointer { o in
+                            aec_process(aec, a.baseAddress! + off, r.baseAddress!, o.baseAddress!)
+                        }
+                    }
+                }
+                if ran != 0 { framesRun += 1 } else { framesPassed += 1 }
+                if (ran != 0) != engaged {
+                    engaged = ran != 0
+                    log("aec \(engaged ? "engaged" : "bypassed") (tap reference \(engaged ? "playing" : "silent"))")
+                }
+                // Gain adapts only while nothing plays: music never trains it.
+                out.withUnsafeMutableBufferPointer { aec_agc_process(agc, $0.baseAddress!, ran != 0 ? 0 : 1) }
+                for j in 0..<frame {
+                    let s = out[j] * 32768
+                    pcm[j] = Int16(max(-32768, min(32767, s)))
+                }
+                pcm.withUnsafeBytes { writeAll($0.baseAddress!, frame * 2) }
+                off += frame
+            }
+            if off > 0 {
+                for j in 0..<(accN - off) { acc[j] = acc[off + j] }
+                accN -= off
+                accHost = accHost &+ UInt64(Double(off) / 16_000 * hostTicksPerSec)
+            }
+        }
+    }
+}
+
+var tapStatsHolder: DispatchSourceTimer?
+let aecPref = ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_AEC"] ?? ""
+if args.contains("--request-tap-permission") {
+    log("tap permission before: \(tapPermission())")
+    log("tap permission granted: \(requestTapPermission())")
+    exit(0)
+}
+if args.contains("--tap-status") { log("tap permission: \(tapPermission())"); exit(0) }
+var tapMode = false
+var outputTap: AnyObject?
+// Diagnostics: `--ref-only` runs only the output tap (no microphone) and
+// writes the 16 kHz mono s16 reference to stdout, 10 ms at a time.
+if args.contains("--ref-only") {
+    guard #available(macOS 14.2, *) else { exit(5) }
+    let t = OutputTap()
+    if let err = t.start() { log("ref tap unavailable: \(err)"); exit(5) }
+    var f = [Float](repeating: 0, count: 160), pcm = [Int16](repeating: 0, count: 160)
+    while true {
+        usleep(10_000)
+        f.withUnsafeMutableBufferPointer { refRing.read($0.baseAddress!, 160, host: mach_absolute_time() - UInt64(0.2 * hostTicksPerSec)) }
+        for i in 0..<160 { pcm[i] = Int16(max(-32768, min(32767, f[i] * 32768))) }
+        pcm.withUnsafeBytes { p in var o = 0; while o < 320 { let n = write(1, p.baseAddress! + o, 320 - o); if n <= 0 { exit(0) }; o += n } }
+    }
+}
+if !args.contains("--no-vp") && !args.contains("--vp") && aecPref != "vp" {
+    if #available(macOS 14.2, *) {
+        let perm = tapPermission()
+        if perm == "authorized" || args.contains("--tap") || aecPref == "tap" {
+            let t = OutputTap()
+            if let err = t.start() { log("ref tap unavailable (\(err), permission=\(perm)) — using VPIO") }
+            else { outputTap = t; tapMode = true }
+        } else {
+            log("ref tap needs System Audio Recording (permission=\(perm)) — using VPIO")
+            // Ask once (the prompt names Always, the responsible app). VPIO
+            // keeps capturing meanwhile; on "Allow" exit so the daemon
+            // respawns this helper straight into tap mode.
+            if perm == "undetermined" && ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_TAP_REQUEST"] != "0" {
+                Thread {
+                    let ok = requestTapPermission()
+                    log("tap permission request answered: granted=\(ok)")
+                    if ok { log("respawning into tap mode"); exit(0) }
+                }.start()
+            }
+        }
+    }
+}
+let useVP = !args.contains("--no-vp") && !tapMode
+let tapPipeline: TapPipeline? = tapMode ? TapPipeline() : nil
 
 let engine = AVAudioEngine()
 let input = engine.inputNode
@@ -67,7 +378,8 @@ guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
 // 0); mix down only channel 0 rather than averaging in raw mic channels.
 let monoIn = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: inFormat.sampleRate,
                            channels: 1, interleaved: false)!
-let outFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
+// Tap mode converts to float for the canceller, which writes the s16.
+let outFormat = AVAudioFormat(commonFormat: tapMode ? .pcmFormatFloat32 : .pcmFormatInt16, sampleRate: 16_000,
                               channels: 1, interleaved: true)!
 guard let converter = AVAudioConverter(from: monoIn, to: outFormat) else {
     log("no converter")
@@ -158,7 +470,7 @@ func stopRawMeter() {
 // touches them.
 var monoBuf: AVAudioPCMBuffer?
 var outBuf: AVAudioPCMBuffer?
-input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buffer, _ in
+input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buffer, when in
     let frames = Int(buffer.frameLength)
     guard frames > 0, let src = buffer.floatChannelData?[0] else { return }
     if rawLevelsEnabled { procMeter.add(src, frames, rate: inFormat.sampleRate) }
@@ -184,7 +496,12 @@ input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buffer, _ in
     }
     if let err { log("convert error: \(err)"); return }
     let n = Int(out.frameLength)
-    if n > 0 { writeAll(out.int16ChannelData![0], n * 2) }
+    guard n > 0 else { return }
+    if let tp = tapPipeline {
+        tp.feed(out.floatChannelData![0], n, host: when.isHostTimeValid ? when.hostTime : mach_absolute_time())
+    } else {
+        writeAll(out.int16ChannelData![0], n * 2)
+    }
 }
 
 // ---- Status cues through THIS engine's output -------------------------------
@@ -505,7 +822,23 @@ if rawLevelsEnabled {
     }
     levelTimer.resume()
 }
-log("capturing")
+if let tp = tapPipeline {
+    // One line per 10 s while anything played: canceller duty cycle + gain.
+    let tapStatsTimer = DispatchSource.makeTimerSource(queue: .main)
+    tapStatsTimer.schedule(deadline: .now() + 10, repeating: 10)
+    tapStatsTimer.setEventHandler {
+        // Torn reads of these counters are harmless (diagnostics only).
+        let run = tp.framesRun, passed = tp.framesPassed, peak = tp.maxRefRms
+        tp.framesRun = 0; tp.framesPassed = 0; tp.maxRefRms = 0
+        if run > 0 {
+            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB", run, passed,
+                       20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc)))
+        }
+    }
+    tapStatsTimer.resume()
+    tapStatsHolder = tapStatsTimer
+}
+log("capturing mode=\(tapMode ? "tap-aec" : useVP ? "vpio" : "plain")")
 
 // Parent-death watchdog: the daemon may be SIGKILLed with our stdout pipe
 // still referenced elsewhere; never outlive it. Kernel exit notification

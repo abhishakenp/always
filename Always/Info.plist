@@ -43,6 +43,8 @@
     <key>NSAppleEventsUsageDescription</key>
     <string>Always needs accessibility access to position the voice indicator near your active text field.</string>
     <!-- Required for mic TCC; bundled always-daemon inherits Always.app attribution. -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Always listens to what your Mac is playing so it can remove videos, music and voice assistants from your dictation.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Always needs microphone access to detect when you speak and transcribe your voice into text.</string>
     <!-- Required for on-device Siri dictation via SFSpeechRecognizer. -->
