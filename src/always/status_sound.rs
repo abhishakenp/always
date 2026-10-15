@@ -19,9 +19,9 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::sync::mpsc;
 
 static AUDIBLE_STATUS_SOUND: AtomicU8 = AtomicU8::new(StatusSoundSetting::Off as u8);
 
@@ -612,7 +612,10 @@ mod tests {
         for sound in StatusSound::ALL {
             cue(sound);
         }
-        assert_eq!(take_test_cues(), vec![StatusSound::Listening, StatusSound::Failure]);
+        assert_eq!(
+            take_test_cues(),
+            vec![StatusSound::Listening, StatusSound::Failure]
+        );
         // An explicit client request still plays any cue.
         cue_requested(StatusSound::Command);
         assert_eq!(take_test_cues(), vec![StatusSound::Command]);
@@ -638,7 +641,8 @@ mod tests {
 
     #[test]
     fn custom_cue_file_replaces_listening_only_when_present() {
-        let dir = std::env::temp_dir().join(format!("always-custom-cue-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("always-custom-cue-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("crinkle.wav");
         std::fs::write(&file, b"RIFF").unwrap();
@@ -646,7 +650,10 @@ mod tests {
         assert_eq!(custom_cue(StatusSound::Listening), Some(file.clone()));
         assert_eq!(custom_cue(StatusSound::Failure), None);
         assert_eq!(custom_cue(StatusSound::Transcribing), None);
-        assert_eq!(cue_file(StatusSound::Listening, StatusSoundSetting::High), Some(file.clone()));
+        assert_eq!(
+            cue_file(StatusSound::Listening, StatusSoundSetting::High),
+            Some(file.clone())
+        );
         assert_eq!(cue_duration(StatusSound::Listening), CUSTOM_CUE_ASSUMED);
         std::fs::remove_file(&file).unwrap();
         // A deleted file falls back to the built-in cue, never silence.

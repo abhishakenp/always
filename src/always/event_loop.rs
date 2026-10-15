@@ -60,7 +60,10 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     let _ = paste::pasteboard_change_count();
     crate::always::status_sound::set_setting(cfg.audible_status_sound);
-    crate::always::status_sound::set_custom_cues(cfg.listen_cue.as_deref(), cfg.fail_cue.as_deref());
+    crate::always::status_sound::set_custom_cues(
+        cfg.listen_cue.as_deref(),
+        cfg.fail_cue.as_deref(),
+    );
     // Spawn + warm the Parakeet live-preview helper now (model load and
     // first ANE inference), so the user's first word is never cold.
     crate::always::preview_asr::prewarm(&cfg.lang, cfg.transcriber_backend.is_apple());
@@ -1539,7 +1542,7 @@ pub(crate) const COMMIT_HOLD_OPEN_MS: u32 = 3_000;
 /// 2026-10-15 18:56:06Z: "…and this is about all." was pasted and Entered
 /// 50 ms later; he resumed 0.7 s after the paste and his thought arrived as
 /// two messages.
-fn commit_hold_ms(loc: &crate::always::localization::Localization, text: &str) -> u32 {
+pub(crate) fn commit_hold_ms(loc: &crate::always::localization::Localization, text: &str) -> u32 {
     if crate::always::vad::text_reads_complete(loc, text) {
         COMMIT_HOLD_COMPLETE_MS
     } else {
@@ -1803,7 +1806,10 @@ mod tests {
 
     #[test]
     fn utterance_terminal_rearms_cue_after_success_held_cancel_error_and_reset() {
-        use crate::always::{event, status_sound::{StatusSound, take_test_cues}};
+        use crate::always::{
+            event,
+            status_sound::{StatusSound, take_test_cues},
+        };
         let b = event::global_broadcaster();
         super::emit_utterance_terminal();
         take_test_cues();
@@ -1824,16 +1830,27 @@ mod tests {
                 }
                 "cancel" => b.transcription_filtered("cancelled transcription"),
                 "error" => b.transcription_failed("stt", "test failure"),
-                "reset" => {}, // silent/drop/aborted recording cycle
+                "reset" => {} // silent/drop/aborted recording cycle
                 _ => unreachable!(),
             }
             super::emit_utterance_terminal();
             let mut events = Vec::new();
-            while let Ok(ev) = rx.try_recv() { events.push(ev); }
-            assert!(matches!(events.last(), Some(event::DaemonEvent::TranscribingStopped)));
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+            assert!(matches!(
+                events.last(),
+                Some(event::DaemonEvent::TranscribingStopped)
+            ));
             if boundary == "held" {
-                let held = events.iter().position(|e| matches!(e, event::DaemonEvent::TranscriptHeld { .. })).unwrap();
-                let final_ = events.iter().position(|e| matches!(e, event::DaemonEvent::TranscriptFinal { .. })).unwrap();
+                let held = events
+                    .iter()
+                    .position(|e| matches!(e, event::DaemonEvent::TranscriptHeld { .. }))
+                    .unwrap();
+                let final_ = events
+                    .iter()
+                    .position(|e| matches!(e, event::DaemonEvent::TranscriptFinal { .. }))
+                    .unwrap();
                 assert!(held < final_);
             }
             // Exactly one audible cue per utterance (Listening at the

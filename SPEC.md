@@ -175,6 +175,12 @@ VPIO's noise suppression was not measurable on a single-speaker machine.
    applies to the **whole utterance**: committing a chunk of a long
    dictation (step 4) must never shorten it. Only an utterance that is
    itself under 400 ms in total gets the short 200 ms cut.
+   Text that trails off (a filler, a connector — "…need to", "…or.")
+   holds the cut for the hesitation window, 1.2 s
+   (`ALWAYS_HESITATION_SILENCE_SECS`; was 2.5 s, which made every such
+   ending wait 2.5 s for its text — 2026-10-15 21:49Z). A cut there no
+   longer sends half a thought: auto-Enter waits its 3 s commit hold for
+   trailing text and a resume merges (step 9).
    A live partial ending on a filler ("uh") holds the cut for the
    hesitation window only until the deciding text (speculation, or the
    chunk flushed at this pause) lands: decided text that reads complete
@@ -197,7 +203,12 @@ VPIO's noise suppression was not measurable on a single-speaker machine.
    continuation of the same text, so a thinking pause no longer sends half
    a thought (2026-10-15 18:56:06Z: "…and this is about all." was Entered
    50 ms after the paste, he resumed 0.7 s later). 1.5 s covers 162 of the
-   207 resumes within 3 s of a paste in his logs of 2026-10-12..15. Only
+   207 resumes within 3 s of a paste in his logs of 2026-10-12..15.
+   Only REAL keystrokes cancel the hold: the keyboard tap also sees
+   Always's own posted Cmd+V / Cmd+Z / Return, and ignores V, Z and Return
+   for 300 ms after posting them (before this, the paste's own Cmd+V
+   cancelled every hold ~100 ms in and auto-Enter never fired —
+   2026-10-15 21:49Z, build 0.1.0). Only
    with the commit hold at 0 (not reachable from settings today) would
    Return be posted 50 ms after Cmd+V (the Cmd-flag guard in `auto_enter_countdown`);
    the 100 ms post-paste settle that holds the paste-in-flight lock runs

@@ -32,12 +32,18 @@ fn hesitation() -> usize {
 /// chunk's raw STT). Returns `true` if the pause ends the utterance before
 /// speech resumes at `pause_ms` (`None` = never resumes).
 fn pause_cuts(text: &str, pause_ms: Option<u32>, text_latency_ms: u32) -> bool {
+    pause_cut_ms(text, pause_ms, text_latency_ms).is_some()
+}
+
+/// Silence (ms) at which the pause ends the utterance, `None` if speech
+/// resumes first.
+fn pause_cut_ms(text: &str, pause_ms: Option<u32>, text_latency_ms: u32) -> Option<u32> {
     let loc = &Localization::ENGLISH;
     let pause_frames = pause_ms.map(|ms| (ms / FRAME_MS) as usize);
     let latency_frames = (text_latency_ms / FRAME_MS) as usize;
     for frame in 1..=10_000usize {
         if pause_frames.is_some_and(|p| frame > p) {
-            return false; // speech resumed first: same utterance
+            return None; // speech resumed first: same utterance
         }
         let decided = frame >= latency_frames;
         let cut = final_silence_cut_frames(
@@ -51,18 +57,41 @@ fn pause_cuts(text: &str, pause_ms: Option<u32>, text_latency_ms: u32) -> bool {
             },
         );
         if frame >= cut {
-            return true;
+            return Some(frame as u32 * FRAME_MS);
         }
     }
     panic!("a pause that never resumes must end the utterance");
 }
 
-/// Replays one spoken sequence; returns the number of Enters (= cuts).
+/// Replays one spoken sequence; returns the number of Enters. A cut pastes
+/// at once (when its text is in), but Return waits the commit hold for the
+/// text pasted so far; speech resuming inside it merges into the same
+/// message (`event_loop::commit_hold_ms`). So an Enter = a cut whose pause
+/// outlasts paste + commit hold, or the final cut.
 fn enters_for(pieces: &[(&str, Option<u32>)], text_latency_ms: u32) -> usize {
-    pieces
-        .iter()
-        .filter(|(text, pause)| pause_cuts(text, *pause, text_latency_ms))
-        .count()
+    let loc = &Localization::ENGLISH;
+    let mut pasted = String::new();
+    let mut enters = 0;
+    for (text, pause) in pieces {
+        pasted = if pasted.is_empty() {
+            text.to_string()
+        } else {
+            format!("{pasted} {text}")
+        };
+        let Some(cut) = pause_cut_ms(text, *pause, text_latency_ms) else {
+            continue;
+        };
+        let paste_at = cut.max(text_latency_ms);
+        let hold = crate::always::event_loop::commit_hold_ms(loc, &pasted);
+        match pause {
+            Some(p) if p.saturating_sub(paste_at) < hold => {} // merged
+            _ => {
+                enters += 1;
+                pasted.clear();
+            }
+        }
+    }
+    enters
 }
 
 /// Logged Apple STT for a 6-10 s chunk landed 152-551 ms after the cut
@@ -70,9 +99,9 @@ fn enters_for(pieces: &[(&str, Option<u32>)], text_latency_ms: u32) -> usize {
 const TEXT_LATENCY_MS: u32 = 450;
 
 #[test]
-fn hesitation_hold_default_is_2_5_s() {
-    assert_eq!(hesitation(), 84); // ceil(2500 / 30)
-    assert!(hesitation() > extended_silence_frames(BASE));
+fn hesitation_hold_default_is_1_2_s() {
+    assert_eq!(hesitation(), 40); // ceil(1200 / 30)
+    assert_eq!(hesitation(), extended_silence_frames(BASE));
 }
 
 #[test]
@@ -318,4 +347,47 @@ fn decided_complete_text_overrides_stale_partial_hesitation() {
         final_silence_cut_frames(BASE, BASE, hesitation(), hes),
         extended_silence_frames(BASE).max(hesitation())
     );
+}
+
+/// 2026-10-15 21:49:31Z and 21:49:46Z (0.1.0): decided text ending on a
+/// connector ("…that you need to", "…what's happening, or.") held the cut
+/// 2.5 s — `endpoint_hold_ms` 2517 / 2518. Now the hold is 1.2 s, and a
+/// resume within the 3 s commit hold still merges into one message.
+#[test]
+fn trailing_connector_cuts_at_1_2_s_and_a_resume_still_merges() {
+    let loc = &Localization::ENGLISH;
+    for t in [
+        "Everything that you need to",
+        "seems broken in always or what, what's happening, or.",
+    ] {
+        let v = PauseVerdict {
+            text_pending: false,
+            text: Some(classify_pause_text(loc, t)),
+            partial_hesitating: false,
+        };
+        let cut = final_silence_cut_frames(BASE, BASE, hesitation(), v) as u32 * FRAME_MS;
+        assert!(cut <= 1_200, "{t}: {cut} ms");
+    }
+    // He resumes 2.43 s into the pause (the 10-14 upper bound): cut at
+    // 1.2 s, resume 1.2 s after the paste < 3 s hold → one message.
+    let pieces: &[(&str, Option<u32>)] = &[
+        ("Everything that you need to", Some(2_430)),
+        ("check is in the log.", None),
+    ];
+    assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
+}
+
+/// 2026-10-15 18:56:06Z: "…and this is about all." cut at 0.72 s and was
+/// Entered; he resumed 0.7 s after the paste. With the 1.5 s commit hold
+/// the resume merges: one message.
+#[test]
+fn replay_185606_complete_looking_thinking_pause_is_one_enter() {
+    let pieces: &[(&str, Option<u32>)] = &[
+        (
+            "This, I'm not sure if this is the exact code you have to check, test, and fix, and this is about all.",
+            Some(1_420),
+        ),
+        ("Takes a while to do that and while I was speaking.", None),
+    ];
+    assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
 }

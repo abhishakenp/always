@@ -1428,16 +1428,42 @@ mod tests {
             b.transcribing_stopped();
         }
         let cues = take_test_cues();
-        let transcribing = cues.iter().filter(|&&cue| cue == StatusSound::Transcribing).count();
+        let transcribing = cues
+            .iter()
+            .filter(|&&cue| cue == StatusSound::Transcribing)
+            .count();
         eprintln!("six speculative cycles: {transcribing} transcribing cue requests");
         let events = drain(&mut rx);
-        assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscribingStarted)).count(), 12);
-        assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscribingStopped)).count(), 6);
-        assert_eq!(events.iter().filter(|ev| matches!(ev, DaemonEvent::TranscriptChunk { .. })).count(), 6);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev, DaemonEvent::TranscribingStarted))
+                .count(),
+            12
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev, DaemonEvent::TranscribingStopped))
+                .count(),
+            6
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev, DaemonEvent::TranscriptChunk { .. }))
+                .count(),
+            6
+        );
         // One utterance = one audible cue (Listening); Transcribing is
         // silent by policy (user report 2026-10-15: "5 times").
         assert_eq!(transcribing, 0);
-        assert_eq!(cues.iter().filter(|&&cue| cue == StatusSound::Listening).count(), 1);
+        assert_eq!(
+            cues.iter()
+                .filter(|&&cue| cue == StatusSound::Listening)
+                .count(),
+            1
+        );
     }
 
     #[test]

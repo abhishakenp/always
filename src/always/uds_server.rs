@@ -1256,7 +1256,10 @@ fn apply_runtime_preferences(
         if let Some(path) = fail_cue {
             cfg.fail_cue = Some(path).filter(|p| !p.is_empty());
         }
-        crate::always::status_sound::set_custom_cues(cfg.listen_cue.as_deref(), cfg.fail_cue.as_deref());
+        crate::always::status_sound::set_custom_cues(
+            cfg.listen_cue.as_deref(),
+            cfg.fail_cue.as_deref(),
+        );
     }
     cfg.auto_enter_delay_ms = auto_enter_delay_ms.min(60_000);
     cfg.energy_threshold = energy_threshold.clamp(0.0001, 0.5);
