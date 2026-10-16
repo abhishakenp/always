@@ -458,12 +458,15 @@ final class TapPipeline {
         micGain = powf(10, pre / 20)
         // Two-speaker canceller (left/right reference) unless ALWAYS_CAPTURE_STEREO_AEC=0.
         stereoAec = env["ALWAYS_CAPTURE_STEREO_AEC"] != "0"
-        // Residual echo suppressor depth (speex echo_suppress / echo_suppress_active, negative dB; 0 = speex
-        // default -40/-15; a positive value turns the suppressor off). Measured on his accepted speech mixed
-        // into the 2026-10-17 calibration: the default costs his far voice 2-14 dB, -15/-6 costs 2-8 dB but
-        // leaves up to 9 dB more echo; gate scores within 0.03 either way. Default unchanged.
-        echoSuppress = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS"] ?? "") ?? 0
-        echoSuppressActive = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS_ACTIVE"] ?? "") ?? 0
+        // Residual echo suppressor depth (speex echo_suppress / echo_suppress_active, negative dB; a positive
+        // value turns the suppressor off). Speex blends the two by its speech probability, so "active" is what
+        // HIS speech gets. Measured 2026-10-17 on the calibration recording with his accepted speech mixed in
+        // (12 clips, near -14.7 / far -22.9 dBFS, volumes 50/75/100, music + film + Iris singly and together):
+        // speex default -40/-15 cost his far voice 2.3-11.9 dB; -40/-1 costs 1.2-7.8 dB while still removing
+        // 13.7 dB of echo on average (default 16.6, off 7.2); mean gate score near 0.423 -> 0.435, far 0.279 -> 0.298;
+        // echo-only windows never above 0.26 (gate 0.5) for any setting.
+        echoSuppress = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS"] ?? "") ?? -40
+        echoSuppressActive = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS_ACTIVE"] ?? "") ?? -1
         aec = aec_new_mc(tail, echoSuppress, echoSuppressActive, pre, stereoAec ? 2 : 1)
         let g0 = Float(env["ALWAYS_CAPTURE_GAIN_DB"] ?? "") ?? 22
         agc = aec_agc_new(-26, 35 - pre, max(0, g0 - pre))
