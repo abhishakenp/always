@@ -65,8 +65,42 @@ const HESITATIONS: &[&str] = &["uh", "um", "er", "ah", "eh", "hmm", "mm"];
 /// A name usually follows these when it ends the clause.
 const NAME_CUES: &[&str] = &[
     "hey", "hi", "hello", "thanks", "ping", "cc", "dear", "ask", "tell", "message", "email", "dm",
-    "call", "with", "from",
+    "call", "with", "from", "said", "say", "says", "told", "that",
 ];
+/// Cue words a misheard name can swallow ("I sadly view" = "I said Livio").
+const ABSORB_CUES: &[&str] = &["said", "to", "ask", "tell", "hey", "thanks", "that"];
+/// Strictest bound: an absorbed span must sound like cue + term almost exactly.
+const ABSORB_THRESHOLD: f32 = 0.08;
+/// Letter run vs the term's head ("NVO" vs "Livio" scores 0.2).
+const LETTERS_THRESHOLD: f32 = 0.22;
+/// One real word becomes a term only when spoken TO it: after one of these
+/// ("talk to Irish" = "talk to Iris")…
+const ADDRESS_CUES_1: &[&str] = &["ask", "tell", "hey", "ping", "asked", "told"];
+const ADDRESS_CUES_2: &[(&str, &str)] = &[
+    ("talk", "to"),
+    ("talking", "to"),
+    ("speak", "to"),
+    ("speaking", "to"),
+    ("said", "to"),
+    ("say", "to"),
+];
+/// …and followed by the end of the clause or one of these words, never a
+/// noun it could be describing ("talk to Irish people" stays).
+const ADDRESS_FOLLOW: &[&str] = &[
+    "with", "and", "about", "that", "to", "if", "when", "how", "so", "because", "please", "now",
+    "again", "for", "while", "but", "or", "then",
+];
+/// Function words: a span made only of these ("and I") is grammar, never a
+/// misheard name, and a span starting with an article/pronoun ("a skill")
+/// cannot have swallowed a cue word.
+const FUNCTION_WORDS: &[&str] = &[
+    "a", "an", "the", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us",
+    "them", "my", "your", "his", "its", "our", "their", "this", "that", "these", "those", "and",
+    "or", "but", "so", "to", "of", "in", "on", "at", "for", "with", "is", "are", "was", "be", "do",
+    "did", "if", "as", "by", "not", "no",
+];
+/// Names every user's dictionary holds: the assistant's.
+const BUILTIN_TERMS: &[&str] = &["Iris"];
 
 #[derive(Debug, Clone)]
 struct Term {
@@ -75,6 +109,10 @@ struct Term {
     tokens: Vec<String>,
     phon: Vec<Ph>,
     frequency: i64,
+    /// For a term ending in an acronym ("Livio's PR"): that acronym
+    /// (lowercase) and the sound of the words before it, possessive
+    /// dropped — what a letter run like "NVOPR" is compared with.
+    letter_form: Option<(String, Vec<Ph>)>,
     /// Stated by the user (glossary) or among his most frequent learned
     /// names. Untrusted names (the long tail of a contacts import) only
     /// match by sound inside a name slot — with 1308 names loaded, sound
@@ -99,7 +137,19 @@ pub struct Compiled {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HitKind {
     Exact,
-    Phonetic { score: f32 },
+    Phonetic {
+        score: f32,
+    },
+    /// The misheard span swallowed the cue word before the name
+    /// ("sadly view" = "said Livio"); the cue is written back in front.
+    Absorbed {
+        cue: &'static str,
+        score: f32,
+    },
+    /// One capital-letter run spelling the term ("NVOPR" = "Livio PR").
+    Letters {
+        score: f32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,10 +235,27 @@ impl Compiled {
                     if tokens.len() > 1 {
                         c.anchor_words.extend(tokens.iter().cloned());
                     }
+                    let words: Vec<&str> = canonical.split_whitespace().collect();
+                    let letter_form = match words.split_last() {
+                        Some((last, head))
+                            if !head.is_empty()
+                                && (2..=4).contains(&last.len())
+                                && last.bytes().all(|b| b.is_ascii_uppercase()) =>
+                        {
+                            let head = ph::encode_span(head.iter().map(|w| {
+                                w.strip_suffix("'s")
+                                    .or_else(|| w.strip_suffix("’s"))
+                                    .unwrap_or(w)
+                            }));
+                            Some((last.to_lowercase(), head))
+                        }
+                        _ => None,
+                    };
                     c.terms.push(Term {
                         canonical,
                         tokens,
                         phon,
+                        letter_form,
                         frequency: input.frequency,
                         trusted: input.trusted,
                     });
@@ -427,7 +494,26 @@ pub fn correct_with(text: &str, c: &Compiled, prior: &dyn Prior) -> (String, Vec
                 let (_, _, suffix) = split_punct(toks[i + n - 1].raw);
                 let canonical = &c.terms[term_idx].canonical;
                 let from = raws[i..i + n].join(" ");
-                out.push(format!("{prefix}{canonical}{suffix}"));
+                let body = match &kind {
+                    HitKind::Absorbed { cue, .. } => {
+                        let first_upper = split_punct(toks[i].raw)
+                            .1
+                            .chars()
+                            .next()
+                            .is_some_and(char::is_uppercase);
+                        let cue = if first_upper {
+                            let mut c = cue.chars();
+                            c.next()
+                                .map(|f| f.to_uppercase().chain(c).collect::<String>())
+                                .unwrap_or_default()
+                        } else {
+                            cue.to_string()
+                        };
+                        format!("{cue} {canonical}")
+                    }
+                    _ => canonical.clone(),
+                };
+                out.push(format!("{prefix}{body}{suffix}"));
                 hits.push(Hit {
                     from,
                     to: canonical.clone(),
@@ -498,6 +584,25 @@ fn best_at(
         return Some((n, *term_idx, HitKind::Exact));
     }
 
+    // 1b. A capital-letter run spelling a term that ends in an acronym:
+    // "NVOPR" = N-V-O + "PR" for "Livio's PR".
+    if let Some(hit) = letters_at(&toks[i], c) {
+        return Some(hit);
+    }
+
+    // One real word addressed by name ("talk to Irish with…").
+    let addressed = |n: usize| -> bool {
+        let prev1 = i >= 1 && ADDRESS_CUES_1.contains(&toks[i - 1].norm.as_str());
+        let prev2 = i >= 2
+            && ADDRESS_CUES_2
+                .iter()
+                .any(|(a, b)| toks[i - 2].norm == *a && toks[i - 1].norm == *b);
+        let next_ok = i + n == toks.len()
+            || toks[i + n - 1].clause_end
+            || ADDRESS_FOLLOW.contains(&toks[i + n].norm.as_str());
+        (prev1 || prev2) && next_ok
+    };
+
     // 2. Phonetic.
     let mut best: Option<(usize, usize, f32)> = None;
     for n in (1..=max_n).rev() {
@@ -520,14 +625,17 @@ fn best_at(
         {
             continue;
         }
-        let context = isolated(n) || name_slot(n);
+        let only_function = span
+            .iter()
+            .all(|t| FUNCTION_WORDS.contains(&t.norm.as_str()));
+        let context = !only_function && (isolated(n) || name_slot(n));
         // Qualify the span before touching any term.
         let may_anchor = n >= 2 && span.iter().any(|t| c.anchor_words.contains(&t.norm));
         // A non-word may carry at most one real word along ("Lee Vio",
         // "Libio's"): "at the Libio" is two words plus a name.
         let english_count = span.iter().filter(|t| t.english).count();
         let by_sound = if all_english {
-            n >= 2 && context
+            (n >= 2 && context) || (n == 1 && addressed(1))
         } else {
             english_count <= 1
         };
@@ -563,7 +671,7 @@ fn best_at(
                 // from the long tail also needs a name slot.
                 !(n == 1 && phon.len() < 4) && (term.trusted || context)
             } else {
-                n >= 2 && context && term.trusted
+                term.trusted && ((n >= 2 && context) || (n == 1 && addressed(1)))
             };
             if !qualified {
                 continue;
@@ -611,7 +719,90 @@ fn best_at(
             }
         }
     }
-    best.map(|(n, ti, s)| (n, ti, HitKind::Phonetic { score: s }))
+    if let Some((n, ti, s)) = best {
+        return Some((n, ti, HitKind::Phonetic { score: s }));
+    }
+
+    // 3. A span that swallowed the cue word before the name: "I sadly
+    // view, but…" sounds like "I said Livio, but…". Trusted terms only, the
+    // span must end its clause and sound like cue + term almost exactly.
+    absorbed_at(i, toks, c)
+}
+
+fn absorbed_at(i: usize, toks: &[Tok], c: &Compiled) -> Option<(usize, usize, HitKind)> {
+    let max_n = 3.min(toks.len() - i);
+    let mut best: Option<(usize, usize, &'static str, f32)> = None;
+    for n in (2..=max_n).rev() {
+        let span = &toks[i..i + n];
+        if span[..n - 1].iter().any(|t| t.clause_end)
+            || span
+                .iter()
+                .any(|t| t.norm.is_empty() || t.codeish || HESITATIONS.contains(&t.norm.as_str()))
+        {
+            continue;
+        }
+        let ends = i + n == toks.len() || span[n - 1].clause_end;
+        if !ends
+            || ABSORB_CUES.contains(&span[0].norm.as_str())
+            || FUNCTION_WORDS.contains(&span[0].norm.as_str())
+        {
+            continue;
+        }
+        let phon: Vec<Ph> = span.iter().flat_map(|t| t.phon.iter().copied()).collect();
+        for &cue in ABSORB_CUES {
+            let cue_ph = ph::encode_word(cue);
+            if cue_ph.first().map(|&p| bucket(p)) != phon.first().map(|&p| bucket(p)) {
+                continue;
+            }
+            for (ti, term) in c.terms.iter().enumerate() {
+                if !term.trusted || term.tokens.len() > n {
+                    continue;
+                }
+                let mut want = cue_ph.clone();
+                want.extend_from_slice(&term.phon);
+                if phon.len().abs_diff(want.len()) > 2 {
+                    continue;
+                }
+                let s = ph::score_within(&phon, &want, ABSORB_THRESHOLD);
+                if s <= ABSORB_THRESHOLD && best.is_none_or(|(_, _, _, b)| s < b) {
+                    best = Some((n, ti, cue, s));
+                }
+            }
+        }
+    }
+    best.map(|(n, ti, cue, s)| (n, ti, HitKind::Absorbed { cue, score: s }))
+}
+
+fn letters_at(t: &Tok, c: &Compiled) -> Option<(usize, usize, HitKind)> {
+    let core = split_punct(t.raw).1;
+    if t.english
+        || t.codeish
+        || !(4..=8).contains(&core.len())
+        || !core.bytes().all(|b| b.is_ascii_uppercase())
+        || c.accepted.contains(&t.norm)
+    {
+        return None;
+    }
+    let mut best: Option<(usize, f32)> = None;
+    for (ti, term) in c.terms.iter().enumerate() {
+        let Some((acronym, head)) = &term.letter_form else {
+            continue;
+        };
+        if !term.trusted {
+            continue;
+        }
+        let Some(prefix) = t.norm.strip_suffix(acronym.as_str()) else {
+            continue;
+        };
+        if prefix.len() < 2 {
+            continue;
+        }
+        let s = ph::score_within(&ph::encode_letters(prefix), head, LETTERS_THRESHOLD);
+        if s <= LETTERS_THRESHOLD && best.is_none_or(|(_, b)| s < b) {
+            best = Some((ti, s));
+        }
+    }
+    best.map(|(ti, s)| (1, ti, HitKind::Letters { score: s }))
 }
 
 /// Is `wrong → right` a dictionary correction worth learning without
@@ -733,7 +924,13 @@ pub fn compiled() -> Arc<Compiled> {
                 frequency: n.frequency,
                 trusted: rank < TRUSTED_NAMES,
             });
-        let mut built = Compiled::build(glossary.chain(names));
+        let builtin = BUILTIN_TERMS.iter().map(|t| TermInput {
+            term: t.to_string(),
+            mistranscriptions: Vec::new(),
+            frequency: 0,
+            trusted: true,
+        });
+        let mut built = Compiled::build(glossary.chain(names).chain(builtin));
         built.accept_words(accepted_words());
         tracing::info!(
             terms = built.terms.len(),
@@ -805,6 +1002,12 @@ mod tests {
             "Livio, can you check this?"
         );
         assert_eq!(fix("ask Leevio about it"), "ask Livio about it");
+        // "said" is a name cue (04:43:00Z: he said "Livio", it wrote "leave
+        // you"), but only when the name ends the clause.
+        assert_eq!(
+            fix("I said leave you, but she heard something else."),
+            "I said Livio, but she heard something else."
+        );
     }
 
     #[test]
@@ -837,7 +1040,6 @@ mod tests {
             "We should leave your laptop here.",
             "deploy this to the cloud",
             "Leave",
-            "I said leave you, but she heard something else.",
             "views of the PR are fine",
             "Living in Lisbon.",
             // A wrong form split by a sentence mark is two sentences.
@@ -892,6 +1094,54 @@ mod tests {
         }
         assert_eq!(fix("Leave you."), "Livio.");
         assert_eq!(fix("thanks Alekx."), "thanks Alex.");
+    }
+
+    #[test]
+    fn live_misses_2026_10_16() {
+        let mut inputs = vec![TermInput {
+            term: "Iris".into(),
+            mistranscriptions: vec![],
+            frequency: 0,
+            trusted: true,
+        }];
+        let base = his_dictionary();
+        inputs.extend(base.terms.iter().map(|t| TermInput {
+            term: t.canonical.clone(),
+            mistranscriptions: vec![],
+            frequency: 100,
+            trusted: true,
+        }));
+        let c = Compiled::build(inputs);
+        let fix = |s: &str| correct_with(s, &c, &NoPrior).0;
+        // 06:38:00Z: the name swallowed "said".
+        assert_eq!(
+            fix("And also the vocabulary thing, I sadly view, but it still hear something else."),
+            "And also the vocabulary thing, I said Livio, but it still hear something else."
+        );
+        // 06:37:45Z: the name + PR as a letter run.
+        assert_eq!(
+            fix("have you merged that NVOPR, you didn't"),
+            "have you merged that Livio's PR, you didn't"
+        );
+        // Addressed by name mid-sentence.
+        assert_eq!(
+            fix("I can like talk to Irish with the browser open"),
+            "I can like talk to Iris with the browser open"
+        );
+        // …but not the adjective, nor ordinary sentences.
+        for s in [
+            "talk to Irish people",
+            "the Irish team said hi",
+            "I said leave you alone",
+            "That's sadly true, but fine.",
+            "I said that, sadly.",
+            "OK PR is merged",
+            "check the HTTPR flag",
+            "then create a skill.",
+            "that is so annoying, that and I.",
+        ] {
+            assert_eq!(fix(s), s, "{s} must stay");
+        }
     }
 
     #[test]

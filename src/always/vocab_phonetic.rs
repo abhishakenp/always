@@ -155,6 +155,48 @@ pub fn encode_word(word: &str) -> Vec<Ph> {
     out
 }
 
+/// Encode a run of capital letters as their spoken letter names, the way
+/// a recogniser writes a name it heard as letters ("NVOPR" for "Livio
+/// PR"). Letters whose name starts with a vowel sound (F L M N R S X)
+/// keep only the consonant: in a fast run the vowel is not heard.
+pub fn encode_letters(letters: &str) -> Vec<Ph> {
+    let mut out = Vec::new();
+    for c in letters.bytes().filter(u8::is_ascii_alphabetic) {
+        let name: &[u8] = match c.to_ascii_uppercase() {
+            b'A' => b"a",
+            b'B' => b"Bi",
+            b'C' => b"Si",
+            b'D' => b"Di",
+            b'E' => b"i",
+            b'F' => b"F",
+            b'G' => b"Ji",
+            b'H' => b"C",
+            b'I' => b"a",
+            b'J' => b"Ja",
+            b'K' => b"Ka",
+            b'L' => b"L",
+            b'M' => b"M",
+            b'N' => b"N",
+            b'O' => b"o",
+            b'P' => b"Pi",
+            b'Q' => b"KYu",
+            b'R' => b"R",
+            b'S' => b"S",
+            b'T' => b"Ti",
+            b'U' => b"Yu",
+            b'V' => b"Vi",
+            b'W' => b"DuBLYu",
+            b'X' => b"KS",
+            b'Y' => b"Wa",
+            _ => b"Zi",
+        };
+        for &p in name {
+            push(&mut out, p);
+        }
+    }
+    out
+}
+
 fn push(out: &mut Vec<Ph>, p: Ph) {
     // Collapse a doubled phoneme (from "ll", or digraph + same letter).
     if out.last() == Some(&p) {
@@ -209,8 +251,8 @@ fn sub_cost(a: Ph, b: Ph) -> f32 {
     if pair(b'M', b'N') || pair(b'Q', b'T') || pair(b'Q', b'F') || pair(b'Q', b'D') {
         return 0.5;
     }
-    if pair(b'L', b'R') {
-        return 0.7;
+    if pair(b'L', b'R') || pair(b'L', b'N') {
+        return 0.6;
     }
     1.0
 }
@@ -325,5 +367,18 @@ mod tests {
         assert!(sc("leave", "Livio") > 0.12);
         assert!(sc("leave video", "Livio") > 0.25);
         assert!(sc("alone", "Livio") > 0.3);
+        // "NVO" spelled out vs "Livio".
+        let nvo = encode_letters("NVO");
+        assert!(
+            score(&nvo, &encode_word("Livio")) <= 0.21,
+            "{}",
+            score(&nvo, &encode_word("Livio"))
+        );
+        // "sadly view" carries the cue word: ≈ "said Livio".
+        assert!(
+            sc("sadly view", "said Livio") <= 0.08,
+            "{}",
+            sc("sadly view", "said Livio")
+        );
     }
 }
