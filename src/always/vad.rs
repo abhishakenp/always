@@ -1597,10 +1597,12 @@ fn record_with_local_vad(
                             if run >= speaker_tail_fail_checks.max(crate::always::speaker_trim::MIN_FOREIGN_RUN)
                                 && let Some(cut) = speaker_timeline.plan(committed_samples, len).trail_from
                             {
+                                let over_media = job.window_verdict(s).media;
                                 tracing::info!(
                                     foreign_windows = run,
                                     kept_secs = cut as f64 / 16_000.0,
                                     trimmed_secs = (len - cut) as f64 / 16_000.0,
+                                    over_media,
                                     "speaker_gate_trail_cut"
                                 );
                                 speech_samples.truncate(cut);
@@ -1608,7 +1610,27 @@ fn record_with_local_vad(
                                 // Whatever was speculated included the reel.
                                 speculation_pending = false;
                                 speculation_slot.invalidate();
-                                break;
+                                if over_media && media_excise_on() && !crate::always::speaker_trim::old_trail_rule() {
+                                    // Over a video/Iris his own words can score
+                                    // foreign (14:37:49Z: cut mid-sentence, the
+                                    // rest pasted as a second message): the
+                                    // cut excises and capture goes on, so his
+                                    // continuation joins this utterance.
+                                    speaker_timeline.excise(cut, usize::MAX);
+                                    confirmed_user_len = confirmed_user_len.min(cut);
+                                    tail_fail_streak = 0;
+                                    if media_excise.is_none() {
+                                        media_excise = Some((
+                                            cut,
+                                            committed_samples,
+                                            std::time::Instant::now()
+                                                + std::time::Duration::from_secs_f64(MEDIA_EXCISE_JOIN_SECS),
+                                        ));
+                                        tracing::info!("speaker_gate_trail_excised");
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
                         }
                     }

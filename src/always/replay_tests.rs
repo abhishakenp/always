@@ -737,4 +737,176 @@ while True:
         std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         eprintln!("report written to {out}");
     }
+
+    /// Fake tap helper for a whole recorded SESSION: streams the daemon-view
+    /// s16 (`<stem>.s16`) in real time and writes each helper stderr line of
+    /// `<stem>.events` ("offset_ms line", e.g. "aec engaged (tap reference
+    /// playing)") at its offset, so the daemon sees the same engage/bypass
+    /// edges as live. Start wall time → `<stem>.t0`.
+    const SESSION_PACER_PY: &str = r#"
+import os, sys, time, struct, random
+out = sys.stdout.buffer
+stem = sys.argv[1]
+pcm = open(stem + ".s16", "rb").read()
+ev = []
+for l in open(stem + ".events"):
+    ms, line = l.rstrip("\n").split(" ", 1)
+    ev.append((int(ms) / 1000.0, line))
+FRAME = 160
+sys.stderr.write("always-capture: capturing mode=tap-aec\n"); sys.stderr.flush()
+t0 = time.time(); sent = 0; k = 0
+open(stem + ".t0", "w").write(repr(t0))
+for i in range(0, len(pcm), FRAME * 2):
+    now_s = sent / 16000.0
+    while k < len(ev) and ev[k][0] <= now_s:
+        sys.stderr.write(ev[k][1] + "\n"); sys.stderr.flush(); k += 1
+    d = t0 + (sent + FRAME) / 16000.0 - time.time()
+    if d > 0: time.sleep(d)
+    out.write(pcm[i:i + FRAME * 2]); out.flush()
+    sent += FRAME
+open(stem + ".done", "w").close()
+while True:
+    out.write(b"".join(struct.pack("<h", random.randint(-30, 30)) for _ in range(16000))); out.flush()
+    time.sleep(1)
+"#;
+
+    /// A recorded session through the real capture loop with his saved
+    /// preferences (`ALWAYS_CONFIG_DIR` = a COPY of his config dir: prefs +
+    /// voiceprint). `SESSION_REPLAY_STEM` (from far-room/s3/build_stream.py),
+    /// `SESSION_REPLAY_OUT` (JSON results), `SESSION_REPLAY_DUMP` (audio of
+    /// every transcription call). `SESSION_REPLAY_STT=apple` uses Apple STT
+    /// and the live preview (needs the Speech grant), otherwise the gate
+    /// only: calls are answered with their file name. Real time.
+    #[test]
+    #[ignore = "real-time session replay; needs SESSION_REPLAY_* env; run explicitly"]
+    fn session_replay() {
+        let Ok(stem) = std::env::var("SESSION_REPLAY_STEM") else {
+            return;
+        };
+        let out = std::env::var("SESSION_REPLAY_OUT").expect("SESSION_REPLAY_OUT");
+        let dump = std::path::PathBuf::from(
+            std::env::var("SESSION_REPLAY_DUMP").expect("SESSION_REPLAY_DUMP"),
+        );
+        std::fs::create_dir_all(&dump).unwrap();
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+            .with_writer(std::io::stderr)
+            .try_init();
+        let pacer = dump.join("pacer.py");
+        std::fs::write(&pacer, SESSION_PACER_PY).unwrap();
+        let capture = dump.join("capture.sh");
+        std::fs::write(
+            &capture,
+            format!("#!/bin/sh\nexec /usr/bin/python3 -I '{}' '{stem}'\n", pacer.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&capture, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let done = std::path::PathBuf::from(format!("{stem}.done"));
+        let _ = std::fs::remove_file(&done);
+        let apple = std::env::var("SESSION_REPLAY_STT").as_deref() == Ok("apple");
+        // SAFETY: set before the recorder spawns; this test runs alone.
+        unsafe {
+            std::env::set_var("ALWAYS_CAPTURE_BIN", &capture);
+            if !apple {
+                std::env::set_var("ALWAYS_PREVIEW_ASR", "0");
+            }
+        }
+        let mut cfg = AlwaysConfig::from_cli("auto".into(), 30, None, None).expect("his prefs");
+        cfg.timeout_secs = 4;
+        if let Ok(l) = std::env::var("SESSION_REPLAY_LANG") {
+            cfg.lang = l;
+        }
+        let transcriber: Arc<dyn Transcriber> = if apple {
+            crate::always::preview_asr::prewarm(&cfg.lang, true);
+            let t = std::time::Instant::now();
+            while crate::always::preview_asr::global().is_some_and(|a| !a.is_ready())
+                && t.elapsed().as_secs() < 120
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            cfg.transcriber_backend = crate::stt_dispatch::TranscriberBackendChoice::Apple;
+            Arc::new(
+                crate::always::stt_apple::AppleTranscriber::new(Some(cfg.lang.clone()))
+                    .expect("Apple STT available"),
+            )
+        } else {
+            cfg.transcriber_backend = crate::stt_dispatch::TranscriberBackendChoice::Groq;
+            cfg.stt_live_preview = false;
+            Arc::new(DumpingTranscriber { dir: dump.clone(), n: Default::default() })
+        };
+        eprintln!(
+            "session_replay cfg: lang={} gate={} thr={} silence={} energy={} hear={}",
+            cfg.lang,
+            cfg.speaker_gate_enabled,
+            cfg.speaker_gate_threshold,
+            cfg.silence_secs,
+            cfg.energy_threshold,
+            cfg.hear_energy_threshold
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut log = Logger;
+        let mut results = Vec::new();
+        let mut idle_after_done = 0;
+        loop {
+            let started = wall_ms();
+            let r = vad::record_utterance(&cfg, &mut log, &transcriber, rt.handle());
+            let ended = wall_ms();
+            let (kind, text, score) = match &r {
+                Ok(RecordResult::Speech { text, .. }) => ("speech", text.clone(), None),
+                Ok(RecordResult::DroppedSpeaker { score }) => {
+                    ("dropped_speaker", String::new(), Some(*score))
+                }
+                Ok(RecordResult::Silence) => ("silence", String::new(), None),
+                Ok(RecordResult::Timeout) => ("timeout", String::new(), None),
+                Ok(RecordResult::DroppedLowEnergy { .. }) => ("low_energy", String::new(), None),
+                Ok(RecordResult::DroppedNoise { raw }) => ("noise", raw.clone(), None),
+                Ok(RecordResult::PreemptedByMicConflict { text }) => {
+                    ("preempted", text.clone(), None)
+                }
+                Err(e) => ("error", format!("{e:#}"), None),
+            };
+            let _ = crate::always::rejected::take_stashed();
+            // The event loop's paste decision (foreign speech / filters).
+            let action = match &r {
+                Ok(RecordResult::Speech { text, transcription, .. }) => {
+                    let then = std::time::Instant::now() - std::time::Duration::from_secs(60);
+                    format!(
+                        "{:?}",
+                        crate::always::speech_action::classify_transcription(
+                            &cfg,
+                            text,
+                            transcription,
+                            std::time::Instant::now(),
+                            then
+                        )
+                    )
+                }
+                _ => String::new(),
+            };
+            if kind == "speech" {
+                global_broadcaster().transcript_final(text.clone());
+            }
+            global_broadcaster().utterance_terminal();
+            eprintln!("session_replay result: {kind} {text:?} score={score:?} action={action}");
+            results.push(serde_json::json!({"kind": kind, "text": text, "score": score, "action": action, "started": started, "ended": ended}));
+            if kind == "error" {
+                break;
+            }
+            if done.exists() {
+                idle_after_done += 1;
+                if idle_after_done >= 2 || matches!(kind, "silence" | "timeout") {
+                    break;
+                }
+            }
+        }
+        let t0: f64 = std::fs::read_to_string(format!("{stem}.t0"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0.0);
+        let report = serde_json::json!({"t0_ms": t0 * 1000.0, "results": results});
+        std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        eprintln!("report written to {out}");
+    }
 }

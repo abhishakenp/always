@@ -54,6 +54,9 @@ pub const FOREIGN_MIN_COHORT: f32 = 0.60;
 pub const FOREIGN_MARGIN: f32 = 0.30;
 /// Consecutive foreign windows needed before an edge is cut.
 pub const MIN_FOREIGN_RUN: usize = 2;
+/// Over media, a window is foreign when it is closer to the impostor than
+/// to him by at least this much (session 2's Iris windows: 0.24–0.66).
+pub const MEDIA_FOREIGN_MARGIN: f32 = 0.10;
 /// Audio kept next to the first/last non-foreign window (450 ms).
 pub const GUARD_SAMPLES: usize = 7_200;
 /// Cuts shorter than this are not worth the risk (600 ms).
@@ -85,7 +88,12 @@ impl WindowVerdict {
             // 0.43/0.15) Iris's "This is another long update" windows scored
             // 0.20/0.44 and 0.11/0.53, were kept as "not clearly foreign", and
             // her words were pasted with his.
-            let media_foreign = self.media && (self.score < c || self.score < MEDIA_TAIL_MIN_SCORE);
+            // A margin, not just "closer": 2026-10-16 14:37:49Z his own words
+            // under a full-volume YouTube voice scored 0.32 him / 0.37 video,
+            // counted foreign, and his sentence was cut mid-way.
+            let margin = if old_trail_rule() { f32::MIN_POSITIVE } else { MEDIA_FOREIGN_MARGIN };
+            let media_foreign =
+                self.media && (c - self.score >= margin || self.score < MEDIA_TAIL_MIN_SCORE);
             clear || media_foreign
         })
     }
@@ -364,6 +372,16 @@ pub fn clear_cohort() {
 
 /// The film rules below are on (always, except offline "before" replays
 /// with `GATE_REPLAY_BASELINE` set).
+/// Replay A/B: `GATE_REPLAY_OLD_TRAIL=1` restores the 7a84839e9d700f120cc0b2996d41740e09c43d94 media rule
+/// (any window closer to the impostor is foreign; a trail cut ends the utterance).
+pub fn old_trail_rule() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("GATE_REPLAY_OLD_TRAIL").is_some() {
+        return true;
+    }
+    false
+}
+
 pub fn media_rules_on() -> bool {
     #[cfg(test)]
     if std::env::var_os("GATE_REPLAY_BASELINE").is_some() {
@@ -479,6 +497,16 @@ mod tests {
         // The same windows without media: the old, cohort-only rule keeps more.
         let quiet: Vec<_> = ws.iter().map(|w| WindowVerdict { media: false, ..*w }).collect();
         assert!(plan(&quiet, 64_000, false).trail_from.unwrap() > cut);
+    }
+
+    #[test]
+    fn over_media_his_window_barely_closer_to_the_video_is_not_foreign() {
+        // 2026-10-16 14:37:49Z, full-volume YouTube: (score, cohort) of his windows.
+        let mk = |s: f32, c: f32| WindowVerdict { start: 0, end: W, score: s, cohort: Some(c), media: true };
+        assert!(!mk(0.32, 0.37).is_foreign(), "0.05 closer to the video: still his");
+        assert!(mk(0.16, 0.48).is_foreign());
+        assert!(mk(0.21, 0.39).is_foreign());
+        assert!(mk(0.12, 0.13).is_foreign(), "below the media floor");
     }
 
     #[test]
