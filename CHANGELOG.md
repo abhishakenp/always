@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **history:** Settings → History is no longer empty on a normal install. It read pasted text out of the diagnostic log, which never holds transcript text outside dev builds; the daemon now keeps a local history file (`~/Library/Application Support/always/history.jsonl`) that the tab reads, and **Delete All** clears it.
 - **status overlay:** switching Settings → Status Overlay between Normal, Compact and Hidden now changes the indicator already on screen, instead of waiting for the next one (or a restart). Picking Normal or Compact shows a short preview, and the setting now says where the indicator appears: centred near the bottom of the screen your pointer is on, above the Dock.
+- **onboarding:** the last setup page offers the apps you are likely to dictate into — Slack, Messages, ChatGPT, Claude, Cursor, browsers, Mail, Notes and more — whether they are running or only installed, instead of the first eight running apps A→Z, which left Slack off on a busy Mac. Password managers are never offered.
 
 ## [0.1.0] - 2026-10-15
 
