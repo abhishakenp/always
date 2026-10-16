@@ -684,6 +684,18 @@ const SPEAKER_TAIL_THRESHOLD_FACTOR: f32 = 0.6;
 const MEDIA_TAIL_FAIL_CHECKS: usize = 4;
 /// Two film-rule window passes must end this far apart (0.75 s of audio).
 const MEDIA_PASS_GAP_SAMPLES: usize = 12_000;
+/// Replay A/B switch: `GATE_REPLAY_NO_EXCISE` (tests only) restores the
+/// old end-at-the-cut behaviour.
+fn media_excise_on() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("GATE_REPLAY_NO_EXCISE").is_some() {
+        return false;
+    }
+    true
+}
+/// After a tail cut over other output, his continuation joins the same
+/// utterance if one of his windows lands within this long.
+const MEDIA_EXCISE_JOIN_SECS: f64 = 2.5;
 
 pub fn record_utterance(
     cfg: &AlwaysConfig,
@@ -1498,12 +1510,35 @@ fn record_with_local_vad(
     // so the live stream (which heard everything) cannot supply its text.
     let mut speaker_timeline = crate::always::speaker_trim::Timeline::default();
     let mut speaker_trimmed = false;
+    // A tail cut while other output plays (Iris answering, a film) EXCISES
+    // instead of ending: his verified head is kept, the foreign stretch is
+    // dropped, and capture goes on so his continuation joins the SAME
+    // utterance (2026-10-16 04:38Z: "Okay, I..." was pasted + Return alone
+    // while Iris talked over him, his continuation 0.9 s later became a
+    // second message). (head end, buffer generation, deadline): no window
+    // of his within MEDIA_EXCISE_JOIN_SECS → the head alone is the utterance.
+    let mut media_excise: Option<(usize, usize, std::time::Instant)> = None;
+    let mut excise_film_pass: Option<std::time::Instant> = None;
     // At most one speaker check in flight, scored off this thread (see
     // `GateJob`). Its verdict is applied by `gate_apply_verdict!` on the
     // first frame after it lands — voiced or silent.
     let mut gate_job: Option<GateJob> = None;
     macro_rules! gate_apply_verdict {
         () => {{
+            if let Some((head, generation, deadline)) = media_excise
+                && std::time::Instant::now() >= deadline
+            {
+                let head = if generation == committed_samples { head.min(speech_samples.len()) } else { 0 };
+                tracing::info!(
+                    kept_secs = head as f64 / 16_000.0,
+                    trimmed_secs = (speech_samples.len() - head) as f64 / 16_000.0,
+                    "speaker_gate_excise_expired"
+                );
+                speech_samples.truncate(head);
+                speaker_timeline.excise(head, usize::MAX);
+                media_excise = None;
+                break;
+            }
             if let Some(score) = gate_job.as_ref().and_then(GateJob::poll) {
                 let job = gate_job.take().expect("polled gate job present");
                 if let Some(gate) = &speaker_gate
@@ -1597,9 +1632,46 @@ fn record_with_local_vad(
                             } else {
                                 speaker_tail_fail_checks
                             };
-                            if speaker_gate_allows_score(score, tail_threshold) || media_tail_ok {
+                            // After an excision the continuation must be clearly his
+                            // (the lenient film-tail rule passed Iris windows at 0.2).
+                            // As strict as a fresh verification: the profile
+                            // threshold, or two film-rule passes >= 0.75 s apart.
+                            let tail_pass = if media_excise.is_some() {
+                                let film_pass = score.is_some_and(|s| {
+                                    crate::always::speaker_trim::media_window_passes(s, film)
+                                });
+                                let now = std::time::Instant::now();
+                                let second = film_pass
+                                    && excise_film_pass.is_some_and(|t: std::time::Instant| {
+                                        now.duration_since(t).as_secs_f64()
+                                            >= MEDIA_PASS_GAP_SAMPLES as f64 / 16_000.0
+                                    });
+                                if film_pass && excise_film_pass.is_none() {
+                                    excise_film_pass = Some(now);
+                                }
+                                speaker_gate_allows_score(score, gate.threshold) || second
+                            } else {
+                                speaker_gate_allows_score(score, tail_threshold) || media_tail_ok
+                            };
+                            if tail_pass {
                                 tail_fail_streak = 0;
                                 confirmed_user_len = job.len_at_submit;
+                                excise_film_pass = None;
+                                if let Some((head, generation, _)) = media_excise.take() {
+                                    // Join: drop the foreign stretch between his head
+                                    // and the window that is his again.
+                                    let from = if generation == committed_samples { head } else { 0 };
+                                    let to = job.len_at_submit.saturating_sub(job.scored_len).max(from);
+                                    speech_samples.drain(from..to.min(speech_samples.len()));
+                                    speaker_timeline.excise(from, to);
+                                    confirmed_user_len = confirmed_user_len.saturating_sub(to - from);
+                                    tracing::info!(
+                                        score = ?score,
+                                        film = ?film,
+                                        dropped_secs = (to - from) as f64 / 16_000.0,
+                                        "speaker_gate_continuation_joined"
+                                    );
+                                }
                             } else {
                                 tail_fail_streak += 1;
                                 tracing::debug!(
@@ -1624,7 +1696,23 @@ fn record_with_local_vad(
                                         &mut speculation_pending,
                                         &speculation_slot,
                                     );
-                                    break;
+                                    speaker_timeline.excise(confirmed_user_len, usize::MAX);
+                                    if film.is_some() && media_excise_on() {
+                                        // Other output plays: keep listening for his
+                                        // continuation (see `media_excise`).
+                                        tail_fail_streak = 0;
+                                        if media_excise.is_none() {
+                                            media_excise = Some((
+                                                confirmed_user_len,
+                                                committed_samples,
+                                                std::time::Instant::now()
+                                                    + std::time::Duration::from_secs_f64(MEDIA_EXCISE_JOIN_SECS),
+                                            ));
+                                            tracing::info!("speaker_gate_tail_excised");
+                                        }
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -2873,6 +2961,18 @@ fn record_with_local_vad(
         }
     }
 
+    // Ended (silence, timeout) while an excision waited for his
+    // continuation: only his head is the utterance.
+    if let Some((head, generation, _)) = media_excise.take() {
+        let head = if generation == committed_samples { head.min(speech_samples.len()) } else { 0 };
+        tracing::info!(
+            kept_secs = head as f64 / 16_000.0,
+            trimmed_secs = (speech_samples.len() - head) as f64 / 16_000.0,
+            "speaker_gate_excise_ended"
+        );
+        speech_samples.truncate(head);
+        speaker_timeline.excise(head, usize::MAX);
+    }
     // "Speech end" for latency accounting: the capture time of the frame
     // on which the final-silence cut fired — i.e. when the user's silence
     // window actually elapsed, not when the loop got around to it.

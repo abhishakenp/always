@@ -208,6 +208,19 @@ impl Timeline {
 
     /// The buffer lost its first `n` samples: shift, dropping windows
     /// that started inside the removed audio.
+    /// Samples `from..to` of the live buffer were removed: windows that
+    /// touched them go, later ones shift down. `to = usize::MAX` truncates.
+    pub fn excise(&mut self, from: usize, to: usize) {
+        let n = to.saturating_sub(from);
+        self.windows.retain(|w| w.end <= from || w.start >= to);
+        for w in &mut self.windows {
+            if w.start >= to {
+                w.start -= n;
+                w.end -= n;
+            }
+        }
+    }
+
     pub fn drain_front(&mut self, n: usize) {
         self.windows.retain(|w| w.start >= n);
         for w in &mut self.windows {
@@ -441,6 +454,24 @@ mod tests {
     }
     const REEL: (f32, Option<f32>) = (0.08, Some(0.72));
     const USER: (f32, Option<f32>) = (0.55, Some(0.05));
+
+    #[test]
+    fn excise_drops_touching_windows_and_shifts_later_ones() {
+        let mut t = Timeline::default();
+        for w in windows(6, |_| USER) {
+            t.push(0, w);
+        }
+        // remove samples 40_000..52_000 (windows end at 24k, 32k, ..., 64k)
+        t.excise(40_000, 52_000);
+        let ends: Vec<usize> = t.windows.iter().map(|w| w.end).collect();
+        // 24k (16k..24k... start = end - W) and 32k end before 40k: kept; any window
+        // overlapping 40k..52k removed; a window starting at/after 52k shifts by 12k.
+        assert!(ends.iter().all(|&e| e <= 40_000 || e >= 52_000 - 12_000));
+        assert!(t.windows.iter().all(|w| w.end <= 40_000 || w.start >= 40_000));
+        // truncate everything after 30k
+        t.excise(30_000, usize::MAX);
+        assert!(t.windows.iter().all(|w| w.end <= 30_000));
+    }
 
     #[test]
     fn foreign_needs_low_score_high_cohort_and_margin() {
