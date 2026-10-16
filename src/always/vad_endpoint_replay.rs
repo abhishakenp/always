@@ -46,7 +46,8 @@ fn pause_cut_ms(text: &str, pause_ms: Option<u32>, text_latency_ms: u32) -> Opti
             return None; // speech resumed first: same utterance
         }
         let decided = frame >= latency_frames;
-        let cut = final_silence_cut_frames(
+        let cut = endpoint_cut_frames(
+            true,
             BASE,
             BASE,
             hesitation(),
@@ -63,35 +64,23 @@ fn pause_cut_ms(text: &str, pause_ms: Option<u32>, text_latency_ms: u32) -> Opti
     panic!("a pause that never resumes must end the utterance");
 }
 
-/// Replays one spoken sequence; returns the number of Enters. A cut pastes
-/// at once (when its text is in), but Return waits the commit hold for the
-/// text pasted so far; speech resuming inside it merges into the same
-/// message (`event_loop::commit_hold_ms`). So an Enter = a cut whose pause
-/// outlasts paste + commit hold, or the final cut.
+/// Replays one spoken sequence in paste mode; returns the number of
+/// Enters. His auto-Enter setting (0) is authoritative since 83ef87a — no
+/// commit hold, no merge — so every cut is one paste and one Return.
 fn enters_for(pieces: &[(&str, Option<u32>)], text_latency_ms: u32) -> usize {
-    let loc = &Localization::ENGLISH;
-    let mut pasted = String::new();
-    let mut enters = 0;
-    for (text, pause) in pieces {
-        pasted = if pasted.is_empty() {
-            text.to_string()
-        } else {
-            format!("{pasted} {text}")
-        };
-        let Some(cut) = pause_cut_ms(text, *pause, text_latency_ms) else {
-            continue;
-        };
-        let paste_at = cut.max(text_latency_ms);
-        let hold = crate::always::event_loop::commit_hold_ms(loc, &pasted);
-        match pause {
-            Some(p) if p.saturating_sub(paste_at) < hold => {} // merged
-            _ => {
-                enters += 1;
-                pasted.clear();
-            }
-        }
-    }
-    enters
+    pieces
+        .iter()
+        .filter(|(text, pause)| pause_cut_ms(text, *pause, text_latency_ms).is_some())
+        .count()
+}
+
+/// The same sequence under prod 83ef87a (paste mode cut at the base
+/// window whatever the text said): every pause of at least the window.
+fn enters_prod(pieces: &[(&str, Option<u32>)]) -> usize {
+    pieces
+        .iter()
+        .filter(|(_, pause)| pause.is_none_or(|p| p >= BASE as u32 * FRAME_MS))
+        .count()
 }
 
 /// Logged Apple STT for a 6-10 s chunk landed 152-551 ms after the cut
@@ -147,9 +136,10 @@ fn today_fragment_endings_classify() {
 /// 11:04:32-11:04:47Z: "...after like a tiny..." → 1.21 s → "Just, uh, go
 /// away, ... if I want to." → 1.44 s → "I could just uh go to the
 /// detailed view uh in the notch and everything." Logged: 3 pastes, 3
-/// Enters (each 51 ms after its paste). Now: one paste, one Enter.
+/// Enters (each 51 ms after its paste). Both long pauses outlast the 1.2 s
+/// hesitation hold, so they still cut.
 #[test]
-fn replay_1104_tiny_go_away_detailed_view_is_one_enter() {
+fn replay_1104_tiny_go_away_detailed_view() {
     let pieces: &[(&str, Option<u32>)] = &[
         (
             "Basically, because it would not disturb anything on",
@@ -167,13 +157,18 @@ fn replay_1104_tiny_go_away_detailed_view_is_one_enter() {
         ("I could just uh go to the detailed view uh", Some(90)),
         ("in the notch and everything.", None),
     ];
-    assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
+    // (paste mode now, prod 83ef87a). No commit hold merges a resume any
+    // more: a pause past the hold is a Return.
+    assert_eq!(
+        (enters_for(pieces, TEXT_LATENCY_MS), enters_prod(pieces)),
+        (3, 3)
+    );
 }
 
 /// 11:09:01-11:09:11Z: "...but it would be really nice to..." → 1.63 s →
 /// "The transcript, uh, to the right, the strip, ..." Logged: 2 Enters.
 #[test]
-fn replay_1109_really_nice_to_is_one_enter() {
+fn replay_1109_really_nice_to() {
     let pieces: &[(&str, Option<u32>)] = &[
         (
             "And basically, Iris spoke, and after she was done speaking,",
@@ -187,13 +182,18 @@ fn replay_1109_really_nice_to_is_one_enter() {
         ("uh, not the bottom, the right strip,", Some(660)),
         ("and as she was speaking, not, uh, after.", None),
     ];
-    assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
+    // (paste mode now, prod 83ef87a). No commit hold merges a resume any
+    // more: a pause past the hold is a Return.
+    assert_eq!(
+        (enters_for(pieces, TEXT_LATENCY_MS), enters_prod(pieces)),
+        (2, 3)
+    );
 }
 
 /// 11:04:10-11:04:17Z: "...that goes all the..." → ≤2.43 s → "To the left
 /// as needed, ..." Logged: 2 Enters.
 #[test]
-fn replay_1104_goes_all_the_is_one_enter() {
+fn replay_1104_goes_all_the() {
     let pieces: &[(&str, Option<u32>)] = &[
         (
             "I think we should show the, uh, my uh, transcription in the website that goes all the...",
@@ -205,7 +205,12 @@ fn replay_1104_goes_all_the_is_one_enter() {
         ),
         ("uh, it should go all the way to it.", None),
     ];
-    assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
+    // (paste mode now, prod 83ef87a). No commit hold merges a resume any
+    // more: a pause past the hold is a Return.
+    assert_eq!(
+        (enters_for(pieces, TEXT_LATENCY_MS), enters_prod(pieces)),
+        (2, 2)
+    );
 }
 
 /// The live partial hears "uh" before any final text exists: the hold
@@ -351,10 +356,9 @@ fn decided_complete_text_overrides_stale_partial_hesitation() {
 
 /// 2026-10-15 21:49:31Z and 21:49:46Z (0.1.0): decided text ending on a
 /// connector ("…that you need to", "…what's happening, or.") held the cut
-/// 2.5 s — `endpoint_hold_ms` 2517 / 2518. Now the hold is 1.2 s, and a
-/// resume within the 3 s commit hold still merges into one message.
+/// 2.5 s — `endpoint_hold_ms` 2517 / 2518. Now the hold is 1.2 s.
 #[test]
-fn trailing_connector_cuts_at_1_2_s_and_a_resume_still_merges() {
+fn trailing_connector_cuts_at_1_2_s() {
     let loc = &Localization::ENGLISH;
     for t in [
         "Everything that you need to",
@@ -374,14 +378,19 @@ fn trailing_connector_cuts_at_1_2_s_and_a_resume_still_merges() {
         ("Everything that you need to", Some(2_430)),
         ("check is in the log.", None),
     ];
-    assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
+    // (paste mode now, prod 83ef87a). No commit hold merges a resume any
+    // more: a pause past the hold is a Return.
+    assert_eq!(
+        (enters_for(pieces, TEXT_LATENCY_MS), enters_prod(pieces)),
+        (2, 2)
+    );
 }
 
 /// 2026-10-15 18:56:06Z: "…and this is about all." cut at 0.72 s and was
-/// Entered; he resumed 0.7 s after the paste. With the 1.5 s commit hold
-/// the resume merges: one message.
+/// Entered; he resumed 0.7 s after the paste. Text that reads finished
+/// gives no evidence to hold on — the honest boundary.
 #[test]
-fn replay_185606_complete_looking_thinking_pause_is_one_enter() {
+fn replay_185606_complete_looking_thinking_pause() {
     let pieces: &[(&str, Option<u32>)] = &[
         (
             "This, I'm not sure if this is the exact code you have to check, test, and fix, and this is about all.",
@@ -389,45 +398,253 @@ fn replay_185606_complete_looking_thinking_pause_is_one_enter() {
         ),
         ("Takes a while to do that and while I was speaking.", None),
     ];
-    assert_eq!(enters_for(pieces, TEXT_LATENCY_MS), 1);
+    // (paste mode now, prod 83ef87a). No commit hold merges a resume any
+    // more: a pause past the hold is a Return.
+    assert_eq!(
+        (enters_for(pieces, TEXT_LATENCY_MS), enters_prod(pieces)),
+        (2, 2)
+    );
 }
 
-/// Paste mode never holds the cut past the base window, whatever the text
-/// or partial says; consume mode (Iris) keeps the adaptive holds.
+/// Paste mode (auto-Enter 0, no commit hold): positive "more is coming"
+/// evidence holds the cut exactly as in consume mode; only text still in
+/// flight no longer adds the decision grace (the paste does not wait on
+/// that text). Complete / no text: the base window, no added delay.
 #[test]
-fn paste_mode_cuts_at_base_window_consume_mode_keeps_holds() {
+fn paste_mode_holds_open_clauses_but_never_waits_for_text() {
     let loc = &Localization::ENGLISH;
-    let verdicts = [
-        PauseVerdict {
-            text_pending: true,
-            text: None,
-            partial_hesitating: true,
-        },
-        PauseVerdict {
-            text_pending: false,
-            text: Some(classify_pause_text(loc, "Everything that you need to")),
-            partial_hesitating: false,
-        },
-        PauseVerdict {
-            text_pending: false,
-            text: Some(classify_pause_text(loc, "and then we")),
-            partial_hesitating: false,
-        },
-        PauseVerdict {
-            text_pending: true,
-            text: None,
-            partial_hesitating: false,
-        },
+    let held = extended_silence_frames(BASE).max(hesitation());
+    let v = |pending: bool, text: Option<&str>, partial: bool| PauseVerdict {
+        text_pending: pending,
+        text: text.map(|t| classify_pause_text(loc, t)),
+        partial_hesitating: partial,
+    };
+    // Open clause: held in both modes.
+    for open in [
+        v(true, None, true),
+        v(false, Some("Everything that you need to"), false),
+        v(false, Some("and then we"), false),
+        v(false, Some("Great limited one account so."), false),
+    ] {
+        assert_eq!(endpoint_cut_frames(true, BASE, BASE, hesitation(), open), held, "{open:?}");
+        assert_eq!(endpoint_cut_frames(false, BASE, BASE, hesitation(), open), held, "{open:?}");
+    }
+    // Text in flight: no grace when pasting; consume mode keeps it.
+    let pending = v(true, None, false);
+    assert_eq!(endpoint_cut_frames(true, BASE, BASE, hesitation(), pending), BASE);
+    assert_eq!(
+        endpoint_cut_frames(false, BASE, BASE, hesitation(), pending),
+        BASE + MIDSENTENCE_DECISION_GRACE_FRAMES
+    );
+    // Finished: base window in both.
+    for done in [
+        v(false, Some("What's the status on that?"), false),
+        v(false, Some("Please fix that."), false),
+        v(false, None, false),
+    ] {
+        assert_eq!(endpoint_cut_frames(true, BASE, BASE, hesitation(), done), BASE, "{done:?}");
+    }
+}
+
+/// His decided pause texts that ENDED the utterance read as finished now;
+/// open clauses still hold (2026-10-12..16 logs, `endpoint_log_replay`).
+#[test]
+fn connector_before_terminator_reads_finished_unless_a_conjunction() {
+    let loc = &Localization::ENGLISH;
+    for t in [
+        "I just tried, it did not work. What's happening? What's the status on that?",
+        "Okay, so is the click lag being worked on?",
+        "Anything like that?",
+        "Please fix that.",
+        "And disturbed me from watching movies and that is why I said that.",
+        "I should otherwise ask if it's irreversible action or things like that.",
+    ] {
+        assert_eq!(classify_pause_text(loc, t), PauseText::Complete, "{t}");
+    }
+    for t in [
+        "Great limited one account so.",
+        "It can happen in the.",
+        "Everything that you need to.",
+        "seems broken in always or what, what's happening, or.",
+        "And?",
+        "Check the documentation of Omnir out and everything that...",
+    ] {
+        assert_eq!(classify_pause_text(loc, t), PauseText::Hesitating, "{t}");
+    }
+    // Live partials (unpunctuated): "that" is no evidence; "the" still is.
+    assert!(!partial_says_hesitating(loc, "whats the status on that"));
+    assert!(partial_says_hesitating(loc, "it should go all the way to the"));
+}
+
+/// Landed speculation replaces the live session's finish only when the
+/// session heard words and the speculation is valid with text.
+#[test]
+fn speculation_replaces_stream_only_with_full_evidence() {
+    use super::speculation_replaces_stream as r;
+    assert!(r(true, true, true, true));
+    assert!(!r(false, true, true, true)); // no session: speculation path anyway
+    assert!(!r(true, false, true, true)); // invalidated by a resume
+    assert!(!r(true, true, false, true)); // not landed / empty
+    assert!(!r(true, true, true, false)); // session heard nothing: let it report NoWords
+}
+
+/// One decided pause from his live logs (see `endpoint_log_replay`).
+struct LoggedPause {
+    text: String,
+    decided_ms: u32,
+    /// `Some(ms)` = he resumed after this much (smoothed) silence.
+    resumed_ms: Option<u32>,
+}
+
+/// Silence (ms) at which `cut_frames(verdict_known)` ends this pause, or
+/// `None` when he resumed first. The verdict is known from `decided_ms`.
+fn logged_cut_ms(p: &LoggedPause, cut_frames: impl Fn(Option<PauseText>) -> usize) -> Option<u32> {
+    let loc = &Localization::ENGLISH;
+    let verdict = classify_pause_text(loc, &p.text);
+    for frame in 1..=10_000u32 {
+        let ms = frame * FRAME_MS;
+        if p.resumed_ms.is_some_and(|r| ms > r) {
+            return None;
+        }
+        let known = (ms >= p.decided_ms).then_some(verdict);
+        if frame as usize >= cut_frames(known) {
+            return Some(ms);
+        }
+    }
+    None
+}
+
+/// Replays every decided pause of his pasted utterances (extracted from
+/// ~/Library/Logs/Always by the scratch `extract.py` into JSONL with
+/// `text`, `frame` (decision frame), `outcome` ("end"/"resumed"),
+/// `pause_ms`) through the paste-mode endpoint. Prints, per policy, the
+/// thinking pauses it would cut (a cut = paste + Return at auto-Enter 0)
+/// and the endpoint hold on finished utterances.
+#[test]
+#[ignore = "needs ENDPOINT_LOG_REPLAY=<decisions.jsonl>; run explicitly"]
+fn endpoint_log_replay() {
+    let Ok(path) = std::env::var("ENDPOINT_LOG_REPLAY") else {
+        return;
+    };
+    let pauses: Vec<LoggedPause> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| {
+            Some(LoggedPause {
+                text: v["text"].as_str()?.to_string(),
+                decided_ms: v["frame"].as_u64()? as u32 * FRAME_MS,
+                resumed_ms: match v["outcome"].as_str()? {
+                    "resumed" => Some(v["pause_ms"].as_u64()? as u32),
+                    _ => None,
+                },
+            })
+        })
+        .collect();
+    let base = BASE;
+    let held = extended_silence_frames(BASE).max(hesitation());
+    let policies: Vec<(&str, Box<dyn Fn(Option<PauseText>) -> usize>)> = vec![
+        ("prod 83ef87a: base always", Box::new(move |_| base)),
+        (
+            "new: paste-mode holds",
+            Box::new(move |v| {
+                endpoint_cut_frames(
+                    true,
+                    base,
+                    base,
+                    hesitation(),
+                    PauseVerdict {
+                        text_pending: v.is_none(),
+                        text: v,
+                        partial_hesitating: false,
+                    },
+                )
+            }),
+        ),
+        (
+            "new + hesitation hold 1.8 s",
+            Box::new(move |v| {
+                endpoint_cut_frames(
+                    true,
+                    base,
+                    base,
+                    60,
+                    PauseVerdict {
+                        text_pending: false,
+                        text: v,
+                        partial_hesitating: false,
+                    },
+                )
+            }),
+        ),
+        (
+            "new + hesitation hold 2.5 s",
+            Box::new(move |v| {
+                endpoint_cut_frames(
+                    true,
+                    base,
+                    base,
+                    84,
+                    PauseVerdict {
+                        text_pending: false,
+                        text: v,
+                        partial_hesitating: false,
+                    },
+                )
+            }),
+        ),
+        (
+            "fast: Complete cuts at 210 ms",
+            Box::new(move |v| match v {
+                Some(PauseText::Complete) => 7,
+                Some(_) => held,
+                None => base,
+            }),
+        ),
+        (
+            "fast: Complete cuts at 450 ms",
+            Box::new(move |v| match v {
+                Some(PauseText::Complete) => 15,
+                Some(_) => held,
+                None => base,
+            }),
+        ),
     ];
-    for v in verdicts {
-        assert_eq!(
-            endpoint_cut_frames(true, BASE, BASE, hesitation(), v),
-            BASE,
-            "{v:?}"
+    let resumed = pauses.iter().filter(|p| p.resumed_ms.is_some()).count();
+    let ended = pauses.len() - resumed;
+    eprintln!("pauses: {} ({resumed} resumed thinking pauses, {ended} ends)", pauses.len());
+    for (name, cut) in &policies {
+        let splits = pauses
+            .iter()
+            .filter(|p| p.resumed_ms.is_some() && logged_cut_ms(p, cut).is_some())
+            .count();
+        let mut holds: Vec<u32> = pauses
+            .iter()
+            .filter(|p| p.resumed_ms.is_none())
+            .filter_map(|p| logged_cut_ms(p, cut))
+            .collect();
+        holds.sort_unstable();
+        // Speculation landed by the cut: the paste skips the live
+        // session's finish (`speculation_replaces_stream`).
+        let landed = pauses
+            .iter()
+            .filter(|p| p.resumed_ms.is_none())
+            .filter(|p| logged_cut_ms(p, cut).is_some_and(|c| p.decided_ms <= c))
+            .count();
+        let pct = |q: f64| holds[((holds.len() as f64 - 1.0) * q) as usize];
+        eprintln!(
+            "{name:30} splits {splits:3}/{resumed}  end hold p50 {} p90 {} p95 {} mean {} ms  text landed by cut {landed}/{ended}",
+            pct(0.5),
+            pct(0.9),
+            pct(0.95),
+            holds.iter().sum::<u32>() / holds.len() as u32,
         );
-        assert!(
-            endpoint_cut_frames(false, BASE, BASE, hesitation(), v) > BASE,
-            "{v:?}"
-        );
+        if std::env::var("ENDPOINT_LOG_REPLAY_VERBOSE").is_ok() {
+            for p in pauses.iter().filter(|p| p.resumed_ms.is_some()) {
+                if let Some(c) = logged_cut_ms(p, cut) {
+                    eprintln!("    split at {c} ms (resumed {:?}): {:?}", p.resumed_ms, p.text);
+                }
+            }
+        }
     }
 }

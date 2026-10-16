@@ -198,6 +198,12 @@ impl LivePreview {
         self.state.lock().verified
     }
 
+    /// Whether the Apple recognizer has reported any words for the open
+    /// chunk.
+    pub fn apple_heard(&self) -> bool {
+        !self.state.lock().apple.is_empty()
+    }
+
     /// What the Parakeet engine has heard so far in the open chunk
     /// (empty when it heard nothing). Read once at end of capture by the
     /// foreign-speech gate.

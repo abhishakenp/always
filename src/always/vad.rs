@@ -1160,6 +1160,12 @@ impl UtterancePreview {
         (!text.trim().is_empty()).then_some(text)
     }
 
+    /// Whether the live Apple session has pushed any words for the open
+    /// speech — the same evidence its finish would report as `Heard`.
+    fn apple_heard(&self) -> bool {
+        self.preview.as_ref().is_some_and(|p| p.apple_heard())
+    }
+
     /// Parakeet's text for the utterance when the Parakeet preview engine
     /// ran (`Some("")` = it ran and heard nothing), `None` when it did not.
     fn parakeet_snapshot(&self) -> Option<String> {
@@ -3076,6 +3082,23 @@ fn record_with_local_vad(
         tracing::info!("streaming_final_skipped_speaker_trimmed");
     }
     let mut live_stream = crate::stt::LiveStreamOutcome::NotRun;
+    // The speculative pass already transcribed this exact audio (any
+    // resume invalidates it): waiting on the live session's finish only
+    // added its 83-165 ms (`stt_wait_ms`, 2026-10-16) between his last word
+    // and the paste. The file pass is also the better text — 02:22:38Z
+    // speculation "…Why didn't it immediately? What's happened?" vs the
+    // stream's "…Why didn't it immediate what's happened?". The session's
+    // `Heard` verdict is carried over from its pushed words.
+    if speculation_replaces_stream(
+        stream_session.is_some(),
+        speculation_pending,
+        speculation_slot.peek_text().is_some(),
+        utt_preview.apple_heard(),
+    ) {
+        drop(stream_session.take());
+        live_stream = crate::stt::LiveStreamOutcome::Heard;
+        tracing::info!("streaming_final_skipped_speculation_ready");
+    }
     let streaming_final = match stream_session.take() {
         Some(session) => {
             let (text, outcome) = session.finish_with_outcome(APPLE_STREAM_FINISH_MS);
@@ -3685,7 +3708,7 @@ fn classify_pause_text(loc: &crate::always::localization::Localization, text: &s
         })
         .collect();
     let last_word = words.first().map(String::as_str).unwrap_or("");
-    if TRAILING_FILLERS.contains(&last_word) || TRAILING_CONNECTORS.contains(&last_word) {
+    if TRAILING_FILLERS.contains(&last_word) || connector_holds(last_word, last_char) {
         return PauseText::Hesitating;
     }
     if let [last, prev] = words.as_slice() {
@@ -3701,9 +3724,50 @@ fn classify_pause_text(loc: &crate::always::localization::Localization, text: &s
     }
 }
 
+/// Take the landed speculative pass as the final instead of finishing the
+/// live session: only when a session is running, the speculation is still
+/// valid (no resume since its snapshot) and has text, and the session
+/// itself heard words (keeps the hallucination gate's `NoWords` evidence
+/// honest — a session that heard nothing still finishes and reports it).
+fn speculation_replaces_stream(
+    session_running: bool,
+    speculation_pending: bool,
+    speculation_has_text: bool,
+    apple_heard: bool,
+) -> bool {
+    session_running && speculation_pending && speculation_has_text && apple_heard
+}
+
+/// Does a trailing connector mean "more is coming" before this final
+/// character? The recogniser marks a phrase that stopped mid-way with
+/// "..." (handled earlier), so a connector before a real terminator is
+/// often a finished sentence. Measured on his decided pause texts
+/// 2026-10-12..16 (`endpoint_log_replay`): "…what's the status on that?",
+/// "…is the click lag being worked on?", "…things like that.", "Please
+/// fix that." all ENDED the utterance, yet held it as hesitations.
+/// - `?` / `!`: only a coordinating conjunction still holds ("And?").
+/// - `.`: "that" is the pronoun ("do that.", "all that."), not a clause
+///   opener; every other connector still holds ("…one account so.").
+fn connector_holds(last_word: &str, last_char: char) -> bool {
+    if !TRAILING_CONNECTORS.contains(&last_word) {
+        return false;
+    }
+    match last_char {
+        '?' | '!' => TRAILING_CONJUNCTIONS.contains(&last_word),
+        // Also unpunctuated (a live partial): "that" alone is no evidence.
+        _ => last_word != "that",
+    }
+}
+
+/// Connectors that join clauses: a sentence never ends on one, even
+/// before a question mark.
+const TRAILING_CONJUNCTIONS: &[&str] = &["and", "but", "or", "so", "because"];
+
 /// Live partials carry no reliable punctuation, so only POSITIVE
 /// hesitation evidence counts there: a missing terminator in a partial
-/// means nothing.
+/// means nothing. A partial ending on "that" is not evidence either (see
+/// `connector_holds`): unpunctuated, "do that" (his common ending) and
+/// "so that" look alike — it held 02:22:16Z for "…the status on that".
 fn partial_says_hesitating(loc: &crate::always::localization::Localization, partial: &str) -> bool {
     classify_pause_text(loc, partial) == PauseText::Hesitating
 }
@@ -3727,16 +3791,16 @@ struct PauseVerdict {
 
 /// Where this pause ends the utterance, by delivery mode.
 ///
-/// Pasting (no stream consumer): always the base window. A cut there is
-/// cheap now — the paste only shows text; auto-Enter waits the commit hold
-/// (1.5 s complete / 3 s trailing off) and a resume merges into the same
-/// message — so holding the cut for text or hesitation only delayed text
-/// he could already see in the preview ("the transcript is already there
-/// but I wait seconds for it to be pasted", 2026-10-15 22:0xZ;
-/// `endpoint_hold_ms` 1019-2518 on 0.1.0).
+/// Pasting: his auto-Enter setting is authoritative (83ef87a removed the
+/// commit hold), so with 0 every cut is a paste AND a Return — a cut on an
+/// open clause sends half a sentence. Positive "more is coming" evidence
+/// (decided text trailing off / mid-clause, or a hesitating live partial)
+/// holds the cut as in consume mode. Text still in flight does NOT hold:
+/// the paste no longer waits on that text (the live session or the landed
+/// speculation supplies it), so the decision grace would only add delay.
 ///
-/// Consume mode (Iris takes the utterance, nothing is pasted, no commit
-/// hold or merge exists): the adaptive holds below still apply.
+/// Consume mode (Iris takes the utterance): the adaptive holds below,
+/// grace included.
 fn endpoint_cut_frames(
     pasting: bool,
     base_frames: usize,
@@ -3744,11 +3808,15 @@ fn endpoint_cut_frames(
     hesitation_frames: usize,
     v: PauseVerdict,
 ) -> usize {
-    if pasting {
-        base_frames
+    let v = if pasting {
+        PauseVerdict {
+            text_pending: false,
+            ..v
+        }
     } else {
-        final_silence_cut_frames(base_frames, normal_frames, hesitation_frames, v)
-    }
+        v
+    };
+    final_silence_cut_frames(base_frames, normal_frames, hesitation_frames, v)
 }
 
 /// Frames of silence after which this pause ends the utterance.
@@ -3771,9 +3839,7 @@ fn final_silence_cut_frames(
     // covers the audio up to the pause. 2026-10-15 18:53:10Z / 18:53:48Z:
     // the chunk text "…We have to send a PR." decided Complete at frame
     // 70, but a stale partial "uh" held the cut to frame 84 (2.5 s after
-    // he stopped). A premature cut is no longer a split message either:
-    // auto-Enter waits for the commit window and a resumed utterance
-    // merges into the same text (see `commit_hold_ms` in event_loop).
+    // he stopped).
     let partial_counts = v.partial_hesitating && v.text != Some(PauseText::Complete);
     if partial_counts || v.text == Some(PauseText::Hesitating) {
         return extended.max(hesitation_frames);
