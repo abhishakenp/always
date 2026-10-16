@@ -4662,6 +4662,7 @@ mod tests {
                 48_000,
                 0.05,
                 std::time::Instant::now(),
+                std::time::Instant::now(),
                 false,
             )
             .unwrap();
@@ -4698,6 +4699,7 @@ mod tests {
                 true,
                 32_000,
                 0.05,
+                std::time::Instant::now(),
                 std::time::Instant::now(),
                 false,
             );
