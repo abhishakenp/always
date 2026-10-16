@@ -91,6 +91,36 @@ async fn run_loop() {
         if pairs.is_empty() {
             continue;
         }
+        let auto_learn = crate::db::open()
+            .ok()
+            .and_then(|c| crate::db::get_preferences(&c).ok())
+            .and_then(|p| p.auto_learn_corrections)
+            .unwrap_or(true);
+
+        // Dictionary corrections (a name, or a sound-alike fix) are learned
+        // at once when auto-learn is on (the default): the next "leave you"
+        // already comes out "Livio". Anything else still waits for review.
+        let (learn_now, pairs): (Vec<_>, Vec<_>) = pairs.into_iter().partition(|p| {
+            auto_learn && crate::always::vocab_match::is_vocab_pair(&p.wrong, &p.right)
+        });
+        if !learn_now.is_empty() {
+            match correction::apply_pairs_to_glossary_with_provenance(
+                &learn_now,
+                correction::Provenance::Passive,
+            ) {
+                Ok(written) => {
+                    for p in &learn_now {
+                        event::global_broadcaster().correction_logged(&p.wrong, &p.right);
+                    }
+                    tracing::info!(
+                        pairs = learn_now.len(),
+                        written,
+                        "passive_correction_learned"
+                    );
+                }
+                Err(e) => tracing::error!(error = %e, "passive_correction_learn_failed"),
+            }
+        }
 
         for pair in pairs {
             match queue.add(pair.clone(), correction_queue::CorrectionSource::Passive) {

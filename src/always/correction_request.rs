@@ -43,6 +43,10 @@ pub fn build(text: &str, llm_available: bool) -> CorrectionRequest {
     // the warm and paste keys differ and turned the paste into a cold
     // LLM call. Idempotent, so the paste path's own call is harmless.
     let cleaned = crate::always::postprocess::local_cleanup(text);
+    // Same dictionary pass the paste path applies (event_loop), so warm and
+    // paste keys stay identical and the LLM sees "Livio", not "leave you".
+    // Idempotent: the paste path's already-corrected text passes unchanged.
+    let cleaned = crate::always::vocab_match::correct_quiet(&cleaned);
     let text = cleaned.as_str();
     let entries = crate::glossary::glossary_match_entries();
     let (acoustic_text, substitutions) = apply_glossary_tiered(

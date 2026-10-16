@@ -32,6 +32,9 @@ struct Entry {
     /// form; defaults to `1`.
     #[serde(default = "default_weight")]
     weight: i64,
+    /// Where the entry came from (`manual`, `hotkey`, `passive`, …).
+    #[serde(default)]
+    provenance: Option<String>,
 }
 
 fn default_weight() -> i64 {
@@ -209,6 +212,55 @@ fn entries() -> Vec<Entry> {
     cache().read().entries.clone()
 }
 
+/// Longest glossary "term" treated as vocabulary. Longer entries are whole
+/// sentences the correction dialog once stored as terms (his glossary held
+/// 13 of them on 2026-10-16); they are not words to bias or match, and in
+/// Apple's `contextualStrings` they only dilute the real names.
+pub const MAX_TERM_WORDS: usize = 4;
+pub const MAX_TERM_CHARS: usize = 40;
+
+/// True when `term` is word-sized vocabulary, not a stored sentence.
+pub fn is_vocab_sized(term: &str) -> bool {
+    let t = term.trim();
+    !t.is_empty()
+        && t.chars().count() <= MAX_TERM_CHARS
+        && t.split_whitespace().count() <= MAX_TERM_WORDS
+}
+
+/// One glossary entry as the dictionary matcher (`vocab_match`) needs it.
+#[derive(Debug, Clone)]
+pub struct VocabEntry {
+    pub term: String,
+    pub mistranscriptions: Vec<String>,
+    pub frequency: i64,
+    /// The user stated this term (manual add, a bumped weight, or learned
+    /// wrong forms) — as opposed to a bare auto-import such as an app name.
+    pub user_stated: bool,
+}
+
+/// Every word-sized glossary entry, with whether the user stated it.
+pub fn vocab_entries() -> Vec<VocabEntry> {
+    entries()
+        .into_iter()
+        .filter(|e| is_vocab_sized(&e.term))
+        .map(|e| VocabEntry {
+            term: e.term.trim().to_string(),
+            user_stated: !e.mistranscriptions.is_empty()
+                || e.weight > default_weight()
+                || e.provenance.as_deref() == Some("manual"),
+            mistranscriptions: e.mistranscriptions,
+            frequency: e.frequency,
+        })
+        .collect()
+}
+
+/// Identity of the loaded glossary (its file mtime): changes whenever the
+/// file is reloaded, so derived caches know to rebuild.
+pub fn loaded_version() -> Option<SystemTime> {
+    ensure_fresh();
+    cache().read().loaded_mtime
+}
+
 /// Vocabulary-biasing string for Whisper's `prompt` field. Returns `None`
 /// when the glossary is empty or unavailable.
 pub fn whisper_bias_prompt() -> Option<String> {
@@ -247,7 +299,7 @@ pub fn all_terms() -> Vec<String> {
     let mut out = Vec::new();
     for e in entries() {
         let term = e.term.trim();
-        if !term.is_empty() && seen.insert(term.to_lowercase()) {
+        if is_vocab_sized(term) && seen.insert(term.to_lowercase()) {
             out.push(term.to_string());
         }
     }
@@ -370,7 +422,7 @@ fn build_whisper_bias_prompt(entries: &[Entry]) -> Option<String> {
     let mut chosen: Vec<&str> = Vec::new();
     for entry in entries {
         let term = entry.term.trim();
-        if term.is_empty() {
+        if !is_vocab_sized(term) {
             continue;
         }
         let term_words = term.split_whitespace().count().max(1);
@@ -599,6 +651,7 @@ mod tests {
             mistranscriptions: miss.iter().map(|s| s.to_string()).collect(),
             frequency: 100,
             weight: 1,
+            provenance: None,
         }
     }
 
@@ -608,6 +661,7 @@ mod tests {
             mistranscriptions: miss.iter().map(|s| s.to_string()).collect(),
             frequency: 100,
             weight,
+            provenance: None,
         }
     }
 

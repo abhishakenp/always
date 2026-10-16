@@ -438,7 +438,10 @@ static LAST_PASTED: std::sync::LazyLock<Mutex<Option<(String, std::time::Instant
 /// Record the text we just pasted. Called from `event_loop::handle_speech`
 /// after `paste::paste_text` succeeds.
 pub fn set_last_pasted(text: impl Into<String>) {
-    *LAST_PASTED.lock() = Some((text.into(), std::time::Instant::now()));
+    let text = text.into();
+    // The dictionary matcher's recency prior: names he just used.
+    crate::always::vocab_match::note_pasted(&text);
+    *LAST_PASTED.lock() = Some((text, std::time::Instant::now()));
 }
 
 /// Read the most recent paste text if still within `window`.

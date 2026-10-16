@@ -1499,6 +1499,36 @@ fn handle_log_correction(intended: &str) {
         return;
     };
 
+    // A whole corrected sentence typed into the dialog is NOT a new term:
+    // stored as one, it never matched anything and flooded Apple's
+    // contextualStrings (13 sentence "terms" in his glossary, 2026-10-16).
+    // Diff it against the paste instead and learn the word pairs.
+    if !crate::glossary::is_vocab_sized(intended) {
+        let pairs: Vec<_> = crate::always::correction::diff_words(&last, intended)
+            .into_iter()
+            .filter(|p| crate::glossary::is_vocab_sized(&p.right))
+            .collect();
+        if pairs.is_empty() {
+            tracing::info!("uds_log_correction_sentence_no_pairs");
+            global_broadcaster().correction_capture_result("no_correction_pairs");
+            return;
+        }
+        match crate::always::correction::apply_pairs_to_glossary(&pairs) {
+            Ok(_) => {
+                for p in &pairs {
+                    global_broadcaster().correction_logged(&p.wrong, &p.right);
+                    tracing::info!(wrong = %p.wrong, right = %p.right, "uds_log_correction_applied");
+                }
+                global_broadcaster().correction_capture_result("applied");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "uds_log_correction_apply_failed");
+                global_broadcaster().correction_capture_result("error");
+            }
+        }
+        return;
+    }
+
     let best = best_token_match(&last, intended);
     match best {
         Some((wrong, distance)) if distance <= intended.chars().count() / 2 => {

@@ -170,6 +170,18 @@ enum VocabAction {
     },
     /// Import vocabulary from installed speech-to-text software
     Import,
+    /// Run the dictionary matcher on one text: `always vocab check "Leave you."`
+    Check {
+        /// Transcript text as the recogniser wrote it
+        text: String,
+    },
+    /// Replay the dictionary matcher over transcript history and list every
+    /// rewrite it would make (`~/.always/transcripts.jsonl`, daemon logs)
+    Eval {
+        /// JSONL files: `{"text": …}` lines or daemon log lines whose
+        /// `fields.raw_text` holds a pasted transcript
+        files: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -460,7 +472,10 @@ fn handle_config(action: ConfigAction) -> Result<()> {
                 )
             );
             println!("capture_aec: {}", prefs.capture_aec.unwrap_or(true));
-            println!("learn_from_voice: {}", prefs.learn_from_voice.unwrap_or(true));
+            println!(
+                "learn_from_voice: {}",
+                prefs.learn_from_voice.unwrap_or(true)
+            );
             #[cfg(target_os = "macos")]
             println!(
                 "apple_intelligence_available: {}",
@@ -557,6 +572,23 @@ fn handle_vocab(action: VocabAction) -> Result<()> {
         VocabAction::Extract { path } => {
             let project_root = path.unwrap_or_else(|| ".".to_string());
             println!("Vocabulary extraction not yet implemented for: {project_root}");
+        }
+        VocabAction::Check { text } => {
+            let started = std::time::Instant::now();
+            let (out, hits) = always::always::vocab_match::correct_with(
+                &text,
+                &always::always::vocab_match::compiled(),
+                &always::always::vocab_match::NoPrior,
+            );
+            let took = started.elapsed();
+            println!("{out}");
+            for h in &hits {
+                println!("  {:?}: {:?} -> {:?}", h.kind, h.from, h.to);
+            }
+            println!("  ({} rewrites, {:?})", hits.len(), took);
+        }
+        VocabAction::Eval { files } => {
+            print!("{}", always::always::vocab_match::eval_files(&files)?);
         }
         VocabAction::Import => {
             println!("Scanning for installed speech-to-text software...");

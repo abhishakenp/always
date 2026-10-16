@@ -54,6 +54,12 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
 
     // Initialize the auto-enter state from config
     pause::init_auto_enter(cfg.auto_enter);
+    // The dictionary matcher's English word list (~236k words): load it
+    // off-thread now so the first utterance never waits on it.
+    std::thread::spawn(|| {
+        crate::always::english_words::warm();
+        let _ = crate::always::vocab_match::compiled();
+    });
     // Pre-load AppKit's pasteboard class: the first in-process NSPasteboard
     // touch costs ~70 ms (measured: native write max 71.6 ms on the first of
     // 20, p50 0.84 ms after). Pay it at boot, not on the first paste.
@@ -880,6 +886,11 @@ fn handle_speech(
             // Before every branch below, so the short-utterance and snippet
             // paths and the consume-mode handoff to Iris all see it.
             let transformed = crate::always::det_correct::normalize_leading_wake(&transformed);
+            // Dictionary words (glossary + learned names): before every
+            // branch, so the short-utterance bypass ("Leave you." → "Livio."),
+            // snippets, long dictations and the Iris handoff all get them.
+            // Deterministic, no model, ≤ 2 ms (vocab_match.rs).
+            let transformed = crate::always::vocab_match::correct(&transformed);
             // Voice editing ("scratch that", "change X to Y", "new line"):
             // claimed ONLY when the whole utterance is an edit command right
             // after a paste into this same field (voice_edit.rs gate);

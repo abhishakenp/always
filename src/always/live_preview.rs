@@ -148,7 +148,10 @@ impl LivePreview {
         if st.closed {
             return;
         }
-        let tail = merge(&st.apple, &st.parakeet);
+        // Dictionary words in the preview too: Parakeet (never biased) and
+        // the Apple stream write "leave you" for Livio, and verified
+        // previews are routable by Iris.
+        let tail = crate::always::vocab_match::correct_quiet(&merge(&st.apple, &st.parakeet));
         let text = match (st.prefix.is_empty(), tail.is_empty()) {
             (true, _) => tail,
             (false, true) => st.prefix.clone(),

@@ -103,7 +103,9 @@ impl Transcriber for AppleTranscriber {
 }
 
 /// Domain phrases fed to `AnalysisContext.contextualStrings` for vocabulary
-/// biasing. Default tech terms are merged with every canonical glossary term;
+/// biasing. His stated terms and learned names lead; default tech terms are
+/// merged with every word-sized canonical glossary term (stored sentences
+/// are excluded — `glossary::is_vocab_sized`);
 /// the engine only boosts, never rewrites, so the full glossary is safe to
 /// include. Capped at 100 phrases (Apple's documented budget).
 pub fn context_phrases() -> Vec<String> {
@@ -126,9 +128,12 @@ pub fn context_phrases() -> Vec<String> {
     ];
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for phrase in DEFAULTS
-        .iter()
-        .map(|s| s.to_string())
+    // His own dictionary first (terms he stated, then the training step's
+    // names by frequency): the budget is 100, and a learned-names file can
+    // hold thousands — the defaults and bare auto-imports fill what is left.
+    for phrase in crate::always::vocab_match::bias_terms(100 - DEFAULTS.len())
+        .into_iter()
+        .chain(DEFAULTS.iter().map(|s| s.to_string()))
         .chain(crate::glossary::all_terms())
     {
         if out.len() >= 100 {

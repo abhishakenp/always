@@ -2898,6 +2898,13 @@ fn record_with_local_vad(
     // Capture is over: end the live preview + Parakeet feed and send the
     // terminal zero level now, not after transcription.
     let preview_text = utt_preview.parakeet_snapshot();
+    // Read BEFORE the preview is dropped: `speculation_replaces_stream`
+    // below needs it, and reading it after the drop always said "no words"
+    // — the landed speculation never replaced the stream (0 skips in 17
+    // stream finals after the 04:25Z restart, 2026-10-16), so the legacy
+    // on-device stream's text ("Give you", 04:42:48Z) was pasted over the
+    // SpeechAnalyzer pass that had landed first ("Leave you.").
+    let apple_heard = utt_preview.apple_heard();
     drop(std::mem::take(&mut utt_preview));
 
     let has_chunks = !chunker.is_empty();
@@ -3206,7 +3213,7 @@ fn record_with_local_vad(
         stream_session.is_some(),
         speculation_pending,
         speculation_slot.peek_text().is_some(),
-        utt_preview.apple_heard(),
+        apple_heard,
     ) {
         drop(stream_session.take());
         live_stream = crate::stt::LiveStreamOutcome::Heard;
