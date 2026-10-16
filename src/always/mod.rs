@@ -18,6 +18,9 @@ pub mod daemon;
 pub mod det_correct;
 pub mod dictation;
 pub mod enrollment;
+pub mod eot;
+#[cfg(test)]
+mod eot_corpus;
 pub mod event;
 pub mod event_loop;
 pub mod filter;
