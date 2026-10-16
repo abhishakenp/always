@@ -152,6 +152,7 @@ final class OutputTap {
     var mono = [Float](repeating: 0, count: 8192)
     var res = [Float](repeating: 0, count: 8192)
     var rate: Double = 0
+    var rateChecked = false, rateT0: UInt64 = 0, rateFrames = 0
 
     func start() -> String? {
         var outDev = AudioObjectID(kAudioObjectUnknown)
@@ -204,6 +205,19 @@ final class OutputTap {
         st = AudioObjectGetPropertyData(tapID, &a, 0, nil, &sz, &asbd)
         if st != noErr || asbd.mSampleRate <= 0 { stop(); return "tap format \(st)" }
         rate = asbd.mSampleRate
+        // The IOProc runs at the AGGREGATE device's rate, which follows its
+        // main sub-device (the speakers), not the tap's nominal format. Live
+        // 2026-10-16: tap 48 kHz, speakers at 96 kHz; resampling 96 kHz data
+        // as 48 kHz wrote 170 reference samples per 85 samples of time, the
+        // ring re-synced on every callback (dev 85 samples, 15k re-syncs per
+        // 10 s) and the canceller's ERLE was 0.9-2 dB.
+        var aggRate: Float64 = 0
+        a = caAddr(kAudioDevicePropertyNominalSampleRate)
+        sz = UInt32(MemoryLayout<Float64>.size)
+        if AudioObjectGetPropertyData(aggID, &a, 0, nil, &sz, &aggRate) == noErr, aggRate > 0, aggRate != rate {
+            log("ref tap: tap format \(Int(rate)) Hz, aggregate runs at \(Int(aggRate)) Hz — resampling from \(Int(aggRate))")
+            rate = aggRate
+        }
         var err: Int32 = 0
         resampler = speex_resampler_init(1, UInt32(rate), 16_000, 4, &err)
         if resampler == nil { stop(); return "resampler \(err)" }
@@ -235,6 +249,28 @@ final class OutputTap {
             for i in 0..<n { mono[i] = f[i] }
         }
         guard n > 0 else { return }
+        // Verify the data rate from the callbacks themselves (frames per host
+        // second over the first ~2 s); a nominal rate that disagrees by > 3%
+        // is replaced by the nearest standard rate, once, and logged.
+        let hostNow = (inTime.pointee.mFlags.contains(.hostTimeValid)) ? inTime.pointee.mHostTime : mach_absolute_time()
+        if !rateChecked {
+            if rateT0 == 0 { rateT0 = hostNow; rateFrames = 0 } else {
+                let secs = Double(hostNow &- rateT0) / hostTicksPerSec
+                if secs >= 2 {
+                    let measured = Double(rateFrames) / secs
+                    rateChecked = true
+                    if abs(measured / rate - 1) > 0.03 {
+                        let std = [44_100.0, 48_000, 88_200, 96_000, 176_400, 192_000].min { abs($0 - measured) < abs($1 - measured) }!
+                        log(String(format: "ref tap: measured %.0f frames/s vs %.0f assumed — resampling from %.0f", measured, rate, std))
+                        rate = std
+                        speex_resampler_set_rate(resampler, UInt32(std), 16_000)
+                    } else {
+                        log(String(format: "ref tap: measured %.0f frames/s (assumed %.0f) ok", measured, rate))
+                    }
+                }
+            }
+            rateFrames += n
+        }
         var inLen = UInt32(n), outLen = UInt32(res.count)
         mono.withUnsafeBufferPointer { mp in
             res.withUnsafeMutableBufferPointer { rp in
