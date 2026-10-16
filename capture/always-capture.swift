@@ -292,49 +292,64 @@ final class OutputTap {
     }
 }
 
+/// Application Support/Always (ALWAYS_CAPTURE_SUPPORT_DIR overrides it for tests).
+func alwaysSupportDir() -> URL {
+    if let d = ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_SUPPORT_DIR"] { return URL(fileURLWithPath: d) }
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Always")
+}
 func extractorWeightsPath() -> String {
-    FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Always/tse/current.bin").path
+    alwaysSupportDir().appendingPathComponent("tse/current.bin").path
 }
 func extractorMtime() -> Date? {
     (try? FileManager.default.attributesOfItem(atPath: extractorWeightsPath()))?[.modificationDate] as? Date
 }
 /// Echo recordings for the extractor's training (OFF unless he opts in by
-/// creating Application Support/Always/tse/dump-echo): while the canceller
-/// is engaged, the raw 16 kHz mic and the reference it got, aligned exactly
-/// as the canceller saw them, go to tse/echo/<start>.{mic,ref}.s16 (0600),
-/// at most `ECHO_DUMP_MAX_SECS` per helper run. Local only.
-let ECHO_DUMP_MAX_SECS = 600.0
+/// creating Application Support/Always/tse/dump-echo): EVERY 10 ms frame —
+/// the raw 16 kHz mic, the reference it got (aligned exactly as the
+/// canceller saw them), what this helper wrote to the daemon (`.out`), and
+/// one byte per frame (`.ran`: 1 = canceller ran) — go to
+/// tse/echo/<start>.{mic,ref,out}.s16 + .ran (0600), at most
+/// `ECHO_DUMP_MAX_SECS` per dump. Local only. (Until 2026-10-16 only
+/// frames where the canceller ran were kept: a quiet-room sentence was
+/// half missing and a session could not be replayed faithfully.)
+let ECHO_DUMP_MAX_SECS = 900.0
 final class EchoDump {
-    let mic: FileHandle, ref: FileHandle, idx: FileHandle
+    let mic: FileHandle, ref: FileHandle, out: FileHandle, ran: FileHandle, idx: FileHandle
     var frames = 0
     var buf = [Int16](repeating: 0, count: 320)
     init?() {
-        let sup = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Always/tse")
+        let sup = alwaysSupportDir().appendingPathComponent("tse")
         guard FileManager.default.fileExists(atPath: sup.appendingPathComponent("dump-echo").path) else { return nil }
         let dir = sup.appendingPathComponent("echo")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let stem = dir.appendingPathComponent("\(Int(Date().timeIntervalSince1970))").path
-        for ext in ["mic", "ref"] {
-            FileManager.default.createFile(atPath: "\(stem).\(ext).s16", contents: nil, attributes: [.posixPermissions: 0o600])
+        for name in ["mic.s16", "ref.s16", "out.s16", "ran", "idx"] {
+            FileManager.default.createFile(atPath: "\(stem).\(name)", contents: nil, attributes: [.posixPermissions: 0o600])
         }
-        FileManager.default.createFile(atPath: "\(stem).idx", contents: nil, attributes: [.posixPermissions: 0o600])
         guard let m = FileHandle(forWritingAtPath: "\(stem).mic.s16"), let r = FileHandle(forWritingAtPath: "\(stem).ref.s16"),
+              let o = FileHandle(forWritingAtPath: "\(stem).out.s16"), let rn = FileHandle(forWritingAtPath: "\(stem).ran"),
               let ix = FileHandle(forWritingAtPath: "\(stem).idx") else { return nil }
-        mic = m; ref = r; idx = ix
-        log("echo dump on: \(stem).{mic,ref}.s16 (max \(Int(ECHO_DUMP_MAX_SECS)) s)")
+        mic = m; ref = r; out = o; ran = rn; idx = ix
+        log("echo dump on: \(stem).{mic,ref,out}.s16 + .ran, every frame, mic pre-gained (max \(Int(ECHO_DUMP_MAX_SECS)) s)")
     }
-    func write(_ m: UnsafePointer<Float>, _ r: UnsafePointer<Float>, _ n: Int) {
+    /// The mic is written pre-gained exactly as the canceller sees it (no int16 clipping).
+    func write(_ m: UnsafePointer<Float>, _ r: UnsafePointer<Float>, _ n: Int, ran didRun: Bool, micGain: Float) {
         guard Double(frames * n) / 16_000 < ECHO_DUMP_MAX_SECS else { return }
         // Wall clock of every 50th frame (0.5 s): maps the dump onto the logs.
         if frames % 50 == 0 {
             idx.write("\(Int(Date().timeIntervalSince1970 * 1000)) \(frames * n)\n".data(using: .utf8)!)
         }
         frames += 1
-        for (h, p) in [(mic, m), (ref, r)] {
-            for i in 0..<n { buf[i] = Int16(max(-32768, min(32767, p[i] * 32768))) }
+        for (h, p, g) in [(mic, m, micGain), (ref, r, Float(1))] {
+            for i in 0..<n { buf[i] = Int16(max(-32768, min(32767, p[i] * g * 32768))) }
             buf.withUnsafeBytes { h.write(Data($0.prefix(n * 2))) }
         }
+        ran.write(Data([didRun ? 1 : 0]))
+    }
+    /// The frame exactly as written to the daemon (after canceller, extractor, AGC).
+    func writeOut(_ p: UnsafePointer<Int16>, _ n: Int) {
+        guard Double(frames * n) / 16_000 <= ECHO_DUMP_MAX_SECS + 0.01 else { return }
+        out.write(Data(bytes: p, count: n * 2))
     }
 }
 // Checked every 10 s (stats timer): the flag appearing starts a dump, the
@@ -342,8 +357,7 @@ final class EchoDump {
 var echoDumpLock = os_unfair_lock()
 var echoDumpShared: EchoDump? = EchoDump()
 func echoDumpFlagPresent() -> Bool {
-    FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Always/tse/dump-echo").path)
+    FileManager.default.fileExists(atPath: alwaysSupportDir().appendingPathComponent("tse/dump-echo").path)
 }
 func echoDumpRefresh() {
     let want = echoDumpFlagPresent()
@@ -362,7 +376,7 @@ func echoDumpRefresh() {
 /// Loads the extractor (nil when disabled, or weights/voiceprint missing).
 func loadExtractor() -> OpaquePointer? {
     if ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_TSE"] == "0" { log("tse off (ALWAYS_CAPTURE_TSE=0)"); return nil }
-    let sup = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Always")
+    let sup = alwaysSupportDir()
     let weights = sup.appendingPathComponent("tse/current.bin").path
     guard FileManager.default.fileExists(atPath: weights) else { log("tse off (no \(weights))"); return nil }
     guard let d = try? Data(contentsOf: sup.appendingPathComponent("voiceprint.json")),
@@ -388,15 +402,26 @@ final class TapPipeline {
     var engaged = false
     // Stats for the 10 s summary log line.
     var framesRun = 0, framesPassed = 0, maxRefRms: Float = 0
+    // Raw mic peak (float, before any int16 conversion) and how many samples
+    // were at/over full scale: tells whether loud playback clips IN the
+    // driver (peak stays <= 0 dBFS) or only in our int16 canceller (> 0 dBFS).
+    var micPeak: Float = 0, micOver = 0
     // Echo reduction actually achieved (canceller in vs out energy while it runs).
     var erleIn: Double = 0, erleOut: Double = 0
+    /// Linear pre-gain applied to the mic before the canceller (and to the dump's mic).
+    var micGain: Float = 1
     init() {
         let env = ProcessInfo.processInfo.environment
         let tail = Int32(env["ALWAYS_CAPTURE_AEC_TAIL"] ?? "") ?? 4096
         // Canceller on the raw mic, then a speech AGC on its output starting
         // at 22 dB — the measured raw-vs-VPIO level offset — so the daemon's
         // levels do not drop when the path changes.
-        let pre = Float(env["ALWAYS_CAPTURE_PREGAIN_DB"] ?? "") ?? 0
+        // −12 dB before the int16 canceller: at full playback volume the raw
+        // float mic peaks at +8.5 dBFS (probe 2026-10-16, 1.4% of samples
+        // over full scale) and the int16 conversion hard-clipped it — the
+        // driver does not. The AGC below starts 12 dB higher to compensate.
+        let pre = Float(env["ALWAYS_CAPTURE_PREGAIN_DB"] ?? "") ?? -12
+        micGain = powf(10, pre / 20)
         aec = aec_new(tail, 0, 0, pre)
         let g0 = Float(env["ALWAYS_CAPTURE_GAIN_DB"] ?? "") ?? 22
         agc = aec_agc_new(-26, 35 - pre, max(0, g0 - pre))
@@ -440,6 +465,7 @@ final class TapPipeline {
                 var e: Float = 0
                 for r in ref { e += r * r }
                 maxRefRms = max(maxRefRms, sqrtf(e / Float(frame)))
+                for j in 0..<frame { let v = abs(acc[off + j]); if v > micPeak { micPeak = v }; if v >= 0.9999 { micOver += 1 } }
                 let ran = acc.withUnsafeBufferPointer { a in
                     ref.withUnsafeBufferPointer { r in
                         out.withUnsafeMutableBufferPointer { o in
@@ -451,11 +477,12 @@ final class TapPipeline {
                     framesRun += 1
                     var ei: Float = 0, eo: Float = 0
                     for j in 0..<frame { ei += acc[off + j] * acc[off + j]; eo += out[j] * out[j] }
+                    eo /= micGain * micGain  // canceller output is pre-gained; ERLE compares like with like
                     erleIn += Double(ei); erleOut += Double(eo)
                 } else { framesPassed += 1 }
                 os_unfair_lock_lock(&echoDumpLock); let echoDump = echoDumpShared; os_unfair_lock_unlock(&echoDumpLock)
-                if ran != 0, let d = echoDump {
-                    acc.withUnsafeBufferPointer { a in ref.withUnsafeBufferPointer { r in d.write(a.baseAddress! + off, r.baseAddress!, frame) } }
+                if let d = echoDump {
+                    acc.withUnsafeBufferPointer { a in ref.withUnsafeBufferPointer { r in d.write(a.baseAddress! + off, r.baseAddress!, frame, ran: ran != 0, micGain: micGain) } }
                 }
                 if (ran != 0) != engaged {
                     engaged = ran != 0
@@ -490,6 +517,7 @@ final class TapPipeline {
                     let s = out[j] * 32768
                     pcm[j] = Int16(max(-32768, min(32767, s)))
                 }
+                if let d = echoDump { pcm.withUnsafeBufferPointer { d.writeOut($0.baseAddress!, frame) } }
                 pcm.withUnsafeBytes { writeAll($0.baseAddress!, frame * 2) }
                 off += frame
             }
@@ -1084,7 +1112,8 @@ if let tp = tapPipeline {
         echoDumpRefresh()
         // Torn reads of these counters are harmless (diagnostics only).
         let run = tp.framesRun, passed = tp.framesPassed, peak = tp.maxRefRms
-        tp.framesRun = 0; tp.framesPassed = 0; tp.maxRefRms = 0
+        let mpk = tp.micPeak, mover = tp.micOver
+        tp.framesRun = 0; tp.framesPassed = 0; tp.maxRefRms = 0; tp.micPeak = 0; tp.micOver = 0
         if run > 0 {
             let tf = tp.tseFrames, tu = tp.tseUs
             tp.tseFrames = 0; tp.tseUs = 0
@@ -1093,8 +1122,9 @@ if let tp = tapPipeline {
             tp.erleIn = 0; tp.erleOut = 0
             let (md, ad, rs, ra) = refRing.takeStats()
             log(String(format: "ref ring: write dev max %d avg %.1f samples, resyncs %d, mic frames reading past the ref %d", md, ad, rs, ra))
-            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB erle=%.1f dB mic=%.1f dBFS tse=%d frames %.0f us/frame drift_comp=%d", run, passed,
-                       20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc), erle, micDb, tf, tf > 0 ? tu / Double(tf) : 0, tapDriftCompensation ? 1 : 0))
+            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB erle=%.1f dB mic=%.1f dBFS tse=%d frames %.0f us/frame drift_comp=%d mic_peak=%.1f dBFS mic_full_scale=%d", run, passed,
+                       20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc), erle, micDb, tf, tf > 0 ? tu / Double(tf) : 0, tapDriftCompensation ? 1 : 0,
+                       20 * log10f(max(mpk, 1e-6)), mover))
         }
     }
     tapStatsTimer.resume()
