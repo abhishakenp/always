@@ -1466,6 +1466,8 @@ fn record_with_local_vad(
     // worth a speculative STT round trip.
     let mut chunker = crate::always::chunker::ChunkAccumulator::new();
     let mut committed_samples = 0usize;
+    // The loop was cut by a graceful shutdown (shutdown.rs), not the endpoint.
+    let mut shutdown_cut = false;
     let mut voiced_since_flush = true;
     // VAD-voiced samples in the open buffer since the last chunk flush —
     // decides whether a chunked tail is transcribed (see
@@ -1930,6 +1932,26 @@ fn record_with_local_vad(
         // dictation).
         if crate::always::enrollment::is_pending() {
             event::global_broadcaster().voice_activity_ended();
+            flip_to_listening!();
+            return Ok(RecordResult::Silence);
+        }
+        // SIGTERM (shutdown.rs): idle → stop now; mid-utterance → cut here,
+        // as if the endpoint fired, so the normal path transcribes and
+        // pastes (or hands to Iris) what he has said so far.
+        if crate::always::shutdown::requested() {
+            if in_speech || committed_samples > 0 {
+                tracing::info!(
+                    live_secs = speech_samples.len() as f64 / 16_000.0,
+                    committed_secs = committed_samples as f64 / 16_000.0,
+                    "shutdown_cut_utterance"
+                );
+                crate::always::shutdown::begin_cut(&speech_samples, utt_preview.open_text());
+                shutdown_cut = true;
+                break;
+            }
+            if voice_activity_announced {
+                event::global_broadcaster().voice_activity_ended();
+            }
             flip_to_listening!();
             return Ok(RecordResult::Silence);
         }
@@ -3303,7 +3325,7 @@ fn record_with_local_vad(
     // Learning ring: his verified utterance + its pause rows, staged until
     // the event loop pastes it (`learn::commit_staged`). Gate off → the
     // voice could be anyone's → nothing is kept.
-    if learn_rows && speaker_gate_requested && ended_at_endpoint {
+    if learn_rows && speaker_gate_requested && (ended_at_endpoint || shutdown_cut) {
         let now = std::time::Instant::now();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

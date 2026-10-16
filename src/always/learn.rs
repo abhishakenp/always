@@ -150,11 +150,51 @@ pub fn commit_staged() {
         recycle(s.samples);
         return;
     }
+    WRITES_PENDING.fetch_add(1, Ordering::SeqCst);
     match writer().try_send(s) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(s)) | Err(mpsc::TrySendError::Disconnected(s)) => {
+            WRITES_PENDING.fetch_sub(1, Ordering::SeqCst);
             tracing::info!("learn_ring_writer_busy_skipped");
             recycle(s.samples);
+        }
+    }
+}
+
+/// Utterances handed to the writer thread and not yet on disk.
+static WRITES_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Graceful shutdown: wait (bounded) for the writer to put queued utterances on disk.
+/// Returns true when nothing is left in flight.
+pub fn flush(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while WRITES_PENDING.load(Ordering::SeqCst) > 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
+/// Graceful shutdown: the staged utterance was not pasted (the process is
+/// exiting before it could be) — keep it anyway, written on this thread.
+/// Returns its id when one was written.
+pub fn commit_staged_now() -> Option<String> {
+    let s = lock(&STAGED).take()?;
+    if !enabled() {
+        recycle(s.samples);
+        return None;
+    }
+    let id = s.meta.id.clone();
+    let mut ring = Ring::open(dir());
+    let out = ring.write(&s.meta, &s.samples, &s.rows);
+    recycle(s.samples);
+    match out {
+        Ok(()) => Some(id),
+        Err(e) => {
+            tracing::warn!(error = %e, "learn_ring_write_failed");
+            None
         }
     }
 }
@@ -199,6 +239,7 @@ fn writer() -> &'static mpsc::SyncSender<Staged> {
                         tracing::warn!(error = %e, "learn_ring_write_failed");
                     }
                     recycle(s.samples);
+                    WRITES_PENDING.fetch_sub(1, Ordering::SeqCst);
                 }
             })
             .expect("spawn learn-ring thread");

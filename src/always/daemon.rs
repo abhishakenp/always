@@ -803,6 +803,53 @@ pub fn install_signal_handlers(handle: &tokio::runtime::Handle) {
                 _ = term.recv() => tracing::info!("received SIGTERM, shutting down"),
                 _ = int.recv()  => tracing::info!("received SIGINT, shutting down"),
             }
+            // Graceful: the sentence in progress is finished and sent (or
+            // kept), bounded by `shutdown::DRAIN`. A second signal cuts the
+            // wait short. See `shutdown.rs`.
+            crate::always::shutdown::request();
+            let started = std::time::Instant::now();
+            let again = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let again_set = std::sync::Arc::clone(&again);
+            let second = tokio::spawn(async move {
+                tokio::select! {
+                    _ = term.recv() => {},
+                    _ = int.recv() => {},
+                }
+                again_set.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let again_read = std::sync::Arc::clone(&again);
+            let drained = tokio::task::spawn_blocking(move || {
+                crate::always::shutdown::wait_drained(crate::always::shutdown::DRAIN, || {
+                    again_read.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            })
+            .await
+            .unwrap_or(false);
+            second.abort();
+            let report = tokio::task::spawn_blocking(move || crate::always::shutdown::finish(drained))
+                .await
+                .unwrap_or_default();
+            let drain_ms = started.elapsed().as_millis() as u64;
+            if let Some(path) = &report.recover {
+                tracing::warn!(
+                    drain_ms,
+                    drained = report.drained,
+                    cut = report.cut,
+                    held_left = report.held_left,
+                    learn_id = report.learn_id.as_deref().unwrap_or(""),
+                    recover = %path.display(),
+                    "shutdown_utterance_recovered"
+                );
+                eprintln!("always: shutdown kept an unfinished utterance: {}", path.display());
+            } else {
+                tracing::info!(
+                    drain_ms,
+                    drained = report.drained,
+                    cut = report.cut,
+                    delivered = report.delivered,
+                    "shutdown_drained"
+                );
+            }
             if let Ok(log_path) = always_config::configured_log_path()
                 && let Ok(mut log) = crate::always::log::Logger::open(&log_path)
             {

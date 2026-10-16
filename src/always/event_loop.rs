@@ -293,7 +293,19 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
     // up in `rec`'s buffer during the gate has been drained.
     let mut was_gated = false;
 
+    crate::always::shutdown::report_pending_on_start();
+
     loop {
+        // SIGTERM/SIGINT (shutdown.rs): the utterance in progress has been
+        // finished by the cycle that just returned; take no new one. The
+        // signal task exits the process once the drain is done.
+        if crate::always::shutdown::requested() {
+            crate::always::shutdown::loop_stopped();
+            tracing::info!("event_loop_stopped_for_shutdown");
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
         if last_dup_check.elapsed() >= Duration::from_secs(30) {
             last_dup_check = Instant::now();
             daemon::reconcile_duplicate_processes();
@@ -579,16 +591,25 @@ fn process_one(
             energy,
             transcription,
             timing,
-        } => handle_speech(
-            &cfg,
-            log,
-            &text,
-            energy,
-            &transcription,
-            &timing,
-            last_process,
-            rt,
-        ),
+        } => {
+            crate::always::shutdown::set_text(&text);
+            let r = handle_speech(
+                &cfg,
+                log,
+                &text,
+                energy,
+                &transcription,
+                &timing,
+                last_process,
+                rt,
+            );
+            // Pasted, or parked for the consumer (the shutdown drain then
+            // waits for its verdict): either way it went out.
+            if r.is_ok() {
+                crate::always::shutdown::delivered();
+            }
+            r
+        }
         vad::RecordResult::Silence => {
             // Don't log silence events - they're too frequent and not useful
             Ok(())
@@ -636,8 +657,11 @@ fn process_one(
             Ok(())
         }
     };
-    // A staged learning-ring utterance that was not pasted is dropped.
-    crate::always::learn::discard_staged();
+    // A staged learning-ring utterance that was not pasted is dropped —
+    // except at shutdown, where `shutdown::finish` keeps it.
+    if !crate::always::shutdown::requested() {
+        crate::always::learn::discard_staged();
+    }
     emit_utterance_terminal();
     outcome
 }

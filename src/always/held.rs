@@ -36,6 +36,8 @@ struct Held {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Released jobs whose native paste is still running (graceful shutdown waits on them).
+static PASTING: AtomicU64 = AtomicU64::new(0);
 static HELD: Mutex<VecDeque<Held>> = Mutex::new(VecDeque::new());
 
 fn lock() -> std::sync::MutexGuard<'static, VecDeque<Held>> {
@@ -124,11 +126,28 @@ pub fn release(id: u64, text: Option<&str>) -> bool {
     );
     crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Success);
     let job = held.job;
+    PASTING.fetch_add(1, Ordering::SeqCst);
     std::thread::Builder::new()
         .name("held-paste".into())
-        .spawn(move || job(received))
+        .spawn(move || {
+            job(received);
+            PASTING.fetch_sub(1, Ordering::SeqCst);
+        })
         .map(|_| true)
-        .unwrap_or(false)
+        .unwrap_or_else(|_| {
+            PASTING.fetch_sub(1, Ordering::SeqCst);
+            false
+        })
+}
+
+/// A final still waits for the consumer's verdict, or a released one is still pasting.
+pub fn busy() -> bool {
+    PASTING.load(Ordering::SeqCst) > 0 || !lock().is_empty()
+}
+
+/// Texts of the finals still parked (graceful shutdown keeps them recoverable).
+pub fn pending_texts() -> Vec<String> {
+    lock().iter().map(|h| h.text.clone()).collect()
 }
 
 /// Drop the parked final for `id` (the consumer claimed it).

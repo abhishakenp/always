@@ -790,6 +790,30 @@ offline; the cloud backend is faster to start and needs an API key.
 These engines expose partial text events (§5). Moonshine models are English only;
 Nemotron 3.5 supports 40 language-locales with auto language detection.
 
+
+### 7.4 Graceful shutdown never loses the sentence in progress
+
+On SIGTERM or SIGINT the daemon does not exit at once (requested by the
+user 2026-10-16, after a restart cut an utterance whose only trace was
+Iris's preview). It stops taking new utterances and finishes the one in
+progress, bounded by **3 s**:
+
+- Idle (no speech in the capture loop): the loop stops at the next frame.
+- Mid-utterance: the capture loop cuts there, as if the endpoint fired
+  (`shutdown_cut_utterance`), and the normal path runs — STT on the
+  buffered audio, then the paste, or in consume mode the held hand-off to
+  Iris; the drain also waits for a held final's verdict and its paste.
+- Whatever did not go out inside the budget (STT failed or ran long, a held
+  final nobody answered) is kept: the learning-ring entry is written then
+  (verified voice only, §learning ring), and a recover pair
+  `<config_dir>/recover/<unix_ms>.json` (+ `.wav`, 16 kHz mono) holding the
+  audio, the live partial and any text is written (dir 0700, files 0600),
+  logged as `shutdown_utterance_recovered` and on stderr. The next start
+  logs `shutdown_recover_pending` with the count.
+- A second signal during the drain skips the rest of the wait.
+
+Then the usual cleanup runs (pid + socket removed, peer resumed, `exit(0)`).
+
 ### 8.1 NVIDIA Nemotron 3.5 ASR — implementation notes
 
 Nemotron 3.5 ASR Streaming 0.6B is implemented via the `parakeet-rs` crate (0.3.6,

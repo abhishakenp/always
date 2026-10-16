@@ -50,6 +50,7 @@ pub mod postprocess;
 pub mod preview_asr;
 pub mod rejected;
 mod replay_tests;
+pub mod shutdown;
 pub mod snippets;
 pub mod speaker_embed;
 pub mod speaker_trim;
