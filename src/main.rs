@@ -460,6 +460,7 @@ fn handle_config(action: ConfigAction) -> Result<()> {
                 )
             );
             println!("capture_aec: {}", prefs.capture_aec.unwrap_or(true));
+            println!("learn_from_voice: {}", prefs.learn_from_voice.unwrap_or(true));
             #[cfg(target_os = "macos")]
             println!(
                 "apple_intelligence_available: {}",

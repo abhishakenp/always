@@ -1311,6 +1311,19 @@ fn record_with_local_vad(
     // Capture time of the frame being processed; its value when the loop
     // exits is the moment the final-silence cut was reached in speech time.
     let mut frame_captured_at = std::time::Instant::now();
+    // Learned end-of-turn (`eot.rs`, `learn.rs`): a raw-frame prosody
+    // tracker (no smoothing), the pause rows the learning ring keeps, and
+    // the promoted model's confident early cut. No model → no early cut.
+    crate::always::learn::discard_staged();
+    let eot_model = crate::always::learn::eot_model();
+    let learn_rows = crate::always::learn::enabled();
+    let mut eot_tracker = crate::always::eot::EotTracker::default();
+    let mut pause_log = crate::always::eot::PauseLog::default();
+    // Some((raw silence frames, score)) when the learned cut ended it.
+    let mut eot_early: Option<(u32, f32)> = None;
+    // The loop ended at the endpoint (base window / holds / learned cut),
+    // not at a cap, a recorder EOF or a gate drop.
+    let mut ended_at_endpoint = false;
     let mut early_voice_streak = 0usize;
     let mut long_recording_warned = false;
     let mut total_frames = 0usize;
@@ -1973,12 +1986,64 @@ fn record_with_local_vad(
         // utterance). Hold the pause: keep the audio (if he really did
         // resume, nothing is lost), but neither reset nor advance the
         // silence count while the cue may still be audible.
-        if own_cue_echo_holds(
+        let echo_hold = own_cue_echo_holds(
             is_speech,
             in_speech,
             consecutive_silence,
             crate::always::status_sound::echo_window_active(),
-        ) {
+        );
+        if in_speech {
+            if echo_hold {
+                // Our own cue is not his voice: never cut this pause early.
+                eot_tracker.hold();
+            } else {
+                let raw_voiced =
+                    last_prob >= crate::always::eot::VOICED_PROB || energy_above_threshold;
+                eot_tracker.push(samples, last_prob, raw_voiced);
+                if learn_rows {
+                    pause_log.on_frame(
+                        &eot_tracker,
+                        raw_voiced,
+                        consecutive_silence as u32,
+                        (committed_samples + speech_samples.len()) as f32 / 16_000.0,
+                    );
+                }
+                // Confident early cut, ~200-300 ms after his last word when
+                // the model is sure. Paste mode only (no consumer). Any
+                // text evidence that more is coming vetoes it, and then the
+                // whole pause is left to the unchanged endpoint.
+                if !raw_voiced
+                    && let Some(model) = eot_model.as_deref()
+                    && let Some(score) = model.cut_now(&eot_tracker)
+                    && !pause::is_consume_mode()
+                {
+                    let probe_ms = eot_tracker.raw_silence_frames() * FRAME_MS;
+                    let veto = if is_short_utterance_so_far(committed_samples, speech_samples.len()) {
+                        Some("short")
+                    } else if partial_hesitating
+                        || utt_preview
+                            .open_text()
+                            .is_some_and(|p| partial_says_hesitating(&cfg.localization, &p))
+                    {
+                        Some("partial_hesitating")
+                    } else if pause_text.is_some_and(|v| v != PauseText::Complete) {
+                        Some("text_open")
+                    } else if keyboard::is_option_held() {
+                        Some("option_held")
+                    } else {
+                        None
+                    };
+                    tracing::info!(probe_ms, score, veto, version = model.version, "eot_early_cut");
+                    if veto.is_none() {
+                        eot_early = Some((eot_tracker.raw_silence_frames(), score));
+                        ended_at_endpoint = true;
+                        break;
+                    }
+                    eot_tracker.hold();
+                }
+            }
+        }
+        if echo_hold {
             utt_preview.frame(samples, false, !speaker_gate_requested || speaker_checked);
             speech_samples.extend_from_slice(samples);
             own_cue_echo_frames += 1;
@@ -2729,6 +2794,7 @@ fn record_with_local_vad(
                 },
             );
             if consecutive_silence >= eff_final_frames {
+                ended_at_endpoint = true;
                 break;
             }
         } else {
@@ -2812,6 +2878,23 @@ fn record_with_local_vad(
     // window actually elapsed, not when the loop got around to it.
     let speech_end_at = frame_captured_at;
     let voice_end_at = last_voiced_at.unwrap_or(speech_end_at);
+    // The final pause is an END label only when the endpoint ended it.
+    if ended_at_endpoint {
+        pause_log.finish_end(eot_early.is_some());
+    } else {
+        pause_log.finish_unlabelled();
+    }
+    if ended_at_endpoint && eot_tracker.seen_voice() {
+        // Real last-word → cut (raw frames, no smoothing hangover); with
+        // `total_ms` of the latency line this gives last word → paste.
+        tracing::info!(
+            raw_silence_ms = eot_tracker.raw_silence_frames() * FRAME_MS,
+            early = eot_early.is_some(),
+            score = eot_early.map(|e| e.1),
+            model = eot_model.as_ref().map(|m| m.version),
+            "eot_endpoint"
+        );
+    }
     // Capture is over: end the live preview + Parakeet feed and send the
     // terminal zero level now, not after transcription.
     let preview_text = utt_preview.parakeet_snapshot();
@@ -3022,6 +3105,36 @@ fn record_with_local_vad(
     // enrolled-only drift guard inside).
     if speaker_gate_requested && let Some(gate) = &speaker_gate {
         speaker_gate_admit_accepted(gate, &speech_samples, voiced_samples);
+    }
+    // Learning ring: his verified utterance + its pause rows, staged until
+    // the event loop pastes it (`learn::commit_staged`). Gate off → the
+    // voice could be anyone's → nothing is kept.
+    if learn_rows && speaker_gate_requested && ended_at_endpoint {
+        let now = std::time::Instant::now();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let wall_ms =
+            |t: std::time::Instant| now_ms.saturating_sub(now.saturating_duration_since(t).as_millis() as u64);
+        let cut_ms = wall_ms(speech_end_at);
+        let kept = speech_samples
+            .len()
+            .min(crate::always::learn::MAX_UTT_SECS * 16_000);
+        let pauses = pause_log.rows.len() as u32;
+        crate::always::learn::stage(
+            &speech_samples,
+            &mut pause_log.rows,
+            crate::always::learn::UttMeta {
+                id: cut_ms.to_string(),
+                cut_unix_ms: cut_ms,
+                voice_start_unix_ms: wall_ms(first_voice_at.unwrap_or(speech_end_at)),
+                secs: kept as f32 / 16_000.0,
+                tail_only: has_chunks,
+                early_cut: eot_early.is_some(),
+                raw_silence_ms: eot_tracker.raw_silence_frames() * FRAME_MS,
+                pauses,
+            },
+        );
     }
 
     // Guarantee Transcribing overlay (speculation usually already flipped).

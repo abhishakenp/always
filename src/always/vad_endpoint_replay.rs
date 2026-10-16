@@ -612,6 +612,36 @@ fn endpoint_log_replay() {
     ];
     let resumed = pauses.iter().filter(|p| p.resumed_ms.is_some()).count();
     let ended = pauses.len() - resumed;
+    // Learned end-of-turn (`eot.rs`): the logs keep no audio, so the
+    // model's score on these pauses is unknown. What IS known: every
+    // resumed pause here lasted ≥ its logged (smoothed) silence + the
+    // 300 ms Silero hold in raw frames, i.e. past every probe (≤ 570 ms),
+    // so the model could reach all of them; the live-partial veto
+    // (`partial_says_hesitating` on the same words, unpunctuated) blocks
+    // some. The rest are bounded by the model's held-out false-cut rate
+    // on his audio pause rows (`eot_corpus::eot_replay`).
+    {
+        let loc = &Localization::ENGLISH;
+        let partial = |t: &str| -> String {
+            t.chars()
+                .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '\'')
+                .collect::<String>()
+                .to_lowercase()
+        };
+        let reach: Vec<&LoggedPause> = pauses
+            .iter()
+            .filter(|p| p.resumed_ms.is_some_and(|ms| ms + 300 > 6 * FRAME_MS))
+            .collect();
+        let vetoed = reach
+            .iter()
+            .filter(|p| partial_says_hesitating(loc, &partial(&p.text)))
+            .count();
+        eprintln!(
+            "learned EOT: resumed pauses reachable by a probe {}/{resumed}, partial-veto {vetoed}, exposed {} (added splits = exposed x held-out false-cut rate)",
+            reach.len(),
+            reach.len() - vetoed
+        );
+    }
     eprintln!("pauses: {} ({resumed} resumed thinking pauses, {ended} ends)", pauses.len());
     for (name, cut) in &policies {
         let splits = pauses

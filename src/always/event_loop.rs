@@ -270,6 +270,11 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
     // `idle_pause_secs == 0`. Lives for the daemon lifetime.
     idle_watcher::spawn(rt.handle(), cfg.idle_pause_secs);
 
+    // Learning ring (his own accepted voice, local + bounded) and the
+    // retrain-when-away loop for the learned end-of-turn model.
+    crate::always::learn::init(cfg.learn_from_voice);
+    crate::always::learn_train::spawn();
+
     // Mic-conflict watchdog: dedicated task so a call starting while
     // `record_utterance` blocks (up to 30s waiting for voice) is caught
     // within the poll interval instead of after the wait. Replaces the
@@ -543,6 +548,8 @@ fn process_one(
     transcriber: &Arc<dyn Transcriber>,
 ) -> Result<()> {
     let cfg = active_cfg.read();
+    // Follow the `learn_from_voice` preference live.
+    crate::always::learn::set_enabled(cfg.learn_from_voice);
     // Keep the paste context fresh for `PasteRejected` (rejected or
     // expired-held transcripts recovered later).
     *PASTE_CTX.lock().unwrap_or_else(|p| p.into_inner()) = Some((cfg.clone(), rt.clone()));
@@ -623,6 +630,8 @@ fn process_one(
             Ok(())
         }
     };
+    // A staged learning-ring utterance that was not pasted is dropped.
+    crate::always::learn::discard_staged();
     emit_utterance_terminal();
     outcome
 }
@@ -1027,6 +1036,11 @@ fn handle_speech(
             // connected. Only a live per-connection consume lease may suppress
             // paste; otherwise a controller crash could silently drop a wake
             // word instead of dictating it normally.
+            // His own accepted utterance is being pasted (not handed to a
+            // consumer): keep it in the learning ring (off-thread write).
+            if !pause::is_consume_mode() {
+                crate::always::learn::commit_staged();
+            }
             let lat = PasteLatency {
                 speech_end_at: timing.speech_end_at,
                 voice_end_at: timing.voice_end_at,

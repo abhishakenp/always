@@ -32,6 +32,8 @@ pub mod hud;
 pub mod idle_watcher;
 pub mod keyboard;
 pub mod keyring;
+pub mod learn;
+pub mod learn_train;
 pub mod level_meter;
 pub mod live_preview;
 pub mod localization;

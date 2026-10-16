@@ -391,6 +391,7 @@ mod tests {
             audible_status_sound: crate::always::status_sound::StatusSoundSetting::default(),
             listen_cue: None,
             fail_cue: None,
+            learn_from_voice: false,
             stt_live_preview: true,
             foreign_speech_confidence_enforce: false,
             mic_conflict_exclusion_bundles: Vec::new(),

@@ -212,6 +212,27 @@ VPIO's noise suppression was not measurable on a single-speaker machine.
    ends the pause at once — the partial lags the audio and its "uh" is
    often seconds old (2026-10-15: a stale partial held 2.5 s after "…We
    have to send a PR.").
+   **Learned early cut (2026-10-16, owner request: "cut ~200–300 ms after
+   my real last word when confident").** The 0.6 s window starts only
+   after Silero's 300 ms max-hold, so the base cut lands ~0.87 s after
+   his last voiced frame. A per-user end-of-turn model (`eot.rs`) scores
+   the pause on RAW frames (no smoothing) at probe points 180–570 ms into
+   it, from prosody only (final energy/pitch movement, final-run
+   lengthening, breath, speaking rate). It ends the utterance only when
+   its score clears a threshold set above every thinking pause in his
+   held-out data, in paste mode, past the short-utterance window, and
+   only when no text evidence says more is coming (live partial ending
+   on a filler/connector, decided open text, Option held — any veto
+   leaves the whole pause to the unchanged endpoint). No promoted model →
+   no early cut; everything else above is unchanged. The paste is still
+   one paste at the end; auto-Enter is untouched. Each utterance logs
+   `eot_endpoint` (raw last word → cut) and early cuts `eot_early_cut`.
+   The model is retrained from the learning ring (§6) while he is away
+   and promoted only on a replay win (zero held-out splits, more ends cut
+   early); a promoted model that splits a thought on later data is
+   rolled back (`learn_train.rs`). Seed model v1 (his 161 older failed-
+   STT recordings): 0/679 held-out thinking pauses cut, 2/42 ends cut
+   early (210 / 480 ms) — the data, not the code, is the limit today.
 7. **Transcribe** — the speculative result is used if still valid, otherwise a
    fresh transcription runs.
 8. **Post-process** — filters, glossary corrections, grammar cleanup (§9).
@@ -549,6 +570,18 @@ paste path. Nothing is pasted without that explicit command.
 ❓ This explicit "paste anyway" is a user override of I3 (requested
 2026-10-14 via the coordinator); I3's wording has not been changed — the
 product owner should confirm or amend it.
+
+**Learning ring (2026-10-16, owner request + consent: "the voice models
+must learn from what they hear of him").** The enrollment is the base.
+On top of it Always keeps HIS accepted utterances — My Voice verified,
+ended at the endpoint, pasted — under `<config_dir>/learn/` (dirs 0700,
+files 0600, never uploaded): the audio (≤ 30 min in total, oldest
+dropped; a chunked dictation keeps its tail) and one prosody feature row
+per pause (≤ 10 000 rows), labelled "he went on" or END; an END he
+resumed within 2 s of is relabelled a split. Gate off → nothing is kept.
+The write is off-thread (pooled copy on the capture path, measured ≤ 0.11
+ms for 10 s of audio in a debug build); `learn_from_voice false` stops
+collection and training. Layout and reader API: `learn.rs` module docs.
 
 **Threshold** is a preference (code default 0.50; this file previously
 said 0.40). Measured on the owner's profile:
@@ -1248,6 +1281,7 @@ Stored in the daemon's database, editable from Settings and the CLI
 | `transcript_stream` | true | Append accepted utterances to `~/.always/transcripts.jsonl` |
 | `capture_aec` | true | Echo-cancelled capture via `always-capture` (§3); false = plain `rec` |
 | `audible_status_sound` | off | Sound cues (off/low/medium/high; see §10.1) |
+| `learn_from_voice` | true | Keep his own verified, pasted utterances + pause rows locally (§6 learning ring) and retrain the end-of-turn model from them while he is away |
 | `per_app_settings_json` | — | Per-application pause rules |
 
 Shortcuts: pause `ctrl+alt+p` · master pause/mute `ctrl+alt+shift+p` ·
