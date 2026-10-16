@@ -488,6 +488,10 @@ pub fn locate_capture_helper() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
+    // Tests only ever read a fake helper (see `test_mic_guard`).
+    if cfg!(test) {
+        return None;
+    }
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|d| d.to_path_buf()))
@@ -501,6 +505,28 @@ pub fn locate_capture_helper() -> Option<PathBuf> {
         .join("capture")
         .join(CAPTURE_HELPER_NAME);
     dev.is_file().then_some(dev)
+}
+
+/// Error text when a test would have opened the real microphone.
+pub(crate) const TEST_MIC_REFUSED: &str = "tests never open the real microphone";
+
+/// Privacy: under `cfg(test)` capture only ever comes from a FAKE helper
+/// (a script, or `ALWAYS_CAPTURE_BIN` naming one) and a failed fake never
+/// falls back to the real helper or SoX `rec` (2026-10-17: a session replay
+/// whose stream file had been deleted fell back to `rec` and recorded the
+/// room for ~20 min). In the daemon this is a no-op.
+fn test_mic_guard(helper: Option<&std::path::Path>) -> Result<()> {
+    if !cfg!(test) {
+        return Ok(());
+    }
+    match helper {
+        None => anyhow::bail!("{TEST_MIC_REFUSED}: no fake capture helper (set ALWAYS_CAPTURE_BIN)"),
+        Some(h) if h.file_name().is_some_and(|n| n == CAPTURE_HELPER_NAME) => anyhow::bail!(
+            "{TEST_MIC_REFUSED}: {} is the real capture helper",
+            h.display()
+        ),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Outcome of [`wait_readable`].
@@ -686,6 +712,7 @@ impl RecChild {
 
     /// [`Self::spawn`] with the helper location and AEC choice explicit.
     fn spawn_from(helper: Option<PathBuf>, aec: bool) -> Result<Self> {
+        test_mic_guard(helper.as_deref())?;
         if let Some(helper) = helper.as_deref() {
             if aec && !CAPTURE_HELPER_FAILED.load(Ordering::Relaxed) {
                 match Self::spawn_capture_helper(helper, &[]) {
@@ -705,6 +732,11 @@ impl RecChild {
                     }
                 }
             }
+        }
+        if cfg!(test) {
+            anyhow::bail!(
+                "{TEST_MIC_REFUSED}: the fake capture helper produced no audio (missing input file?)"
+            );
         }
         match find_rec() {
             Some(rec_path) => Self::spawn_rec(&rec_path),
@@ -1593,9 +1625,51 @@ mod tests {
     /// on a fresh macOS 26 VM: kAUInitialize -10875) must fall back to the
     /// SAME helper in plain `--no-vp` mode, never to SoX `rec` (absent on a
     /// new user's Mac). Stand-in helper: exits 4 unless given `--no-vp`.
+    /// Serializes tests that set the process-wide capture failure flags.
+    #[cfg(target_os = "macos")]
+    static CAPTURE_FLAGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Privacy: a test whose fake input is missing fails hard — never the
+    /// real helper, never `rec`, never the microphone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_test_never_opens_the_real_microphone() {
+        let _flags = CAPTURE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("always-cap-nomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fake helper whose input is gone: exits at once in both modes.
+        let dead = dir.join("fake-capture-dead");
+        std::fs::write(&dead, "#!/bin/sh\necho 'No such file: stream.s16' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&dead, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Something named like the real helper must not even run.
+        let marker = dir.join("ran");
+        let real = dir.join(super::CAPTURE_HELPER_NAME);
+        std::fs::write(&real, format!("#!/bin/sh\ntouch '{}'\nexec /usr/bin/yes\n", marker.display()))
+            .unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for (helper, aec) in [(Some(dead.clone()), true), (Some(dead), false), (None, true), (Some(real), true)] {
+            super::CAPTURE_HELPER_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+            super::CAPTURE_PLAIN_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+            let err = match super::RecChild::spawn_from(helper.clone(), aec) {
+                Ok(_) => panic!("{helper:?}: capture must fail hard, not fall back"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(err.contains(super::TEST_MIC_REFUSED), "{helper:?}: {err}");
+        }
+        assert!(!marker.exists(), "the real-named helper was never started");
+        assert!(
+            super::locate_capture_helper().is_none() || std::env::var_os("ALWAYS_CAPTURE_BIN").is_some(),
+            "tests never locate the bundled/dev helper"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn helper_vp_failure_falls_back_to_plain_helper_not_rec() {
+        let _flags = CAPTURE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::Ordering;
         let dir = std::env::temp_dir().join(format!("always-cap-plain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -777,12 +777,27 @@ while True:
     /// every transcription call). `SESSION_REPLAY_STT=apple` uses Apple STT
     /// and the live preview (needs the Speech grant), otherwise the gate
     /// only: calls are answered with their file name. Real time.
+    /// Fail hard before anything is spawned when the replay's stream is
+    /// missing or empty (privacy: see `audio::test_mic_guard`).
+    fn replay_stream_present(stem: &str) {
+        let s16 = format!("{stem}.s16");
+        let len = std::fs::metadata(&s16).map(|m| m.len()).unwrap_or(0);
+        assert!(len > 0, "session_replay: stream {s16} missing or empty — refusing to run");
+    }
+
+    #[test]
+    #[should_panic(expected = "refusing to run")]
+    fn session_replay_refuses_a_missing_stream() {
+        replay_stream_present("/nonexistent/always-replay-stream");
+    }
+
     #[test]
     #[ignore = "real-time session replay; needs SESSION_REPLAY_* env; run explicitly"]
     fn session_replay() {
         let Ok(stem) = std::env::var("SESSION_REPLAY_STEM") else {
             return;
         };
+        replay_stream_present(&stem);
         let out = std::env::var("SESSION_REPLAY_OUT").expect("SESSION_REPLAY_OUT");
         let dump = std::path::PathBuf::from(
             std::env::var("SESSION_REPLAY_DUMP").expect("SESSION_REPLAY_DUMP"),
