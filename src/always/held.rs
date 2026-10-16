@@ -51,6 +51,8 @@ fn purge(q: &mut VecDeque<Held>, now: Instant) {
             // anyway?" → `PasteRejected`). Not pasted automatically — focus
             // has likely moved on.
             let rid = crate::always::rejected::push(&dropped.text, -1.0);
+            // Nobody decided: nothing was sent — "didn't work".
+            crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Failure);
             crate::always::event::global_broadcaster().transcript_rejected_for(
                 rid,
                 dropped.text.clone(),
@@ -120,6 +122,7 @@ pub fn release(id: u64, text: Option<&str>) -> bool {
         held_ms = received.saturating_duration_since(held.at).as_secs_f64() * 1000.0,
         "held_final_released"
     );
+    crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Success);
     let job = held.job;
     std::thread::Builder::new()
         .name("held-paste".into())
@@ -133,6 +136,8 @@ pub fn discard(id: u64, text: Option<&str>) -> bool {
     match take(id, text) {
         Some(h) => {
             tracing::info!(id = h.id, "held_final_discarded");
+            // Handed to the consumer (Iris/Claude): his "done".
+            crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Command);
             true
         }
         None => false,

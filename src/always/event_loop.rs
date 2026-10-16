@@ -642,6 +642,11 @@ fn process_one(
     outcome
 }
 
+/// A gate-rejected span is transcribed for recovery only when it scored at
+/// least this against his voiceprint (his own rejected windows under media
+/// sat at 0.3-0.5; film/Iris/music ~ -0.06..0.2).
+const REJECTED_STT_MIN_SCORE: f32 = 0.3;
+
 /// Config + runtime of the most recent capture cycle, so a later
 /// `PasteRejected` can run the normal paste path from the UDS thread.
 static PASTE_CTX: std::sync::Mutex<Option<(AlwaysConfig, Handle)>> = std::sync::Mutex::new(None);
@@ -653,6 +658,14 @@ fn recover_rejected(cfg: &AlwaysConfig, rt: &Handle, transcriber: &Arc<dyn Trans
     let Some(stash) = crate::always::rejected::take_stashed() else {
         return;
     };
+    // Clearly foreign audio is never transcribed: with a film playing every
+    // ~5.6 s segment went to Apple STT and localspeechrecognition sat at
+    // ~90% CPU (2026-10-16 08:1x Z, "everything is unusually slow"). Only a
+    // rejection close to his bar is worth recovering ("paste anyway?").
+    if stash.score < REJECTED_STT_MIN_SCORE {
+        tracing::info!(score = stash.score, "rejected_transcript_skipped_foreign");
+        return;
+    }
     *PASTE_CTX.lock().unwrap_or_else(|p| p.into_inner()) = Some((cfg.clone(), rt.clone()));
     let transcriber = Arc::clone(transcriber);
     std::thread::Builder::new()
@@ -1106,9 +1119,9 @@ fn handle_speech(
                 // Held BEFORE final: a consumer that decides synchronously on
                 // the final must already know the id it is deciding about.
                 event::global_broadcaster().transcript_held(id, final_text.clone());
-                // Held finals are an internal handoff to the consumer: no cue
-                // here, and none on ReleaseHeld / DiscardHeld either (user
-                // request 2026-10-14). The consumer (Iris) cues its own way.
+                // Held finals: no cue here. The outcome plays on the verdict
+                // (held.rs): Done on ReleaseHeld, Command on DiscardHeld,
+                // Failure if nobody decides (eyes-free contract, 2026-10-16).
                 event::global_broadcaster().transcript_final_quiet(final_text.clone());
                 pause::dictation_buffer_clear();
                 event::global_broadcaster().voice_activity_ended();

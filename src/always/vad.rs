@@ -685,6 +685,22 @@ const SPEAKER_TAIL_THRESHOLD_FACTOR: f32 = 0.6;
 const MEDIA_TAIL_FAIL_CHECKS: usize = 4;
 /// Two film-rule window passes must end this far apart (0.75 s of audio).
 const MEDIA_PASS_GAP_SAMPLES: usize = 12_000;
+/// Quiet room, gate on: the Listening cue plays at the first ladder window
+/// scoring at least this (his short windows: see the cue replay in the
+/// commit; room noise and other voices stay below).
+const EARLY_CUE_MIN_SCORE: f32 = 0.40;
+/// Over media, live STT opens for a window at least this close to him (his
+/// windows under media 0.3-0.5; film/Iris/music -0.06..0.2).
+const STT_CANDIDATE_SCORE: f32 = 0.30;
+/// Replay A/B switch (tests only): `GATE_REPLAY_OLD_CUE` restores the
+/// Silero-streak instant cue with the gate on.
+fn old_instant_cue() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("GATE_REPLAY_OLD_CUE").is_some() {
+        return true;
+    }
+    false
+}
 /// Replay A/B switch: `GATE_REPLAY_NO_EXCISE` (tests only) restores the
 /// old end-at-the-cut behaviour.
 fn media_excise_on() -> bool {
@@ -1142,6 +1158,14 @@ impl UtterancePreview {
         }
     }
 
+    /// Opened late: feed Parakeet everything captured so far.
+    fn catch_up(&mut self, samples: &[i16]) {
+        self.prebuffer_fed = true;
+        if let Some(p) = self.parakeet.as_mut() {
+            p.feed(samples);
+        }
+    }
+
     /// One in-utterance frame (voiced, or a pause inside the utterance).
     /// The loudness meter only counts VOICED frames of a VERIFIED speaker
     /// (or My Voice off): it is the user's speaking-level meter, so room
@@ -1519,6 +1543,15 @@ fn record_with_local_vad(
     // second message). (head end, buffer generation, deadline): no window
     // of his within MEDIA_EXCISE_JOIN_SECS → the head alone is the utterance.
     let mut media_excise: Option<(usize, usize, std::time::Instant)> = None;
+    // Live STT (Apple stream + Parakeet preview) waits while other output
+    // plays until a window sounds like him: a film's dialogue otherwise
+    // streamed through Apple STT nonstop (localspeechrecognition ~90% CPU,
+    // 2026-10-16). `stt_deferred`: decided at onset; `stt_catchup`: the
+    // session opens on the next speech frame with all audio so far.
+    let mut stt_decided = false;
+    let mut stt_deferred = false;
+    let mut stt_catchup = false;
+    let mut stt_candidate = false;
     let mut excise_film_pass: Option<std::time::Instant> = None;
     // At most one speaker check in flight, scored off this thread (see
     // `GateJob`). Its verdict is applied by `gate_apply_verdict!` on the
@@ -1616,6 +1649,29 @@ fn record_with_local_vad(
                             cohort = ?job.cohort(),
                             "speaker_gate_cohort_veto"
                         );
+                    }
+                    if stt_deferred
+                        && !cohort_veto
+                        && job.kind == GateJobKind::Window
+                        && score.is_some_and(|s| s >= STT_CANDIDATE_SCORE)
+                    {
+                        stt_deferred = false;
+                        stt_catchup = true;
+                        stt_candidate = true;
+                        tracing::info!(score = ?score, "stt_live_started_on_candidate");
+                    }
+                    // Quiet-room early "heard you": the first windows (0.3-0.5 s of
+                    // voice) already sound like him — before the 0.5 verification.
+                    if !speaker_checked
+                        && !voice_activity_announced
+                        && !cohort_veto
+                        && job.kind == GateJobKind::Window
+                        && job.media_similarity().is_none()
+                        && crate::always::audio::other_output_quiet()
+                        && score.is_some_and(|s| s >= EARLY_CUE_MIN_SCORE)
+                    {
+                        tracing::info!(score = ?score, "speaker_gate_early_cue");
+                        announce_voice_activity!();
                     }
                     if speaker_checked {
                         // VERIFIED phase: trailing-window tail monitor.
@@ -1740,6 +1796,10 @@ fn record_with_local_vad(
                         speaker_checked = true;
                         confirmed_user_len = job.len_at_submit;
                         tail_fail_streak = 0;
+                        if stt_deferred {
+                            stt_deferred = false;
+                            stt_catchup = true;
+                        }
                         tracing::info!(score, via = ?job.kind, "speaker_gate_verified");
                         // Foreign speech BEFORE the user's first words (a
                         // phone reel still talking when he started) never
@@ -2025,12 +2085,19 @@ fn record_with_local_vad(
         // Listening cue is his only proof he was heard (user request
         // 2026-10-15; measured gate-verified announce p50 602 ms, p90
         // 1.3 s, max 5.2 s that day). A rejected verdict retracts it.
-        let instant_announce_ok = instant_announce_allowed(
-            speaker_gate_requested,
-            crate::always::audio::other_output_quiet(),
-            instant_announce_blocked_until,
-            std::time::Instant::now(),
-        );
+        // With "My Voice" on, the Silero streak alone never announces:
+        // footsteps, doors, water, coughs and other people tripped it
+        // (2026-10-16 05:30-07:20Z: 68 Listening cues vs 30 verified, many
+        // retracted 150-200 ms after the sound had already played). The
+        // quiet-room early cue now waits for the first voiceprint window
+        // (`EARLY_CUE_MIN_SCORE`, see gate_apply_verdict).
+        let instant_announce_ok = (!speaker_gate_requested || old_instant_cue())
+            && instant_announce_allowed(
+                speaker_gate_requested,
+                crate::always::audio::other_output_quiet(),
+                instant_announce_blocked_until,
+                std::time::Instant::now(),
+            );
         if !in_speech && !voice_activity_announced && instant_announce_ok {
             if early_voice_frame_ok(
                 frame_energy,
@@ -2176,7 +2243,18 @@ fn record_with_local_vad(
                 // Start live recognition the moment speech is confirmed —
                 // partials flowing early is the whole point. Only the Apple
                 // backend has a streaming engine wired up.
+                if !stt_decided {
+                    stt_decided = true;
+                    if speaker_gate_requested
+                        && !speaker_checked
+                        && crate::always::audio::other_output_playing()
+                    {
+                        stt_deferred = true;
+                        tracing::info!("stt_live_deferred_media_playing");
+                    }
+                }
                 if stream_session.is_none()
+                    && !stt_deferred
                     && matches!(
                         cfg.transcriber_backend,
                         crate::stt_dispatch::TranscriberBackendChoice::Apple
@@ -2194,8 +2272,15 @@ fn record_with_local_vad(
                         utt_preview.start(
                             session,
                             &cfg.lang,
-                            !speaker_gate_requested || speaker_checked,
+                            !speaker_gate_requested || speaker_checked || stt_candidate,
                         );
+                        if stt_catchup {
+                            // Opened late (deferred over media): everything he
+                            // said so far, at once.
+                            session.feed(&speech_samples);
+                            utt_preview.catch_up(&speech_samples);
+                            stt_catchup = false;
+                        }
                     }
                 }
                 if !voice_logged {
@@ -2321,7 +2406,7 @@ fn record_with_local_vad(
                 if let Some(session) = stream_session.as_mut() {
                     session.feed(samples);
                 }
-                utt_preview.frame(samples, true, !speaker_gate_requested || speaker_checked);
+                utt_preview.frame(samples, true, !speaker_gate_requested || speaker_checked || stt_candidate);
                 // Same anchor refresh for the case where we were already in
                 // speech (consecutive_speech overflows min_speech_frames
                 // immediately) — keep the watchdog clock pinned to "right
@@ -4193,7 +4278,9 @@ mod tests {
             slot.take().unwrap().unwrap().text,
             "English words including the resumed ending"
         );
+        // Heard, never pasted in this test: the terminal says "didn't work".
         b.utterance_terminal();
+        assert_eq!(take_test_cues(), vec![StatusSound::Failure]);
         super::set_transcribing_overlay(&mut overlay, true, &b);
         assert!(
             take_test_cues().is_empty(),

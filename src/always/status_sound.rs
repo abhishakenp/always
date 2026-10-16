@@ -177,7 +177,12 @@ pub(crate) fn take_test_cues() -> Vec<StatusSound> {
 /// / Command stay silent here: the overlay and menu-bar icon carry those
 /// states. Explicit client requests go through [`cue_requested`].
 pub fn audible_in_utterance(sound: StatusSound) -> bool {
-    matches!(sound, StatusSound::Listening | StatusSound::Failure)
+    // Eyes-free (2026-10-16): heard you / done (pasted) / handed to Iris /
+    // didn't work. Transcribing and Cancel stay silent.
+    matches!(
+        sound,
+        StatusSound::Listening | StatusSound::Success | StatusSound::Command | StatusSound::Failure
+    )
 }
 
 /// Play `sound` from the daemon's own utterance state machine, subject to
@@ -193,6 +198,7 @@ pub fn cue(sound: StatusSound) {
 /// (UDS `PlayStatusCue`: a client asked for this cue explicitly). Never
 /// blocks: the request is posted to the playback worker.
 pub fn cue_requested(sound: StatusSound) {
+    tracing::info!(cue = sound.name(), "status_cue_requested");
     // Unit tests never make a sound: a test that briefly enables cues
     // (`can_set_runtime_setting`) must not let a concurrent test's event
     // broadcast play through the speakers.
@@ -607,14 +613,15 @@ mod tests {
     static SETTING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn one_audible_cue_per_utterance_policy() {
+    fn audible_utterance_cues_are_heard_done_command_failure() {
         take_test_cues();
         for sound in StatusSound::ALL {
             cue(sound);
         }
+        // Eyes-free set: heard you / done / handed to Iris / didn't work.
         assert_eq!(
             take_test_cues(),
-            vec![StatusSound::Listening, StatusSound::Failure]
+            vec![StatusSound::Listening, StatusSound::Success, StatusSound::Failure, StatusSound::Command]
         );
         // An explicit client request still plays any cue.
         cue_requested(StatusSound::Command);

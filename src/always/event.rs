@@ -841,6 +841,15 @@ pub struct EventBroadcaster {
     /// Audio cue lifetime is the entire process_one cycle, not a speculative
     /// overlay interval. Shared by clones, reset only at the terminal boundary.
     transcribing_cued: Arc<AtomicBool>,
+    /// Eyes-free contract, per process_one cycle: "heard you" (Listening)
+    /// at most once; once heard, exactly one outcome cue — Done (pasted),
+    /// Command (handed to a consumer) or Failure (nothing was sent). Never
+    /// an outcome for audio that was not his (no Listening = silence).
+    listening_cued: Arc<AtomicBool>,
+    outcome_cued: Arc<AtomicBool>,
+    /// The final was parked for a consumer (held.rs): its outcome cue plays
+    /// on that verdict, not at this cycle's terminal.
+    outcome_deferred: Arc<AtomicBool>,
 }
 
 impl EventBroadcaster {
@@ -858,6 +867,16 @@ impl EventBroadcaster {
             voice_active: Arc::new(AtomicBool::new(false)),
             transcribing_active: Arc::new(AtomicBool::new(false)),
             transcribing_cued: Arc::new(AtomicBool::new(false)),
+            listening_cued: Arc::new(AtomicBool::new(false)),
+            outcome_cued: Arc::new(AtomicBool::new(false)),
+            outcome_deferred: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The single outcome cue of this cycle (see `listening_cued`).
+    fn outcome(&self, sound: crate::always::status_sound::StatusSound) {
+        if !self.outcome_cued.swap(true, Ordering::SeqCst) {
+            crate::always::status_sound::cue(sound);
         }
     }
 
@@ -918,6 +937,17 @@ impl EventBroadcaster {
         self.voice_activity_ended();
         self.transcribing_stopped();
         self.transcribing_cued.store(false, Ordering::SeqCst);
+        // Heard him but nothing went out (dropped, empty, rejected late):
+        // never silent.
+        if self.listening_cued.swap(false, Ordering::SeqCst)
+            && !self.outcome_deferred.load(Ordering::SeqCst)
+            && !self.outcome_cued.load(Ordering::SeqCst)
+        {
+            crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Failure);
+            tracing::info!("status_cue_failure_at_terminal");
+        }
+        self.outcome_cued.store(false, Ordering::SeqCst);
+        self.outcome_deferred.store(false, Ordering::SeqCst);
     }
 
     /// Send partial transcript chunk (speculative / streaming preview)
@@ -940,7 +970,7 @@ impl EventBroadcaster {
 
     /// Send transcript final event
     pub fn transcript_final(&self, text: String) {
-        crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Success);
+        self.outcome(crate::always::status_sound::StatusSound::Success);
         self.send(DaemonEvent::TranscriptFinal { text });
     }
 
@@ -948,6 +978,7 @@ impl EventBroadcaster {
     /// was parked. Its cue plays on the verdict instead — Success when it is
     /// released to paste, Command when the consumer claims it.
     pub fn transcript_final_quiet(&self, text: String) {
+        self.outcome_deferred.store(true, Ordering::SeqCst);
         self.send(DaemonEvent::TranscriptFinal { text });
     }
 
@@ -1035,7 +1066,9 @@ impl EventBroadcaster {
     /// Send voice activity detected event. Always broadcast (re-emits
     /// double as a keep-alive heartbeat for the GUI's stale-state watchdog).
     pub fn voice_activity_detected(&self) {
-        if !self.voice_active.swap(true, Ordering::SeqCst) {
+        if !self.voice_active.swap(true, Ordering::SeqCst)
+            && !self.listening_cued.swap(true, Ordering::SeqCst)
+        {
             crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Listening);
         }
         self.send(DaemonEvent::VoiceActivityDetected);
@@ -1059,7 +1092,11 @@ impl EventBroadcaster {
 
     /// Send transcription-filtered event with the human-readable reason.
     pub fn transcription_filtered(&self, reason: impl Into<String>) {
-        crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Cancel);
+        // He was heard and nothing goes out: "didn't work". Not his (never
+        // heard): silent.
+        if self.listening_cued.load(Ordering::SeqCst) {
+            self.outcome(crate::always::status_sound::StatusSound::Failure);
+        }
         self.send(DaemonEvent::TranscriptionFiltered {
             reason: reason.into(),
         });
@@ -1068,7 +1105,7 @@ impl EventBroadcaster {
     /// Send a transcription-failed event (Groq/STT error) so the GUI can
     /// flash a red error overlay instead of leaving a stuck "Processing…".
     pub fn transcription_failed(&self, kind: impl Into<String>, message: impl Into<String>) {
-        crate::always::status_sound::cue(crate::always::status_sound::StatusSound::Failure);
+        self.outcome(crate::always::status_sound::StatusSound::Failure);
         self.send(DaemonEvent::TranscriptionFailed {
             kind: kind.into(),
             message: message.into(),
@@ -1269,6 +1306,40 @@ pub fn global_broadcaster() -> &'static EventBroadcaster {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn eyes_free_cue_contract_one_heard_one_outcome() {
+        use crate::always::status_sound::{take_test_cues, StatusSound as S};
+        let b = EventBroadcaster::new();
+        let _ = take_test_cues();
+        // Not his (never announced): filtered/terminal stay silent.
+        b.transcription_filtered("x");
+        b.utterance_terminal();
+        assert_eq!(take_test_cues(), vec![]);
+        // Heard, retracted and announced again in one cycle: ONE Listening;
+        // pasted: Done; terminal adds nothing.
+        b.voice_activity_detected();
+        b.voice_activity_ended();
+        b.voice_activity_detected();
+        b.transcript_final("hi".into());
+        b.utterance_terminal();
+        assert_eq!(take_test_cues(), vec![S::Listening, S::Success]);
+        // Heard, then nothing went out: Failure at the terminal, once.
+        b.voice_activity_detected();
+        b.utterance_terminal();
+        assert_eq!(take_test_cues(), vec![S::Listening, S::Failure]);
+        // Heard, filtered: Failure once (not again at the terminal).
+        b.voice_activity_detected();
+        b.transcription_filtered("app paused");
+        b.utterance_terminal();
+        assert_eq!(take_test_cues(), vec![S::Listening, S::Failure]);
+        // Heard, held for the consumer: no outcome at the terminal (it plays
+        // on the verdict in held.rs).
+        b.voice_activity_detected();
+        b.transcript_final_quiet("iris".into());
+        b.utterance_terminal();
+        assert_eq!(take_test_cues(), vec![S::Listening]);
+    }
     use super::*;
 
     #[test]

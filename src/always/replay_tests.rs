@@ -572,6 +572,10 @@ FRAME = 160
 if os.environ.get("GATE_REPLAY_MEDIA", "1") == "1":
     sys.stderr.write("always-capture: capturing mode=tap-aec\n")
     sys.stderr.write("always-capture: aec engaged (tap reference playing)\n"); sys.stderr.flush()
+elif os.environ.get("GATE_REPLAY_MEDIA") == "0":
+    # A quiet room as live: the tap helper reports its reference silent.
+    sys.stderr.write("always-capture: capturing mode=tap-aec\n")
+    sys.stderr.write("always-capture: aec bypassed (tap reference silent)\n"); sys.stderr.flush()
 t0 = time.time(); sent = 0
 open(wav + ".t0", "w").write(repr(t0))
 def emit(pcm):
@@ -709,6 +713,12 @@ while True:
                 Err(e) => ("error", format!("{e:#}"), None),
             };
             let _ = crate::always::rejected::take_stashed();
+            // Emulate the event loop's cycle end (cue contract): a pasted
+            // result is `transcript_final`, then every cycle closes.
+            if kind == "speech" {
+                global_broadcaster().transcript_final(text.clone());
+            }
+            global_broadcaster().utterance_terminal();
             eprintln!("gate_replay result: {kind} {text:?} score={score:?}");
             results.push(serde_json::json!({"kind": kind, "text": text, "score": score, "started": started, "ended": ended}));
             if kind == "error" {
