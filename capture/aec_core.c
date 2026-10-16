@@ -15,8 +15,9 @@ struct aec_core {
     int engaged;           // canceller ran on the previous frame
     float mic_gain;        // fixed pre-gain into the int16 canceller
     int no_res;            // skip residual echo suppression (echo_suppress_db > 0)
+    int speakers;          // far-end channels (1 mono, 2 left/right)
     uint64_t processed, passed;
-    spx_int16_t mic16[AEC_FRAME], ref16[AEC_FRAME], out16[AEC_FRAME];
+    spx_int16_t mic16[AEC_FRAME], ref16[2 * AEC_FRAME], out16[AEC_FRAME];
 };
 
 // −72 dBFS: below this the speakers are not producing anything the mic can hear.
@@ -30,12 +31,17 @@ static inline spx_int16_t to16(float v) {
 }
 
 aec_core *aec_new(int tail_samples, int echo_suppress_db, int echo_suppress_active_db, float mic_gain_db) {
+    return aec_new_mc(tail_samples, echo_suppress_db, echo_suppress_active_db, mic_gain_db, 1);
+}
+
+aec_core *aec_new_mc(int tail_samples, int echo_suppress_db, int echo_suppress_active_db, float mic_gain_db, int speakers) {
     aec_core *a = calloc(1, sizeof *a);
     if (!a) return NULL;
+    a->speakers = speakers == 2 ? 2 : 1;
     a->mic_gain = powf(10, mic_gain_db / 20);
     a->no_res = echo_suppress_db > 0;
     int rate = 16000;
-    a->echo = speex_echo_state_init(AEC_FRAME, tail_samples);
+    a->echo = speex_echo_state_init_mc(AEC_FRAME, tail_samples, 1, a->speakers);
     speex_echo_ctl(a->echo, SPEEX_ECHO_SET_SAMPLING_RATE, &rate);
     a->pre = speex_preprocess_state_init(AEC_FRAME, rate);
     int off = 0, on = 1;
@@ -65,9 +71,18 @@ void aec_free(aec_core *a) {
     free(a);
 }
 
+static int aec_run(aec_core *a, const float *mic, const float *ref, const float *refr, float *out);
 int aec_process(aec_core *a, const float *mic, const float *ref, float *out) {
+    if (a->speakers == 2) return aec_run(a, mic, ref, ref, out);  // mono into a stereo canceller: same signal on both
+    return aec_run(a, mic, ref, NULL, out);
+}
+int aec_process_st(aec_core *a, const float *mic, const float *refl, const float *refr, float *out) {
+    return aec_run(a, mic, refl, refr, out);
+}
+static int aec_run(aec_core *a, const float *mic, const float *ref, const float *refr, float *out) {
     float e = 0;
     for (int i = 0; i < AEC_FRAME; i++) e += ref[i] * ref[i];
+    if (refr) for (int i = 0; i < AEC_FRAME; i++) e += refr[i] * refr[i];
     if (sqrtf(e / AEC_FRAME) >= kRefSilentRms) a->idle_frames = 0;
     else if (a->idle_frames < a->idle_limit) a->idle_frames++;
     if (a->idle_frames >= a->idle_limit) {
@@ -76,7 +91,10 @@ int aec_process(aec_core *a, const float *mic, const float *ref, float *out) {
         a->passed++;
         return 0;
     }
-    for (int i = 0; i < AEC_FRAME; i++) { a->mic16[i] = to16(mic[i] * a->mic_gain); a->ref16[i] = to16(ref[i]); }
+    if (a->speakers == 2 && refr)
+        for (int i = 0; i < AEC_FRAME; i++) { a->mic16[i] = to16(mic[i] * a->mic_gain); a->ref16[2 * i] = to16(ref[i]); a->ref16[2 * i + 1] = to16(refr[i]); }
+    else
+        for (int i = 0; i < AEC_FRAME; i++) { a->mic16[i] = to16(mic[i] * a->mic_gain); a->ref16[i] = to16(ref[i]); }
     speex_echo_cancellation(a->echo, a->mic16, a->ref16, a->out16);
     if (!a->no_res) speex_preprocess_run(a->pre, a->out16);
     for (int i = 0; i < AEC_FRAME; i++) out[i] = a->out16[i] * (1.0f / 32768.0f);

@@ -96,9 +96,12 @@ final class RefRing {
     private var lock = os_unfair_lock()
     private let cap = 1 << 16  // 4.1 s
     private var buf: [Float]
+    /// Side channel 0.5·(L−R) on the same timeline (mono = 0.5·(L+R) in `buf`): stereo
+    /// music's left/right difference is invisible to a mono canceller.
+    private var side: [Float]
     private var base: UInt64 = 0      // host time of index 0
     private var writeIdx: Int64 = 0   // next index to write
-    init() { buf = [Float](repeating: 0, count: 1 << 16) }
+    init() { buf = [Float](repeating: 0, count: 1 << 16); side = [Float](repeating: 0, count: 1 << 16) }
     // Diagnostics (10 s stats line): timestamp deviation of tap writes from
     // the continuous write position, and how often it forced a re-sync.
     var maxDev: Int64 = 0, devSum: Double = 0, writes = 0, resyncs = 0, readsAhead = 0
@@ -111,7 +114,7 @@ final class RefRing {
     private func index(_ host: UInt64) -> Int64 {
         Int64((Double(Int64(bitPattern: host &- base)) / hostTicksPerSec * 16_000).rounded())
     }
-    func write(_ p: UnsafePointer<Float>, _ n: Int, host: UInt64) {
+    func write(_ p: UnsafePointer<Float>, _ sd: UnsafePointer<Float>?, _ n: Int, host: UInt64) {
         os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         if base == 0 { base = host }
         var idx = index(host)
@@ -121,10 +124,19 @@ final class RefRing {
         if abs(dev) < 32 { idx = writeIdx } else if writeIdx != 0 { resyncs += 1 }
         if idx > writeIdx {  // gap: what played then is unknown → silence
             var j = max(writeIdx, idx - Int64(cap))
-            while j < idx { buf[Int(j & Int64(cap - 1))] = 0; j += 1 }
+            while j < idx { buf[Int(j & Int64(cap - 1))] = 0; side[Int(j & Int64(cap - 1))] = 0; j += 1 }
         }
-        for i in 0..<n { buf[Int((idx + Int64(i)) & Int64(cap - 1))] = p[i] }
+        for i in 0..<n { buf[Int((idx + Int64(i)) & Int64(cap - 1))] = p[i]; side[Int((idx + Int64(i)) & Int64(cap - 1))] = sd?[i] ?? 0 }
         writeIdx = idx + Int64(n)
+    }
+    /// The side channel for the same span `read` returned (call right after it, same host time).
+    func readSide(_ out: UnsafeMutablePointer<Float>, _ n: Int, host: UInt64) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        let idx = base == 0 ? Int64.min / 2 : index(host)
+        for i in 0..<n {
+            let j = idx + Int64(i)
+            out[i] = (j < writeIdx && j >= writeIdx - Int64(cap)) ? side[Int(j & Int64(cap - 1))] : 0
+        }
     }
     func read(_ out: UnsafeMutablePointer<Float>, _ n: Int, host: UInt64) {
         os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
@@ -151,6 +163,10 @@ final class OutputTap {
     var resampler: OpaquePointer?
     var mono = [Float](repeating: 0, count: 8192)
     var res = [Float](repeating: 0, count: 8192)
+    var sideIn = [Float](repeating: 0, count: 8192)
+    var sideRes = [Float](repeating: 0, count: 8192)
+    var sideResampler: OpaquePointer?
+    var stereo = false
     var rate: Double = 0
     var rateChecked = false, rateT0: UInt64 = 0, rateFrames = 0
 
@@ -220,6 +236,7 @@ final class OutputTap {
         }
         var err: Int32 = 0
         resampler = speex_resampler_init(1, UInt32(rate), 16_000, 4, &err)
+        sideResampler = speex_resampler_init(1, UInt32(rate), 16_000, 4, &err)
         if resampler == nil { stop(); return "resampler \(err)" }
         st = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, nil) { [unowned self] _, inData, inTime, _, _ in
             self.ioProc(inData, inTime)
@@ -239,14 +256,17 @@ final class OutputTap {
         if b.mNumberChannels >= 2 {
             let ch = Int(b.mNumberChannels)
             n = min(Int(b.mDataByteSize) / 4 / ch, mono.count)
-            for i in 0..<n { mono[i] = 0.5 * (f[i * ch] + f[i * ch + 1]) }
+            for i in 0..<n { mono[i] = 0.5 * (f[i * ch] + f[i * ch + 1]); sideIn[i] = 0.5 * (f[i * ch] - f[i * ch + 1]) }
+            stereo = true
         } else if ins.count >= 2, let p2 = ins[1].mData {
             let g = p2.assumingMemoryBound(to: Float.self)
             n = min(Int(b.mDataByteSize) / 4, mono.count)
-            for i in 0..<n { mono[i] = 0.5 * (f[i] + g[i]) }
+            for i in 0..<n { mono[i] = 0.5 * (f[i] + g[i]); sideIn[i] = 0.5 * (f[i] - g[i]) }
+            stereo = true
         } else {
             n = min(Int(b.mDataByteSize) / 4, mono.count)
             for i in 0..<n { mono[i] = f[i] }
+            stereo = false
         }
         guard n > 0 else { return }
         // Verify the data rate from the callbacks themselves (frames per host
@@ -264,6 +284,7 @@ final class OutputTap {
                         log(String(format: "ref tap: measured %.0f frames/s vs %.0f assumed — resampling from %.0f", measured, rate, std))
                         rate = std
                         speex_resampler_set_rate(resampler, UInt32(std), 16_000)
+                    speex_resampler_set_rate(sideResampler, UInt32(std), 16_000)
                     } else {
                         log(String(format: "ref tap: measured %.0f frames/s (assumed %.0f) ok", measured, rate))
                     }
@@ -278,7 +299,13 @@ final class OutputTap {
             }
         }
         let host = (inTime.pointee.mFlags.contains(.hostTimeValid)) ? inTime.pointee.mHostTime : mach_absolute_time()
-        res.withUnsafeBufferPointer { refRing.write($0.baseAddress!, Int(outLen), host: host) }
+        var sIn = UInt32(n), sOut = UInt32(sideRes.count)
+        if stereo {
+            sideIn.withUnsafeBufferPointer { sp in sideRes.withUnsafeMutableBufferPointer { op in
+                _ = speex_resampler_process_float(sideResampler, 0, sp.baseAddress, &sIn, op.baseAddress, &sOut) } }
+        }
+        res.withUnsafeBufferPointer { r in sideRes.withUnsafeBufferPointer { sd in
+            refRing.write(r.baseAddress!, stereo && sOut == outLen ? sd.baseAddress! : nil, Int(outLen), host: host) } }
     }
 
     func stop() {
@@ -289,6 +316,8 @@ final class OutputTap {
         aggID = AudioObjectID(kAudioObjectUnknown); tapID = AudioObjectID(kAudioObjectUnknown)
         if let resampler { speex_resampler_destroy(resampler) }
         resampler = nil
+        if let sideResampler { speex_resampler_destroy(sideResampler) }
+        sideResampler = nil
     }
 }
 
@@ -314,7 +343,7 @@ func extractorMtime() -> Date? {
 /// half missing and a session could not be replayed faithfully.)
 let ECHO_DUMP_MAX_SECS = 900.0
 final class EchoDump {
-    let mic: FileHandle, ref: FileHandle, out: FileHandle, ran: FileHandle, idx: FileHandle
+    let mic: FileHandle, ref: FileHandle, side: FileHandle, out: FileHandle, ran: FileHandle, idx: FileHandle
     var frames = 0
     var buf = [Int16](repeating: 0, count: 320)
     init?() {
@@ -323,24 +352,24 @@ final class EchoDump {
         let dir = sup.appendingPathComponent("echo")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let stem = dir.appendingPathComponent("\(Int(Date().timeIntervalSince1970))").path
-        for name in ["mic.s16", "ref.s16", "out.s16", "ran", "idx"] {
+        for name in ["mic.s16", "ref.s16", "side.s16", "out.s16", "ran", "idx"] {
             FileManager.default.createFile(atPath: "\(stem).\(name)", contents: nil, attributes: [.posixPermissions: 0o600])
         }
         guard let m = FileHandle(forWritingAtPath: "\(stem).mic.s16"), let r = FileHandle(forWritingAtPath: "\(stem).ref.s16"),
-              let o = FileHandle(forWritingAtPath: "\(stem).out.s16"), let rn = FileHandle(forWritingAtPath: "\(stem).ran"),
+              let o = FileHandle(forWritingAtPath: "\(stem).out.s16"), let sd = FileHandle(forWritingAtPath: "\(stem).side.s16"), let rn = FileHandle(forWritingAtPath: "\(stem).ran"),
               let ix = FileHandle(forWritingAtPath: "\(stem).idx") else { return nil }
-        mic = m; ref = r; out = o; ran = rn; idx = ix
+        mic = m; ref = r; side = sd; out = o; ran = rn; idx = ix
         log("echo dump on: \(stem).{mic,ref,out}.s16 + .ran, every frame, mic pre-gained (max \(Int(ECHO_DUMP_MAX_SECS)) s)")
     }
     /// The mic is written pre-gained exactly as the canceller sees it (no int16 clipping).
-    func write(_ m: UnsafePointer<Float>, _ r: UnsafePointer<Float>, _ n: Int, ran didRun: Bool, micGain: Float) {
+    func write(_ m: UnsafePointer<Float>, _ r: UnsafePointer<Float>, _ sd: UnsafePointer<Float>, _ n: Int, ran didRun: Bool, micGain: Float) {
         guard Double(frames * n) / 16_000 < ECHO_DUMP_MAX_SECS else { return }
         // Wall clock of every 50th frame (0.5 s): maps the dump onto the logs.
         if frames % 50 == 0 {
             idx.write("\(Int(Date().timeIntervalSince1970 * 1000)) \(frames * n)\n".data(using: .utf8)!)
         }
         frames += 1
-        for (h, p, g) in [(mic, m, micGain), (ref, r, Float(1))] {
+        for (h, p, g) in [(mic, m, micGain), (ref, r, Float(1)), (side, sd, Float(1))] {
             for i in 0..<n { buf[i] = Int16(max(-32768, min(32767, p[i] * g * 32768))) }
             buf.withUnsafeBytes { h.write(Data($0.prefix(n * 2))) }
         }
@@ -397,6 +426,7 @@ final class TapPipeline {
     var accN = 0
     var accHost: UInt64 = 0          // host time of acc[0]
     var ref = [Float](repeating: 0, count: Int(AEC_FRAME))
+    var side = [Float](repeating: 0, count: Int(AEC_FRAME))
     var out = [Float](repeating: 0, count: Int(AEC_FRAME))
     var pcm = [Int16](repeating: 0, count: Int(AEC_FRAME))
     var engaged = false
@@ -410,6 +440,9 @@ final class TapPipeline {
     var erleIn: Double = 0, erleOut: Double = 0
     /// Linear pre-gain applied to the mic before the canceller (and to the dump's mic).
     var micGain: Float = 1
+    var stereoAec = true
+    var aecUs: Double = 0, aecFrames = 0
+    var refL = [Float](repeating: 0, count: Int(AEC_FRAME)), refR = [Float](repeating: 0, count: Int(AEC_FRAME))
     init() {
         let env = ProcessInfo.processInfo.environment
         let tail = Int32(env["ALWAYS_CAPTURE_AEC_TAIL"] ?? "") ?? 4096
@@ -422,7 +455,9 @@ final class TapPipeline {
         // driver does not. The AGC below starts 12 dB higher to compensate.
         let pre = Float(env["ALWAYS_CAPTURE_PREGAIN_DB"] ?? "") ?? -12
         micGain = powf(10, pre / 20)
-        aec = aec_new(tail, 0, 0, pre)
+        // Two-speaker canceller (left/right reference) unless ALWAYS_CAPTURE_STEREO_AEC=0.
+        stereoAec = env["ALWAYS_CAPTURE_STEREO_AEC"] != "0"
+        aec = aec_new_mc(tail, 0, 0, pre, stereoAec ? 2 : 1)
         let g0 = Float(env["ALWAYS_CAPTURE_GAIN_DB"] ?? "") ?? 22
         agc = aec_agc_new(-26, 35 - pre, max(0, g0 - pre))
         tse = loadExtractor()
@@ -466,10 +501,20 @@ final class TapPipeline {
                 for r in ref { e += r * r }
                 maxRefRms = max(maxRefRms, sqrtf(e / Float(frame)))
                 for j in 0..<frame { let v = abs(acc[off + j]); if v > micPeak { micPeak = v }; if v >= 0.9999 { micOver += 1 } }
-                let ran = acc.withUnsafeBufferPointer { a in
-                    ref.withUnsafeBufferPointer { r in
-                        out.withUnsafeMutableBufferPointer { o in
-                            aec_process(aec, a.baseAddress! + off, r.baseAddress!, o.baseAddress!)
+                side.withUnsafeMutableBufferPointer { refRing.readSide($0.baseAddress!, frame, host: fh) }
+                let ran: Int32
+                let aecT0 = mach_absolute_time()
+                defer { aecUs += Double(mach_absolute_time() - aecT0) / hostTicksPerSec * 1e6; aecFrames += 1 }
+                if stereoAec {
+                    for j in 0..<frame { refL[j] = ref[j] + side[j]; refR[j] = ref[j] - side[j] }
+                    ran = acc.withUnsafeBufferPointer { a in refL.withUnsafeBufferPointer { l in refR.withUnsafeBufferPointer { r in
+                        out.withUnsafeMutableBufferPointer { o in aec_process_st(aec, a.baseAddress! + off, l.baseAddress!, r.baseAddress!, o.baseAddress!) } } } }
+                } else {
+                    ran = acc.withUnsafeBufferPointer { a in
+                        ref.withUnsafeBufferPointer { r in
+                            out.withUnsafeMutableBufferPointer { o in
+                                aec_process(aec, a.baseAddress! + off, r.baseAddress!, o.baseAddress!)
+                            }
                         }
                     }
                 }
@@ -482,7 +527,8 @@ final class TapPipeline {
                 } else { framesPassed += 1 }
                 os_unfair_lock_lock(&echoDumpLock); let echoDump = echoDumpShared; os_unfair_lock_unlock(&echoDumpLock)
                 if let d = echoDump {
-                    acc.withUnsafeBufferPointer { a in ref.withUnsafeBufferPointer { r in d.write(a.baseAddress! + off, r.baseAddress!, frame, ran: ran != 0, micGain: micGain) } }
+                    acc.withUnsafeBufferPointer { a in ref.withUnsafeBufferPointer { r in side.withUnsafeBufferPointer { sd in
+                        d.write(a.baseAddress! + off, r.baseAddress!, sd.baseAddress!, frame, ran: ran != 0, micGain: micGain) } } }
                 }
                 if (ran != 0) != engaged {
                     engaged = ran != 0
@@ -1113,6 +1159,7 @@ if let tp = tapPipeline {
         // Torn reads of these counters are harmless (diagnostics only).
         let run = tp.framesRun, passed = tp.framesPassed, peak = tp.maxRefRms
         let mpk = tp.micPeak, mover = tp.micOver
+        let aus = tp.aecFrames > 0 ? tp.aecUs / Double(tp.aecFrames) : 0; tp.aecUs = 0; tp.aecFrames = 0
         tp.framesRun = 0; tp.framesPassed = 0; tp.maxRefRms = 0; tp.micPeak = 0; tp.micOver = 0
         if run > 0 {
             let tf = tp.tseFrames, tu = tp.tseUs
@@ -1122,9 +1169,9 @@ if let tp = tapPipeline {
             tp.erleIn = 0; tp.erleOut = 0
             let (md, ad, rs, ra) = refRing.takeStats()
             log(String(format: "ref ring: write dev max %d avg %.1f samples, resyncs %d, mic frames reading past the ref %d", md, ad, rs, ra))
-            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB erle=%.1f dB mic=%.1f dBFS tse=%d frames %.0f us/frame drift_comp=%d mic_peak=%.1f dBFS mic_full_scale=%d", run, passed,
+            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB erle=%.1f dB mic=%.1f dBFS tse=%d frames %.0f us/frame drift_comp=%d mic_peak=%.1f dBFS mic_full_scale=%d frame_us=%.0f stereo=%d", run, passed,
                        20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc), erle, micDb, tf, tf > 0 ? tu / Double(tf) : 0, tapDriftCompensation ? 1 : 0,
-                       20 * log10f(max(mpk, 1e-6)), mover))
+                       20 * log10f(max(mpk, 1e-6)), mover, aus, tp.stereoAec ? 1 : 0))
         }
     }
     tapStatsTimer.resume()

@@ -26,6 +26,12 @@ typedef struct aec_core aec_core;
 /// mic_gain_db: fixed gain on the mic before cancelling (and on pass-through);
 /// 0 in always-capture (measured offline: 0 vs 18 dB pre-gain, same ERLE).
 aec_core *aec_new(int tail_samples, int echo_suppress_db, int echo_suppress_active_db, float mic_gain_db);
+/// Same, with `speakers` far-end channels (2 = left/right reference: stereo music's left/right difference
+/// is invisible to a mono reference; measured 2026-10-17 on Spotify at volume 75/100: mono 6.1/7.3 dB,
+/// two-speaker 17.1/16.4 dB of echo removed).
+aec_core *aec_new_mc(int tail_samples, int echo_suppress_db, int echo_suppress_active_db, float mic_gain_db, int speakers);
+/// Two-speaker frame: refl/refr are AEC_FRAME floats each (requires aec_new_mc(..., 2)).
+int aec_process_st(aec_core *a, const float *mic, const float *refl, const float *refr, float *out);
 void aec_free(aec_core *a);
 
 /// One 10 ms frame: mic and ref are AEC_FRAME floats in [-1, 1]; out receives
