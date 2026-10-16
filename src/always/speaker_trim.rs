@@ -68,14 +68,25 @@ pub struct WindowVerdict {
     pub score: f32,
     /// Best similarity to the recent-impostor cohort; `None` = no cohort.
     pub cohort: Option<f32>,
+    /// Scored while other output played (the window may be the media/Iris
+    /// talking over him).
+    pub media: bool,
 }
 
 impl WindowVerdict {
     pub fn is_foreign(&self) -> bool {
         self.cohort.is_some_and(|c| {
-            self.score < FOREIGN_MAX_SCORE
+            let clear = self.score < FOREIGN_MAX_SCORE
                 && c >= FOREIGN_MIN_COHORT
-                && c - self.score >= FOREIGN_MARGIN
+                && c - self.score >= FOREIGN_MARGIN;
+            // Over media a window is his only while it is closer to him than
+            // to the impostor that was just rejected (Iris/the film). Session
+            // 2, 07:32:43Z: after his "Okay, I'm speaking" (0.52/0.04,
+            // 0.43/0.15) Iris's "This is another long update" windows scored
+            // 0.20/0.44 and 0.11/0.53, were kept as "not clearly foreign", and
+            // her words were pasted with his.
+            let media_foreign = self.media && (self.score < c || self.score < MEDIA_TAIL_MIN_SCORE);
+            clear || media_foreign
         })
     }
 }
@@ -441,6 +452,7 @@ mod tests {
             end,
             score,
             cohort,
+            media: false,
         }
     }
     /// Windows every 0.5 s; `kind(i)` → (score, cohort).
@@ -454,6 +466,20 @@ mod tests {
     }
     const REEL: (f32, Option<f32>) = (0.08, Some(0.72));
     const USER: (f32, Option<f32>) = (0.55, Some(0.05));
+
+    #[test]
+    fn over_media_iris_after_his_first_words_is_cut() {
+        // Session 2, 07:32:43Z timeline (end:score:cohort), all over output.
+        let mk = |end: usize, s: f32, c: f32| WindowVerdict { start: end - W, end, score: s, cohort: Some(c), media: true };
+        let ws = vec![mk(24_000, 0.52, 0.04), mk(28_320, 0.43, 0.15), mk(36_480, 0.20, 0.44), mk(44_640, 0.11, 0.53),
+                      mk(52_800, 0.09, 0.64), mk(60_960, -0.01, 0.65)];
+        let p = plan(&ws, 64_000, false);
+        let cut = p.trail_from.expect("trail cut");
+        assert!(cut <= 28_320 + GUARD_SAMPLES, "kept {cut} samples: Iris's windows must go");
+        // The same windows without media: the old, cohort-only rule keeps more.
+        let quiet: Vec<_> = ws.iter().map(|w| WindowVerdict { media: false, ..*w }).collect();
+        assert!(plan(&quiet, 64_000, false).trail_from.unwrap() > cut);
+    }
 
     #[test]
     fn excise_drops_touching_windows_and_shifts_later_ones() {
@@ -592,6 +618,7 @@ mod tests {
             end: 8_000,
             score: 0.0,
             cohort: Some(0.9),
+            media: false,
         });
         let len = ws[9].end;
         ws.push(win(len + 8_000, 0.0, Some(0.9)));

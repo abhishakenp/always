@@ -525,6 +525,7 @@ impl GateJob {
             end: self.len_at_submit,
             score,
             cohort: self.cohort(),
+            media: self.media_similarity().is_some() || crate::always::audio::other_output_playing(),
         }
     }
 
