@@ -48,7 +48,10 @@ const FAR_MAX_RECORDING_SECS: u64 = 75;
 #[cfg(target_os = "macos")]
 const FAR_SILERO_THRESHOLD: f32 = 0.3;
 #[cfg(target_os = "macos")]
-const FAR_MIN_SIMILARITY: f32 = 0.35;
+const FAR_MIN_SIMILARITY: f32 = 0.20;
+/// Each ~2 s piece of the far sample vs the rest of it (same talker).
+#[cfg(target_os = "macos")]
+const FAR_MIN_PIECE_AGREEMENT: f32 = 0.45;
 /// Level-meter throttle (frames): 30ms frames × 3 ≈ 10 Hz.
 #[cfg(target_os = "macos")]
 const LEVEL_EVERY_FRAMES: u32 = 3;
@@ -165,6 +168,7 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
     let mut voiced_ms: u32 = 0;
     let mut started = false;
     let mut frames_since_level: u32 = 0;
+    let mut output_frames: u64 = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
 
     loop {
@@ -204,6 +208,15 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
             sample_buf[i] = i16::from_le_bytes([chunk[0], chunk[1]]);
         }
 
+        // Far step: only room audio with NOTHING playing counts (Iris or
+        // media in the sample would become part of "his far voice").
+        if far && !crate::always::audio::other_output_quiet() {
+            output_frames += 1;
+            if output_frames * FRAME_MS as u64 > (max_secs * 1000) / 2 {
+                anyhow::bail!("something kept playing through the speakers — pause media and Iris, then try again");
+            }
+            continue;
+        }
         let voiced = vad
             .predict(&sample_buf)
             .map(|p| p >= silero_threshold)
@@ -232,9 +245,30 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
         .embed(&samples)
         .context("failed to compute voice embedding")?;
     if let (true, Some(p)) = (far, near_profile.as_ref()) {
-        // Identity check: from the far corner his voice still sits near his
-        // near-field print (offline: his far 0.47 median, other voices <= 0.31);
-        // a sample dominated by someone else / media is refused, never stored.
+        // One talker throughout: ~2 s pieces must agree with each other (a
+        // second voice, or a change of speaker mid-sample, breaks this).
+        let piece = 32_000usize;
+        let pieces: Vec<Vec<f32>> = samples
+            .chunks(piece)
+            .filter(|c| c.len() >= piece / 2)
+            .filter_map(|c| embedder.embed(c).ok())
+            .collect();
+        let mut worst = 1.0f32;
+        for (i, a) in pieces.iter().enumerate() {
+            let others: Vec<Vec<f32>> = pieces.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, v)| v.clone()).collect();
+            if let Ok(rest) = speaker_embed::combine_embeddings(&others) {
+                worst = worst.min(speaker_embed::cosine(a, &rest));
+            }
+        }
+        tracing::info!(pieces = pieces.len(), worst_piece_agreement = worst, output_skipped_ms = output_frames * FRAME_MS as u64, "voice_enrollment_far_consistency");
+        if pieces.len() >= 2 && worst < FAR_MIN_PIECE_AGREEMENT {
+            anyhow::bail!(
+                "the sample had more than one voice in it (agreement {worst:.2}) — try again with only you talking"
+            );
+        }
+        // Identity check, floor only: the reverberant far voice scores well
+        // below the near print (his far 0.37-0.47 offline, lower in a real
+        // room); nothing-playing + one-talker carry the rest.
         let sim = speaker_embed::cosine(&embedding, &p.voiceprint);
         tracing::info!(similarity = sim, "voice_enrollment_far_identity");
         if sim < FAR_MIN_SIMILARITY {
