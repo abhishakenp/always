@@ -31,14 +31,21 @@ final class VoiceEnrollmentClient: ObservableObject {
         case normal
         case lower
         case louder
+        /// Optional: soft voice from the far corner of the room. Not needed
+        /// for "enrolled"; adds a far-field style so he is heard from there.
+        case far
 
         var id: String { rawValue }
+
+        /// The steps a complete enrollment needs (onboarding shows these).
+        static var required: [Step] { [.normal, .lower, .louder] }
 
         var title: String {
             switch self {
             case .normal: return "Normal voice"
             case .lower: return "Quieter voice"
             case .louder: return "Louder voice"
+            case .far: return "From across the room, softly (recommended)"
             }
         }
 
@@ -50,6 +57,8 @@ final class VoiceEnrollmentClient: ObservableObject {
                 return "Speak softly, like dictating in public."
             case .louder:
                 return "Speak up, like talking over background noise."
+            case .far:
+                return "Step to the far side of the room, with nothing playing, and talk softly for about 20 seconds. Optional, but it lets Always hear you from anywhere in the room."
             }
         }
     }

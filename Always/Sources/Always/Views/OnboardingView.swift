@@ -60,7 +60,7 @@ struct OnboardingView: View {
             case .permissions:
                 return "Always needs microphone access to hear you, and accessibility access to type your words into any app. Grant each permission, and I'll continue when you're ready."
             case .voice:
-                return "Now, let's teach me your voice. This is optional, but it lets me ignore other people, videos, and calls. Record three short samples and I'll only listen to you."
+                return "Now, let's teach me your voice. This is optional, but it lets me ignore other people, videos, and calls. Record three short samples and I'll only listen to you. The last one, from across the room and softly, lets me hear you from anywhere — recommended."
             case .tips:
                 return "Here are a few tips to get the most out of Always. Auto-enter is on by default, but holding Command prevents the text from being sent. Control Option V pastes filtered content anyway, and Control Option W lets you correct the last transcript to build your vocabulary."
             case .ready:
@@ -543,7 +543,7 @@ struct OnboardingView: View {
             }
 
             if enrollment.isEnrolled {
-                Label("All three recorded — Always will only listen to you.",
+                Label(enrollment.recordedSteps.contains("far") ? "All recorded — Always will only listen to you, from anywhere in the room." : "Done — Always will only listen to you. The last step (across the room) is optional but recommended.",
                       systemImage: "checkmark.seal.fill")
                     .font(.caption)
                     .foregroundColor(.green)

@@ -616,6 +616,7 @@ fn best_voiceprint_match(
                 "normal" => "normal",
                 "lower" => "lower",
                 "louder" => "louder",
+                "far" => "far",
                 _ => "step",
             };
         }

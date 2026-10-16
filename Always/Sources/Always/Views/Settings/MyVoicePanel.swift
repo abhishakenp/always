@@ -14,7 +14,7 @@ struct MyVoicePanel: View {
             VStack(alignment: .leading, spacing: 14) {
                 header
                 gateToggleCard
-                Text("Record the three short samples below — about 5 seconds of speech each — so Always learns what YOUR voice sounds like across the ways you actually talk.")
+                Text("Record the three short samples below — about 5 seconds of speech each — so Always learns what YOUR voice sounds like across the ways you actually talk. The fourth (from across the room, softly) is optional but lets Always hear you from anywhere in the room.")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

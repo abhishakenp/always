@@ -189,7 +189,7 @@ enum VoiceAction {
     /// Record one guided enrollment sample via the running daemon.
     /// Speak until the daemon reports the sample captured (~5s voice).
     Record {
-        /// Which sample: normal, lower, or louder
+        /// Which sample: normal, lower, louder, or far (optional: soft voice from the far corner)
         step: String,
     },
     /// Cancel an in-flight enrollment recording
@@ -802,7 +802,7 @@ fn handle_voice(action: VoiceAction) -> Result<()> {
     match action {
         VoiceAction::Record { step } => {
             let Some(parsed) = voiceprint::EnrollStep::parse(&step) else {
-                anyhow::bail!("unknown step '{step}' — expected: normal, lower, louder");
+                anyhow::bail!("unknown step '{step}' — expected: normal, lower, louder, far");
             };
             if !always::always::daemon::is_running() {
                 anyhow::bail!("daemon is not running — start Always first");

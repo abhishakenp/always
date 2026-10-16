@@ -39,6 +39,16 @@ const TARGET_VOICED_MS: u32 = 5_000;
 /// walked away" without wedging the event loop forever.
 #[cfg(target_os = "macos")]
 const MAX_RECORDING_SECS: u64 = 45;
+/// Far-corner step: more voice (reverberant soft speech embeds noisier),
+/// more time, a lower voicing bar, and an identity floor vs the near print.
+#[cfg(target_os = "macos")]
+const FAR_TARGET_VOICED_MS: u32 = 8_000;
+#[cfg(target_os = "macos")]
+const FAR_MAX_RECORDING_SECS: u64 = 75;
+#[cfg(target_os = "macos")]
+const FAR_SILERO_THRESHOLD: f32 = 0.3;
+#[cfg(target_os = "macos")]
+const FAR_MIN_SIMILARITY: f32 = 0.35;
 /// Level-meter throttle (frames): 30ms frames × 3 ≈ 10 Hz.
 #[cfg(target_os = "macos")]
 const LEVEL_EVERY_FRAMES: u32 = 3;
@@ -118,6 +128,18 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
     // finished (or failed) the download happens here. Tell the UI we are
     // preparing so it shows a waiting state instead of "speak now", and
     // announce the recording only once we are really about to record.
+    // The far-corner step adds a style to an existing profile: it needs
+    // the near-field steps first (they anchor the identity check below).
+    let far = step == EnrollStep::Far;
+    let near_profile = voiceprint::current().filter(|p| p.is_complete());
+    if far && near_profile.is_none() {
+        anyhow::bail!("record the three near-field steps first");
+    }
+    // Far, soft speech is quiet and reverberant: a lower Silero bar, more
+    // voiced audio for a stable embedding, more time to walk away and talk.
+    let target_voiced_ms = if far { FAR_TARGET_VOICED_MS } else { TARGET_VOICED_MS };
+    let silero_threshold = if far { cfg.silero_threshold.min(FAR_SILERO_THRESHOLD) } else { cfg.silero_threshold };
+    let max_secs = if far { FAR_MAX_RECORDING_SECS } else { MAX_RECORDING_SECS };
     event::global_broadcaster().voice_enrollment_preparing(step.as_str());
     speaker_embed::ensure_model().context("speaker model unavailable")?;
     let embedder = speaker_embed::global().context("speaker embedding engine failed to load")?;
@@ -143,7 +165,7 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
     let mut voiced_ms: u32 = 0;
     let mut started = false;
     let mut frames_since_level: u32 = 0;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(MAX_RECORDING_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
 
     loop {
         if CANCEL.load(Ordering::SeqCst) {
@@ -152,7 +174,7 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "not enough speech captured ({}s of voice needed)",
-                TARGET_VOICED_MS / 1000
+                target_voiced_ms / 1000
             );
         }
 
@@ -184,7 +206,7 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
 
         let voiced = vad
             .predict(&sample_buf)
-            .map(|p| p >= cfg.silero_threshold)
+            .map(|p| p >= silero_threshold)
             .unwrap_or(false);
         if voiced {
             started = true;
@@ -198,10 +220,10 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
         if frames_since_level >= LEVEL_EVERY_FRAMES {
             frames_since_level = 0;
             let energy = frame_energy(&sample_buf);
-            broadcaster.voice_enrollment_level(energy, voiced_ms, TARGET_VOICED_MS);
+            broadcaster.voice_enrollment_level(energy, voiced_ms, target_voiced_ms);
         }
 
-        if voiced_ms >= TARGET_VOICED_MS {
+        if voiced_ms >= target_voiced_ms {
             break;
         }
     }
@@ -209,6 +231,19 @@ fn record_and_store(cfg: &AlwaysConfig, step: EnrollStep) -> Result<()> {
     let embedding = embedder
         .embed(&samples)
         .context("failed to compute voice embedding")?;
+    if let (true, Some(p)) = (far, near_profile.as_ref()) {
+        // Identity check: from the far corner his voice still sits near his
+        // near-field print (offline: his far 0.47 median, other voices <= 0.31);
+        // a sample dominated by someone else / media is refused, never stored.
+        let sim = speaker_embed::cosine(&embedding, &p.voiceprint);
+        tracing::info!(similarity = sim, "voice_enrollment_far_identity");
+        if sim < FAR_MIN_SIMILARITY {
+            anyhow::bail!(
+                "that sample didn't sound like your voice (similarity {sim:.2}) — make sure no one else \
+                 and nothing is playing, then try again"
+            );
+        }
+    }
     voiceprint::set_step(step, embedding).context("failed to persist voiceprint")?;
     Ok(())
 }

@@ -27,16 +27,24 @@ pub enum EnrollStep {
     Normal,
     Lower,
     Louder,
+    /// Optional: his soft voice from the far corner of the room (reverb,
+    /// distance, quiet). Matched as its own style; never part of the
+    /// combined near-field voiceprint and not needed for "enrolled".
+    Far,
 }
 
 impl EnrollStep {
+    /// Required for a complete enrollment.
     pub const ALL: [EnrollStep; 3] = [EnrollStep::Normal, EnrollStep::Lower, EnrollStep::Louder];
+    /// Recorded on request, never required.
+    pub const OPTIONAL: [EnrollStep; 1] = [EnrollStep::Far];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             EnrollStep::Normal => "normal",
             EnrollStep::Lower => "lower",
             EnrollStep::Louder => "louder",
+            EnrollStep::Far => "far",
         }
     }
 
@@ -45,6 +53,7 @@ impl EnrollStep {
             "normal" => Some(EnrollStep::Normal),
             "lower" => Some(EnrollStep::Lower),
             "louder" => Some(EnrollStep::Louder),
+            "far" => Some(EnrollStep::Far),
             _ => None,
         }
     }
@@ -166,8 +175,17 @@ pub fn set_step(step: EnrollStep, embedding: Vec<f32>) -> Result<Arc<VoiceProfil
             updated_at: now_iso(),
         });
     profile.steps.insert(step.as_str().to_string(), embedding);
-    let all: Vec<Vec<f32>> = profile.steps.values().cloned().collect();
-    profile.voiceprint = speaker_embed::combine_embeddings(&all)?;
+    // The combined voiceprint stays near-field: the far style is matched on
+    // its own (best-of-styles in the gate) so it never dilutes the near one.
+    let near: Vec<Vec<f32>> = profile
+        .steps
+        .iter()
+        .filter(|(k, _)| k.as_str() != EnrollStep::Far.as_str())
+        .map(|(_, v)| v.clone())
+        .collect();
+    if !near.is_empty() {
+        profile.voiceprint = speaker_embed::combine_embeddings(&near)?;
+    }
     profile.updated_at = now_iso();
     persist(&profile)?;
     let arc = Arc::new(profile);
@@ -311,6 +329,23 @@ mod tests {
             assert_eq!(p.voiceprint.len(), speaker_embed::EMBEDDING_DIM);
             let norm: f32 = p.voiceprint.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!((norm - 1.0).abs() < 1e-4);
+        });
+    }
+
+    #[test]
+    fn far_step_is_its_own_style_and_never_moves_the_near_print() {
+        with_temp_config(|| {
+            for (i, step) in EnrollStep::ALL.iter().enumerate() {
+                set_step(*step, fake_embedding(i as f32)).unwrap();
+            }
+            let near = current().unwrap().voiceprint.clone();
+            set_step(EnrollStep::Far, fake_embedding(7.0)).unwrap();
+            let p = current().unwrap();
+            assert_eq!(p.voiceprint, near, "combined print stays near-field");
+            assert!(p.steps.contains_key("far"));
+            assert!(is_enrolled());
+            assert_eq!(EnrollStep::parse("far"), Some(EnrollStep::Far));
+            assert!(!EnrollStep::ALL.contains(&EnrollStep::Far), "far is optional");
         });
     }
 
