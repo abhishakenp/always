@@ -590,7 +590,13 @@ fn note_capture_helper_line(line: &str) {
         note_output_playing();
     } else if line.contains("aec bypassed (tap reference silent)") {
         // The tap goes silent in every gap between songs/phrases: quiet
-        // only once nothing has played for OUTPUT_QUIET_AFTER.
+        // only once nothing has played for OUTPUT_QUIET_AFTER — counted
+        // from THIS edge (playback just ended), not from the engage edge.
+        // Counting from the engage edge made any playback longer than 3 s
+        // a "quiet room" the moment it stopped: Iris spoke 23:18:57-01Z
+        // (2026-10-15), the tap went silent and the next frame of her
+        // voice's tail cued Listening — 5 false cues in a minute.
+        note_output_playing();
         OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
     } else if line.contains("aec bypassed (") {
         // The helper only bypasses after its hangover with NO other
@@ -625,6 +631,13 @@ pub(crate) fn other_output_quiet() -> bool {
                     >= us + OUTPUT_QUIET_AFTER.as_micros() as u64
             }
         }
+}
+
+/// The capture helper reports other output playing now, or within the
+/// quiet window (a gap between lines of a film is still the film). False
+/// when nothing is known (no helper).
+pub(crate) fn other_output_playing() -> bool {
+    OTHER_OUTPUT.load(Ordering::Relaxed) != OUTPUT_UNKNOWN && !other_output_quiet()
 }
 
 /// Last time any output was reported playing (µs on [`aec_clock`]; 0 =
@@ -1803,5 +1816,19 @@ mod aec_edge_tracking_tests {
         assert!(!quiet(), "music via the output tap");
         note("always-capture: aec bypassed (tap reference silent)");
         assert!(!quiet(), "a gap in the music is not a quiet room");
+
+        // Playback that ran longer than the quiet window (one engage edge
+        // long ago, 2026-10-15 23:18:57Z) is still "just stopped" at its
+        // silent edge: the quiet clock restarts there.
+        note("always-capture: aec engaged (tap reference playing)");
+        super::OUTPUT_LAST_PLAYING_US.store(1, std::sync::atomic::Ordering::Relaxed);
+        let before_us = super::aec_clock().elapsed().as_micros() as u64;
+        note("always-capture: aec bypassed (tap reference silent)");
+        assert!(
+            super::OUTPUT_LAST_PLAYING_US.load(std::sync::atomic::Ordering::Relaxed)
+                >= before_us.max(1),
+            "the silent edge restarts the quiet clock"
+        );
+        assert!(!quiet(), "long playback just ended is not a quiet room");
     }
 }

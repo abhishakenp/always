@@ -353,6 +353,12 @@ pub(crate) fn set_media_playing(playing: bool) {
 /// strangers stay at 0 accepts — the threshold is unchanged, only the
 /// time to decide grows. Cost: background media holds the (invisible,
 /// unverified) recording ~2 s longer before it is discarded.
+/// Other output (a film, music, Iris) is playing: the UDS media flag or
+/// the capture helper's output tap.
+fn speaker_gate_media_playing() -> bool {
+    MEDIA_PLAYING.load(Ordering::Relaxed) || crate::always::audio::other_output_playing()
+}
+
 fn speaker_gate_reject_from(media_playing: bool) -> usize {
     if media_playing {
         SPEAKER_GATE_EARLY_SAMPLES_MEDIA
@@ -437,7 +443,7 @@ struct GateJob {
     scored_len: usize,
     /// Set by the worker BEFORE the score is sent: the embedding and its
     /// similarity to the recent-impostor cohort (`speaker_trim`).
-    extra: Arc<std::sync::OnceLock<(Vec<f32>, Option<f32>)>>,
+    extra: Arc<std::sync::OnceLock<(Vec<f32>, Option<f32>, Option<f32>)>>,
 }
 
 impl GateJob {
@@ -461,6 +467,9 @@ impl GateJob {
         let scored_len = samples.len();
         let extra = Arc::new(std::sync::OnceLock::new());
         let extra_w = Arc::clone(&extra);
+        // Window checks while other output plays also measure (and feed)
+        // the film's recent-window cohort — see `speaker_trim::media_window`.
+        let media = kind == GateJobKind::Window && speaker_gate_media_playing();
         std::thread::spawn(move || {
             let local = SpeakerGate {
                 embedder,
@@ -470,7 +479,10 @@ impl GateJob {
             let scored = speaker_gate_embed_score(&local, &samples);
             let score = scored.map(|(score, e)| {
                 let cohort = crate::always::speaker_trim::cohort_similarity(&e);
-                let _ = extra_w.set((e, cohort));
+                let media_sim = media
+                    .then(|| crate::always::speaker_trim::media_window(&e, score))
+                    .flatten();
+                let _ = extra_w.set((e, cohort, media_sim));
                 score
             });
             let _ = tx.send(score);
@@ -490,11 +502,20 @@ impl GateJob {
     /// Similarity of the scored audio to the recent-impostor cohort
     /// (`None`: no cohort, or no embedding).
     fn cohort(&self) -> Option<f32> {
-        self.extra.get().and_then(|(_, c)| *c)
+        self.extra.get().and_then(|(_, c, _)| *c)
     }
 
     fn embedding(&self) -> Option<&Vec<f32>> {
-        self.extra.get().map(|(e, _)| e)
+        self.extra.get().map(|(e, _, _)| e)
+    }
+
+    /// Similarity of the scored window to the film's recent windows
+    /// (`None`: no output playing, or no film heard yet).
+    fn media_similarity(&self) -> Option<f32> {
+        if !crate::always::speaker_trim::media_rules_on() {
+            return None;
+        }
+        self.extra.get().and_then(|(_, _, m)| *m)
     }
 
     /// The timeline entry for a landed WINDOW verdict.
@@ -657,6 +678,12 @@ const SPEAKER_TAIL_FAIL_STREAK: usize = 2;
 /// fraction: 0.6 × the default 0.50 = 0.30, still ~6× the measured
 /// media-only tail score (~0.05 through real speakers).
 const SPEAKER_TAIL_THRESHOLD_FACTOR: f32 = 0.6;
+/// Verified tail checks over a film: the cut needs this many consecutive
+/// film windows (2 s of voice) — one window of his under a loud line is
+/// below the media floor more often than not.
+const MEDIA_TAIL_FAIL_CHECKS: usize = 4;
+/// Two film-rule window passes must end this far apart (0.75 s of audio).
+const MEDIA_PASS_GAP_SAMPLES: usize = 12_000;
 
 pub fn record_utterance(
     cfg: &AlwaysConfig,
@@ -1155,6 +1182,34 @@ impl Drop for UtterancePreview {
     }
 }
 
+/// Hard chunk flush with a live session running: `tail` (the fresh
+/// session for the open buffer, `None` if it failed to start) replaces the
+/// running one, which is dropped (aborted) right here instead of hearing
+/// the rest of the utterance for a final nobody reads. Returns whether the
+/// session now in `slot` hears ONLY the open tail. When the tail session
+/// could not start, the running one stays (it still drives the preview) but
+/// it covers committed audio, so its final must not be used as the tail.
+fn retire_for_tail<S: TailFeed>(slot: &mut Option<S>, tail: Option<S>, carry: &[i16]) -> bool {
+    match tail {
+        Some(mut tail) => {
+            tail.feed_carry(carry);
+            drop(slot.replace(tail));
+            true
+        }
+        None => false,
+    }
+}
+
+trait TailFeed {
+    fn feed_carry(&mut self, samples: &[i16]);
+}
+
+impl TailFeed for crate::always::apple_stt::StreamSession {
+    fn feed_carry(&mut self, samples: &[i16]) {
+        self.feed(samples);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn record_with_local_vad(
     cfg: &AlwaysConfig,
@@ -1386,6 +1441,9 @@ fn record_with_local_vad(
     // media-polluted window at the 2s mark used to destroy utterances
     // whose other windows passed.
     let mut gate_fail_streak = 0usize;
+    // End (absolute sample) of the first window that passed the film rule
+    // (`speaker_trim::media_window_passes`) in this utterance.
+    let mut media_pass_at: Option<usize> = None;
     // Actual voiced audio accumulated (excludes pre-buffer and the
     // trailing-silence frames that also land in `speech_samples`) —
     // the embedding needs real voice, not padded silence.
@@ -1477,6 +1535,26 @@ fn record_with_local_vad(
                                     gate.threshold,
                                 )
                         });
+                    // Over a film: a window clearly closer to his profile
+                    // than to the film's recent windows verifies even below
+                    // the profile threshold (see `speaker_trim::media_window`).
+                    // One such window is not enough: a film line scored
+                    // 0.32 (film similarity 0.13) once in the offline replay.
+                    // A second passing window ending ≥ MEDIA_PASS_GAP later
+                    // (different audio) verifies.
+                    let media_window_ok = !speaker_checked
+                        && job.kind == GateJobKind::Window
+                        && score.is_some_and(|s| {
+                            crate::always::speaker_trim::media_window_passes(s, job.media_similarity())
+                        });
+                    let media_pass = media_window_ok
+                        && media_pass_at.is_some_and(|first| {
+                            committed_samples + job.len_at_submit >= first + MEDIA_PASS_GAP_SAMPLES
+                        });
+                    if media_window_ok && media_pass_at.is_none() {
+                        media_pass_at = Some(committed_samples + job.len_at_submit);
+                        tracing::info!(score = ?score, film = ?job.media_similarity(), "speaker_gate_media_window_candidate");
+                    }
                     if cohort_veto {
                         tracing::info!(
                             score = ?score,
@@ -1488,7 +1566,19 @@ fn record_with_local_vad(
                         // VERIFIED phase: trailing-window tail monitor.
                         if job.kind == GateJobKind::Window {
                             let tail_threshold = gate.threshold * SPEAKER_TAIL_THRESHOLD_FACTOR;
-                            if speaker_gate_allows_score(score, tail_threshold) {
+                            // Over a film his windows sit at 0.06-0.41: still
+                            // his while closer to him than to the film, and the
+                            // cut needs a longer run of film (see MEDIA_TAIL_*).
+                            let film = job.media_similarity();
+                            let media_tail_ok = score.is_some_and(|s| {
+                                crate::always::speaker_trim::media_tail_is_his(s, film)
+                            });
+                            let fail_checks = if film.is_some() {
+                                speaker_tail_fail_checks.max(MEDIA_TAIL_FAIL_CHECKS)
+                            } else {
+                                speaker_tail_fail_checks
+                            };
+                            if speaker_gate_allows_score(score, tail_threshold) || media_tail_ok {
                                 tail_fail_streak = 0;
                                 confirmed_user_len = job.len_at_submit;
                             } else {
@@ -1499,9 +1589,7 @@ fn record_with_local_vad(
                                     streak = tail_fail_streak,
                                     "speaker_gate_tail_mismatch"
                                 );
-                                if SPEAKER_GATE_ENFORCE_DROP
-                                    && tail_fail_streak >= speaker_tail_fail_checks
-                                {
+                                if SPEAKER_GATE_ENFORCE_DROP && tail_fail_streak >= fail_checks {
                                     tracing::info!(
                                         score = ?score,
                                         kept_secs = confirmed_user_len as f64 / 16_000.0,
@@ -1530,10 +1618,17 @@ fn record_with_local_vad(
                         // next (cancelled) window decides.
                         tracing::info!(score = ?score, "speaker_gate_refused_aec_edge");
                     } else if !cohort_veto
-                        && speaker_gate_allows_score(score, gate.threshold)
+                        && (speaker_gate_allows_score(score, gate.threshold) || media_pass)
                         && !job.straddles_aec_engage()
                     {
                         let score = score.expect("accepted speaker score must be present");
+                        if media_pass && !speaker_gate_allows_score(Some(score), gate.threshold) {
+                            tracing::info!(
+                                score,
+                                film = ?job.media_similarity(),
+                                "speaker_gate_media_window_pass"
+                            );
+                        }
                         speaker_checked = true;
                         confirmed_user_len = job.len_at_submit;
                         tail_fail_streak = 0;
@@ -1636,11 +1731,17 @@ fn record_with_local_vad(
     // round trip. `None` on other backends or when the engine is
     // unavailable — everything below degrades to the existing paths.
     let mut stream_session: Option<crate::always::apple_stt::StreamSession> = None;
-    // Live session for the open TAIL of a chunked utterance: restarted at
-    // every hard chunk flush (fed the carried audio), so at the end its final
-    // covers exactly the audio not yet committed — the paste no longer
-    // waits for a file pass over up to 15 s of tail after he stops.
-    let mut tail_session: Option<crate::always::apple_stt::StreamSession> = None;
+    // `stream_session` is the live session for the open TAIL of a chunked
+    // utterance once this is set: at every hard chunk flush a fresh session
+    // (fed the carried audio) REPLACES the running one, so at the end its
+    // final covers exactly the audio not yet committed — the paste no longer
+    // waits for a file pass over up to 15 s of tail after he stops. The
+    // replaced session is aborted on the spot: a chunked utterance never
+    // uses its final, and keeping it alive meant two live Apple recognizers
+    // plus the chunk's file pass at once (2026-10-15 22:51:34Z: the 14 s
+    // chunk's file pass timed out at 12 s, the sync retry queued behind it
+    // and speech-end → paste was 11.4 s).
+    let mut stream_is_tail = false;
     // Live preview (both engines push into it) + Parakeet feed + voice
     // level. Declared AFTER `stream_session` so it drops FIRST on every
     // exit path: the preview closes before the Apple session is freed.
@@ -2060,9 +2161,6 @@ fn record_with_local_vad(
                 if let Some(session) = stream_session.as_mut() {
                     session.feed(samples);
                 }
-                if let Some(tail) = tail_session.as_mut() {
-                    tail.feed(samples);
-                }
                 utt_preview.frame(samples, true, !speaker_gate_requested || speaker_checked);
                 // Same anchor refresh for the case where we were already in
                 // speech (consecutive_speech overflows min_speech_frames
@@ -2270,15 +2368,15 @@ fn record_with_local_vad(
                     );
                     chunker.flush_with_context(context, head, transcriber, grammar, rt);
                     if stream_session.is_some() {
-                        tail_session = crate::always::apple_stt::StreamSession::start(
+                        let tail = crate::always::apple_stt::StreamSession::start(
                             stream_session_lang,
                             &crate::always::stt_apple::context_phrases(),
                         );
-                        if let Some(tail) = tail_session.as_mut() {
-                            tail.feed(&speech_samples);
-                        }
+                        let started = tail.is_some();
+                        stream_is_tail =
+                            retire_for_tail(&mut stream_session, tail, &speech_samples);
                         tracing::info!(
-                            started = tail_session.is_some(),
+                            started,
                             carry_ms = speech_samples.len() / 16,
                             "tail_stream_restarted"
                         );
@@ -2962,14 +3060,12 @@ fn record_with_local_vad(
     // its own samples (speculation or a fresh pass) like before streaming.
     // Since 2026-10-16 a TAIL session restarts at every hard flush and
     // hears only the open buffer, so its final is exactly the tail.
-    if has_chunks && let Some(session) = stream_session.take() {
-        drop(session);
-        match tail_session.take() {
-            Some(tail) => {
-                stream_session = Some(tail);
-                tracing::info!("streaming_tail_session_used");
-            }
-            None => tracing::info!("streaming_final_skipped_chunked"),
+    if has_chunks && stream_session.is_some() {
+        if stream_is_tail {
+            tracing::info!("streaming_tail_session_used");
+        } else {
+            drop(stream_session.take());
+            tracing::info!("streaming_final_skipped_chunked");
         }
     }
     // The live session heard the foreign audio the speaker trim removed:
@@ -4472,7 +4568,7 @@ mod tests {
     fn gate_job_window_verdict_carries_span_and_cohort() {
         let (job, _tx) = gate_job_with(super::GateJobKind::Window, 40_000, 0);
         assert_eq!(job.cohort(), None, "no worker result yet: no cohort");
-        job.extra.set((vec![0.0; 4], Some(0.71))).unwrap();
+        job.extra.set((vec![0.0; 4], Some(0.71), None)).unwrap();
         let w = job.window_verdict(0.12);
         assert_eq!(
             (w.start, w.end),
@@ -4671,5 +4767,137 @@ mod aec_edge_tests {
         assert!(!straddles(at(15.6), at(17.1), engaged));
         // No playback edge ever: never refused.
         assert!(!straddles(at(0.0), at(5.0), None));
+    }
+}
+
+/// Offline "My Voice" window scores over WAVs (the daemon's view of the
+/// mic): `GATE_EVAL_WAVS=a.wav,b.wav GATE_EVAL_OUT=out.jsonl
+/// ALWAYS_CONFIG_DIR=<dir with voiceprint.json> cargo test --lib
+/// gate_window_eval -- --ignored`. One JSON line per window: file, window
+/// length, start/end seconds, profile score, cohort similarity.
+#[cfg(test)]
+mod gate_window_eval {
+    #[test]
+    #[ignore = "needs GATE_EVAL_* env + an enrolled voiceprint; run explicitly"]
+    fn gate_window_eval() {
+        use std::io::Write;
+        let Ok(wavs) = std::env::var("GATE_EVAL_WAVS") else {
+            return;
+        };
+        let out = std::env::var("GATE_EVAL_OUT").expect("GATE_EVAL_OUT");
+        let wins: Vec<f64> = std::env::var("GATE_EVAL_WIN")
+            .unwrap_or_else(|_| "1.5".into())
+            .split(',')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let step = std::env::var("GATE_EVAL_STEP")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.25);
+        let mut cfg = crate::always::AlwaysConfig::default();
+        cfg.speaker_gate_enabled = true;
+        let gate = super::speaker_gate_ctx(&cfg)
+            .gate
+            .expect("gate ready (voiceprint + model)");
+        let mut f = std::fs::File::create(&out).unwrap();
+        for wav in wavs.split(',').filter(|s| !s.is_empty()) {
+            let bytes = std::fs::read(wav).unwrap();
+            let pcm: Vec<i16> = bytes[44..]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            for &w in &wins {
+                let wn = (w * 16_000.0) as usize;
+                let sn = (step * 16_000.0) as usize;
+                let mut s = 0;
+                while s + wn <= pcm.len() {
+                    let seg = &pcm[s..s + wn];
+                    if let Ok(e) = gate.embedder.embed(seg) {
+                        let (score, _) = super::best_voiceprint_match(&e, &gate.voiceprint);
+                        let emb = if std::env::var("GATE_EVAL_EMB").is_ok() {
+                            format!(
+                                ",\"emb\":[{}]",
+                                e.iter()
+                                    .map(|v| format!("{v:.5}"))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            )
+                        } else {
+                            String::new()
+                        };
+                        writeln!(
+                            f,
+                            "{{\"wav\":{:?},\"win\":{w},\"t0\":{:.3},\"t1\":{:.3},\"score\":{score:.4}{emb}}}",
+                            wav,
+                            s as f64 / 16_000.0,
+                            (s + wn) as f64 / 16_000.0
+                        )
+                        .unwrap();
+                    }
+                    s += sn;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tail_session_tests {
+    use super::{TailFeed, retire_for_tail};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fake {
+        id: u8,
+        fed: usize,
+        drops: Arc<AtomicUsize>,
+    }
+    impl TailFeed for Fake {
+        fn feed_carry(&mut self, samples: &[i16]) {
+            self.fed += samples.len();
+        }
+    }
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 2026-10-15 22:51:34Z: the onset session kept running next to the
+    /// tail session and the chunk's file pass. At a hard flush the running
+    /// session is dropped and the tail (fed the carry) takes its place;
+    /// every later flush replaces the previous tail the same way.
+    #[test]
+    fn hard_flush_retires_the_running_session() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mk = |id| Fake {
+            id,
+            fed: 0,
+            drops: Arc::clone(&drops),
+        };
+        let mut slot = Some(mk(0));
+        assert!(retire_for_tail(&mut slot, Some(mk(1)), &[0; 480]));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "onset session dropped at the flush"
+        );
+        let s = slot.as_ref().unwrap();
+        assert_eq!(
+            (s.id, s.fed),
+            (1, 480),
+            "tail session holds the carried audio"
+        );
+        assert!(retire_for_tail(&mut slot, Some(mk(2)), &[]));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "previous tail dropped at the next flush"
+        );
+        // Tail failed to start: the running session stays, but it heard
+        // committed audio, so it is no longer a tail.
+        assert!(!retire_for_tail(&mut slot, None, &[0; 10]));
+        assert_eq!(slot.as_ref().unwrap().id, 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 }

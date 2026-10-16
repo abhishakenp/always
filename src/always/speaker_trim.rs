@@ -322,6 +322,93 @@ pub fn clear_cohort() {
     COHORT.lock().clear();
 }
 
+// ---------------------------------------------------------------------
+// Media-window cohort ("he talks while a movie plays")
+// ---------------------------------------------------------------------
+//
+// Lying beside the laptop with a film playing, the echo canceller leaves
+// the film's dialogue at about his own level (speaker distortion caps it
+// near 20 dB) and his 1.5 s windows score 0.06-0.41 against his profile —
+// the film's own windows 0.1-0.38 (2026-10-15 22:52-23:07Z: 76 of 79
+// segments rejected, his "Hello? Hello, my love, Iris" among them). No
+// profile threshold separates the two. What does: how much more a window
+// sounds like HIM than like the film heard in the seconds before. The
+// film's windows are near-copies of its earlier windows (same voices, same
+// speaker coloration through the canceller); his are not. Offline replay
+// (his recordings + a TTS film through the real canceller, SER -18 dB):
+// utterances with a passing window 2/8 → 7/8, film windows passing 0/154.
+
+/// The film rules below are on (always, except offline "before" replays
+/// with `GATE_REPLAY_BASELINE` set).
+pub fn media_rules_on() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("GATE_REPLAY_BASELINE").is_some() {
+        return false;
+    }
+    true
+}
+
+/// Windows this far from his profile while output plays are the film.
+pub const MEDIA_COHORT_ADMIT_MAX_SCORE: f32 = 0.12;
+/// Members are at least this far apart (overlapping ladder windows are
+/// near-duplicates; spacing keeps ~12 s of the film in the cohort).
+pub const MEDIA_COHORT_SPACING: Duration = Duration::from_millis(1500);
+pub const MEDIA_COHORT_MAX: usize = 8;
+/// A media window verifies at this profile score …
+pub const MEDIA_PASS_MIN_SCORE: f32 = 0.30;
+/// … when it is this much closer to his profile than to the film.
+pub const MEDIA_PASS_MARGIN: f32 = 0.10;
+
+static MEDIA_COHORT: Mutex<VecDeque<(Instant, Vec<f32>)>> = Mutex::new(VecDeque::new());
+
+fn media_admit(
+    cohort: &mut VecDeque<(Instant, Vec<f32>)>,
+    now: Instant,
+    embedding: &[f32],
+    score: f32,
+) -> bool {
+    if embedding.len() != EMBEDDING_DIM || score > MEDIA_COHORT_ADMIT_MAX_SCORE {
+        return false;
+    }
+    prune(cohort, now);
+    if cohort
+        .back()
+        .is_some_and(|(at, _)| now.saturating_duration_since(*at) < MEDIA_COHORT_SPACING)
+    {
+        return false;
+    }
+    cohort.push_back((now, embedding.to_vec()));
+    while cohort.len() > MEDIA_COHORT_MAX {
+        cohort.pop_front();
+    }
+    true
+}
+
+/// Score a window against the film heard before it, then (if it is
+/// clearly the film) remember it. Returns the similarity to the members
+/// that existed BEFORE this window. Call only while other output plays.
+pub fn media_window(embedding: &[f32], score: f32) -> Option<f32> {
+    let now = Instant::now();
+    let mut cohort = MEDIA_COHORT.lock();
+    let sim = similarity(&mut cohort, now, embedding);
+    media_admit(&mut cohort, now, embedding, score);
+    sim
+}
+
+/// After he verified over a film, a tail window is still his while it is
+/// no closer to the film than to him (and not near-silent noise).
+pub const MEDIA_TAIL_MIN_SCORE: f32 = 0.15;
+pub fn media_tail_is_his(score: f32, media_similarity: Option<f32>) -> bool {
+    media_similarity.is_some_and(|c| score >= MEDIA_TAIL_MIN_SCORE && score >= c)
+}
+
+/// A window that is his while a film plays: clears the media floor and is
+/// clearly closer to his profile than to the film's recent windows.
+pub fn media_window_passes(score: f32, media_similarity: Option<f32>) -> bool {
+    media_similarity
+        .is_some_and(|c| score >= MEDIA_PASS_MIN_SCORE && score - c >= MEDIA_PASS_MARGIN)
+}
+
 /// A window that clears the gate threshold only barely, while sounding
 /// more like the impostor just rejected, is not a verification.
 pub fn cohort_vetoes_pass(score: f32, cohort: Option<f32>, threshold: f32) -> bool {
@@ -571,5 +658,42 @@ mod tests {
             !cohort_vetoes_pass(0.65, Some(0.80), 0.5),
             "clear pass is never vetoed"
         );
+    }
+    #[test]
+    fn media_window_cohort_admits_spaced_film_windows_only() {
+        let mut c = VecDeque::new();
+        let t = Instant::now();
+        let e = unit(0.37);
+        assert!(media_admit(&mut c, t, &e, 0.05));
+        assert!(
+            !media_admit(&mut c, t + Duration::from_millis(500), &e, 0.05),
+            "overlapping window"
+        );
+        assert!(
+            !media_admit(&mut c, t + Duration::from_secs(2), &e, 0.2),
+            "too close to his profile"
+        );
+        assert!(media_admit(&mut c, t + Duration::from_secs(2), &e, 0.1));
+        for k in 0..20 {
+            media_admit(&mut c, t + Duration::from_secs(4 + 2 * k), &e, 0.0);
+        }
+        assert_eq!(c.len(), MEDIA_COHORT_MAX);
+    }
+
+    #[test]
+    fn media_window_passes_only_with_margin_over_the_film() {
+        // Offline replay values: his window 0.34 vs film 0.20 passes; the
+        // film's own 0.33 window (film similarity 0.6) never does.
+        assert!(media_window_passes(0.34, Some(0.20)));
+        assert!(!media_window_passes(0.33, Some(0.60)));
+        assert!(
+            !media_window_passes(0.29, Some(0.0)),
+            "below the media floor"
+        );
+        assert!(
+            !media_window_passes(0.45, None),
+            "no film heard yet: profile threshold decides"
+        );
+        assert!(!media_window_passes(0.35, Some(0.26)));
     }
 }

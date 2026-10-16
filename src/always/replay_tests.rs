@@ -559,4 +559,174 @@ while True:
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Fake tap-AEC capture helper for the My Voice gate replay: announces
+    /// the output tap as playing (the daemon parses helper stderr exactly
+    /// as live), writes its start wall time to `<wav>.t0`, then streams the
+    /// WAV in real time (10 ms frames) and then room tone.
+    const GATE_PACER_PY: &str = r#"
+import os, sys, time, wave, struct, random
+out = sys.stdout.buffer
+wav = sys.argv[1]
+FRAME = 160
+if os.environ.get("GATE_REPLAY_MEDIA", "1") == "1":
+    sys.stderr.write("always-capture: capturing mode=tap-aec\n")
+    sys.stderr.write("always-capture: aec engaged (tap reference playing)\n"); sys.stderr.flush()
+t0 = time.time(); sent = 0
+open(wav + ".t0", "w").write(repr(t0))
+def emit(pcm):
+    global sent
+    for i in range(0, len(pcm), FRAME * 2):
+        d = t0 + (sent + FRAME) / 16000.0 - time.time()
+        if d > 0: time.sleep(d)
+        out.write(pcm[i:i + FRAME * 2]); out.flush()
+        sent += len(pcm[i:i + FRAME * 2]) // 2
+wf = wave.open(wav)
+emit(wf.readframes(wf.getnframes()))
+open(wav + ".done", "w").close()
+while True:
+    emit(b"".join(struct.pack("<h", random.randint(-30, 30)) for _ in range(16000)))
+"#;
+
+    /// Records every transcription call's audio (`call-NNN.wav` in the dump
+    /// dir) and answers with the call's name, so a pasted text names exactly
+    /// which audio reached the paste.
+    struct DumpingTranscriber {
+        dir: std::path::PathBuf,
+        n: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Transcriber for DumpingTranscriber {
+        fn transcribe_from_bytes(
+            &self,
+            audio: Vec<u8>,
+        ) -> Result<crate::stt::TranscriptionResult, crate::stt::SttError> {
+            let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let _ = std::fs::write(self.dir.join(format!("call-{n:03}.wav")), &audio);
+            Ok(crate::stt::TranscriptionResult {
+                text: format!("call{n:03}"),
+                ..Default::default()
+            })
+        }
+
+        fn transcribe_streaming(
+            &self,
+            audio: Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<
+                            crate::stt::StreamingTranscriptionResult,
+                            crate::stt::SttError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            let r = self.transcribe_from_bytes(audio).map(|r| {
+                crate::stt::StreamingTranscriptionResult {
+                    text: r.text,
+                    is_final: true,
+                    is_interim: false,
+                }
+            });
+            Box::pin(futures::stream::once(async move { r }))
+        }
+    }
+
+    /// The real capture loop (VAD, My Voice gate ladder, cohort, trims,
+    /// chunking) over one daemon-view WAV (`GATE_REPLAY_WAV`, e.g. the AEC
+    /// output of a "movie playing, he talks" scene) with the enrolled
+    /// voiceprint (`ALWAYS_CONFIG_DIR`). Writes `GATE_REPLAY_OUT` (JSON:
+    /// every result with scene-time bounds) and each transcribed audio to
+    /// `GATE_REPLAY_DUMP`. Real time: as long as the WAV.
+    #[test]
+    #[ignore = "real-time gate replay; needs GATE_REPLAY_* env + voiceprint; run explicitly"]
+    fn gate_replay() {
+        let Ok(wav) = std::env::var("GATE_REPLAY_WAV") else {
+            return;
+        };
+        let out = std::env::var("GATE_REPLAY_OUT").expect("GATE_REPLAY_OUT");
+        let dump =
+            std::path::PathBuf::from(std::env::var("GATE_REPLAY_DUMP").expect("GATE_REPLAY_DUMP"));
+        std::fs::create_dir_all(&dump).unwrap();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+            .with_writer(std::io::stderr)
+            .try_init();
+        let pacer = dump.join("pacer.py");
+        std::fs::write(&pacer, GATE_PACER_PY).unwrap();
+        let capture = dump.join("capture.sh");
+        std::fs::write(
+            &capture,
+            format!(
+                "#!/bin/sh\nexec /usr/bin/python3 -I '{}' '{wav}'\n",
+                pacer.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &capture,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let done = std::path::PathBuf::from(format!("{wav}.done"));
+        let _ = std::fs::remove_file(&done);
+        // SAFETY: set before the recorder spawns; this test runs alone.
+        unsafe {
+            std::env::set_var("ALWAYS_CAPTURE_BIN", &capture);
+            std::env::set_var("ALWAYS_PREVIEW_ASR", "0");
+        }
+        let mut cfg = AlwaysConfig::default();
+        cfg.transcriber_backend = crate::stt_dispatch::TranscriberBackendChoice::Groq;
+        cfg.lang = "en".into();
+        cfg.speaker_gate_enabled = true;
+        cfg.stt_live_preview = false;
+        cfg.timeout_secs = 4;
+        let transcriber: Arc<dyn Transcriber> = Arc::new(DumpingTranscriber {
+            dir: dump.clone(),
+            n: Default::default(),
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut log = Logger;
+        let mut results = Vec::new();
+        let mut idle_after_done = 0;
+        loop {
+            let started = wall_ms();
+            let r = vad::record_utterance(&cfg, &mut log, &transcriber, rt.handle());
+            let ended = wall_ms();
+            let (kind, text, score) = match &r {
+                Ok(RecordResult::Speech { text, .. }) => ("speech", text.clone(), None),
+                Ok(RecordResult::DroppedSpeaker { score }) => {
+                    ("dropped_speaker", String::new(), Some(*score))
+                }
+                Ok(RecordResult::Silence) => ("silence", String::new(), None),
+                Ok(RecordResult::Timeout) => ("timeout", String::new(), None),
+                Ok(RecordResult::DroppedLowEnergy { .. }) => ("low_energy", String::new(), None),
+                Ok(RecordResult::DroppedNoise { raw }) => ("noise", raw.clone(), None),
+                Ok(RecordResult::PreemptedByMicConflict { text }) => {
+                    ("preempted", text.clone(), None)
+                }
+                Err(e) => ("error", format!("{e:#}"), None),
+            };
+            let _ = crate::always::rejected::take_stashed();
+            eprintln!("gate_replay result: {kind} {text:?} score={score:?}");
+            results.push(serde_json::json!({"kind": kind, "text": text, "score": score, "started": started, "ended": ended}));
+            if kind == "error" {
+                break;
+            }
+            if done.exists() {
+                idle_after_done += 1;
+                if idle_after_done >= 2 || matches!(kind, "silence" | "timeout") {
+                    break;
+                }
+            }
+        }
+        let t0: f64 = std::fs::read_to_string(format!("{wav}.t0"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0.0);
+        let report = serde_json::json!({"t0_ms": t0 * 1000.0, "results": results});
+        std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        eprintln!("report written to {out}");
+    }
 }
