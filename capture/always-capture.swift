@@ -235,6 +235,21 @@ final class OutputTap {
     }
 }
 
+/// Loads the extractor (nil when disabled, or weights/voiceprint missing).
+func loadExtractor() -> OpaquePointer? {
+    if ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_TSE"] == "0" { log("tse off (ALWAYS_CAPTURE_TSE=0)"); return nil }
+    let sup = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Always")
+    let weights = sup.appendingPathComponent("tse/current.bin").path
+    guard FileManager.default.fileExists(atPath: weights) else { log("tse off (no \(weights))"); return nil }
+    guard let d = try? Data(contentsOf: sup.appendingPathComponent("voiceprint.json")),
+          let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+          let vp = (j["voiceprint"] as? [NSNumber])?.map({ $0.floatValue }), vp.count == 256
+    else { log("tse off (no voiceprint)"); return nil }
+    let t = vp.withUnsafeBufferPointer { tse_new(weights, $0.baseAddress!, 256) }
+    log(t == nil ? "tse off (weights rejected: \(weights))" : "tse on: \(weights)")
+    return t
+}
+
 /// Mic → 10 ms frames → canceller (against the reference at the same host
 /// time) → speech AGC → s16 on stdout. Tap thread only.
 final class TapPipeline {
@@ -259,7 +274,16 @@ final class TapPipeline {
         aec = aec_new(tail, 0, 0, pre)
         let g0 = Float(env["ALWAYS_CAPTURE_GAIN_DB"] ?? "") ?? 22
         agc = aec_agc_new(-26, 35 - pre, max(0, g0 - pre))
+        tse = loadExtractor()
     }
+    // His personal extractor (capture/tse_core.c) on the canceller output,
+    // only while the reference plays. Weights: Application Support/Always/
+    // tse/current.bin, conditioned on his voiceprint.json. Missing either,
+    // or ALWAYS_CAPTURE_TSE=0: the canceller output passes unchanged.
+    var tse: OpaquePointer?
+    var tseOut = [Float](repeating: 0, count: Int(AEC_FRAME))
+    var tseActive = false
+    var tseFrames = 0, tseUs: Double = 0
     func feed(_ p: UnsafePointer<Float>, _ n: Int, host: UInt64) {
         let frame = Int(AEC_FRAME)
         // The buffer's first sample is at `host`; anything still accumulated
@@ -288,6 +312,23 @@ final class TapPipeline {
                 if (ran != 0) != engaged {
                     engaged = ran != 0
                     log("aec \(engaged ? "engaged" : "bypassed") (tap reference \(engaged ? "playing" : "silent"))")
+                }
+                if let tse {
+                    if ran != 0 {
+                        let t0 = mach_absolute_time()
+                        ref.withUnsafeBufferPointer { r in
+                            out.withUnsafeBufferPointer { o in
+                                tseOut.withUnsafeMutableBufferPointer { tse_process(tse, o.baseAddress!, r.baseAddress!, $0.baseAddress!) }
+                            }
+                        }
+                        for j in 0..<frame { out[j] = tseOut[j] }
+                        tseUs += Double(mach_absolute_time() - t0) / hostTicksPerSec * 1e6
+                        tseFrames += 1
+                        tseActive = true
+                    } else if tseActive {
+                        tse_reset(tse)
+                        tseActive = false
+                    }
                 }
                 // Gain adapts only while nothing plays: music never trains it.
                 out.withUnsafeMutableBufferPointer { aec_agc_process(agc, $0.baseAddress!, ran != 0 ? 0 : 1) }
@@ -889,8 +930,10 @@ if let tp = tapPipeline {
         let run = tp.framesRun, passed = tp.framesPassed, peak = tp.maxRefRms
         tp.framesRun = 0; tp.framesPassed = 0; tp.maxRefRms = 0
         if run > 0 {
-            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB", run, passed,
-                       20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc)))
+            let tf = tp.tseFrames, tu = tp.tseUs
+            tp.tseFrames = 0; tp.tseUs = 0
+            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB tse=%d frames %.0f us/frame", run, passed,
+                       20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc), tf, tf > 0 ? tu / Double(tf) : 0))
         }
     }
     tapStatsTimer.resume()
