@@ -99,6 +99,15 @@ final class RefRing {
     private var base: UInt64 = 0      // host time of index 0
     private var writeIdx: Int64 = 0   // next index to write
     init() { buf = [Float](repeating: 0, count: 1 << 16) }
+    // Diagnostics (10 s stats line): timestamp deviation of tap writes from
+    // the continuous write position, and how often it forced a re-sync.
+    var maxDev: Int64 = 0, devSum: Double = 0, writes = 0, resyncs = 0, readsAhead = 0
+    func takeStats() -> (Int64, Double, Int, Int) {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        let r = (maxDev, writes > 0 ? devSum / Double(writes) : 0, resyncs, readsAhead)
+        maxDev = 0; devSum = 0; writes = 0; resyncs = 0; readsAhead = 0
+        return r
+    }
     private func index(_ host: UInt64) -> Int64 {
         Int64((Double(Int64(bitPattern: host &- base)) / hostTicksPerSec * 16_000).rounded())
     }
@@ -107,7 +116,9 @@ final class RefRing {
         if base == 0 { base = host }
         var idx = index(host)
         // Stay continuous through timestamp jitter (< 2 ms); re-sync otherwise.
-        if abs(idx - writeIdx) < 32 { idx = writeIdx }
+        let dev = idx - writeIdx
+        if writeIdx != 0 { maxDev = max(maxDev, abs(dev)); devSum += Double(abs(dev)); writes += 1 }
+        if abs(dev) < 32 { idx = writeIdx } else if writeIdx != 0 { resyncs += 1 }
         if idx > writeIdx {  // gap: what played then is unknown → silence
             var j = max(writeIdx, idx - Int64(cap))
             while j < idx { buf[Int(j & Int64(cap - 1))] = 0; j += 1 }
@@ -118,6 +129,7 @@ final class RefRing {
     func read(_ out: UnsafeMutablePointer<Float>, _ n: Int, host: UInt64) {
         os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
         let idx = base == 0 ? Int64.min / 2 : index(host)
+        if base != 0 && idx + Int64(n) > writeIdx { readsAhead += 1 }
         for i in 0..<n {
             let j = idx + Int64(i)
             out[i] = (j < writeIdx && j >= writeIdx - Int64(cap)) ? buf[Int(j & Int64(cap - 1))] : 0
@@ -125,6 +137,8 @@ final class RefRing {
     }
 }
 let refRing = RefRing()
+
+let tapDriftCompensation = ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_TAP_DRIFT"] == "1"
 
 /// Global tap of every process's output (nothing muted, nothing rerouted) on
 /// a private aggregate device; its IOProc downmixes to mono, resamples to
@@ -171,7 +185,14 @@ final class OutputTap {
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outUID as String]],
-            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true,
+            // The tap and the aggregate's main sub-device are the SAME output
+            // device (one clock): drift compensation only adds a hunting
+            // varispeed to the reference. Live 2026-10-16 the reference fed to
+            // the canceller had mic coherence 0.01 above 300 Hz (vs 0.76 with a
+            // sample-exact reference on the same speakers/mic/level) and ERLE
+            // 1.5-2 dB — the signature of ~±1 ms jitter (reproduced offline).
+            // ALWAYS_CAPTURE_TAP_DRIFT=1 restores it.
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: tapDriftCompensation,
                                                kAudioSubTapUIDKey: d.uuid.uuidString]],
         ]
         st = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &aggID)
@@ -305,6 +326,8 @@ final class TapPipeline {
     var engaged = false
     // Stats for the 10 s summary log line.
     var framesRun = 0, framesPassed = 0, maxRefRms: Float = 0
+    // Echo reduction actually achieved (canceller in vs out energy while it runs).
+    var erleIn: Double = 0, erleOut: Double = 0
     init() {
         let env = ProcessInfo.processInfo.environment
         let tail = Int32(env["ALWAYS_CAPTURE_AEC_TAIL"] ?? "") ?? 4096
@@ -362,7 +385,12 @@ final class TapPipeline {
                         }
                     }
                 }
-                if ran != 0 { framesRun += 1 } else { framesPassed += 1 }
+                if ran != 0 {
+                    framesRun += 1
+                    var ei: Float = 0, eo: Float = 0
+                    for j in 0..<frame { ei += acc[off + j] * acc[off + j]; eo += out[j] * out[j] }
+                    erleIn += Double(ei); erleOut += Double(eo)
+                } else { framesPassed += 1 }
                 if ran != 0, let d = echoDump {
                     acc.withUnsafeBufferPointer { a in ref.withUnsafeBufferPointer { r in d.write(a.baseAddress! + off, r.baseAddress!, frame) } }
                 }
@@ -996,8 +1024,13 @@ if let tp = tapPipeline {
         if run > 0 {
             let tf = tp.tseFrames, tu = tp.tseUs
             tp.tseFrames = 0; tp.tseUs = 0
-            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB tse=%d frames %.0f us/frame", run, passed,
-                       20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc), tf, tf > 0 ? tu / Double(tf) : 0))
+            let erle = tp.erleOut > 0 ? 10 * log10(tp.erleIn / tp.erleOut) : 0
+            let micDb = 10 * log10(max(tp.erleIn / Double(max(run, 1) * 160), 1e-12))
+            tp.erleIn = 0; tp.erleOut = 0
+            let (md, ad, rs, ra) = refRing.takeStats()
+            log(String(format: "ref ring: write dev max %d avg %.1f samples, resyncs %d, mic frames reading past the ref %d", md, ad, rs, ra))
+            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB erle=%.1f dB mic=%.1f dBFS tse=%d frames %.0f us/frame drift_comp=%d", run, passed,
+                       20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc), erle, micDb, tf, tf > 0 ? tu / Double(tf) : 0, tapDriftCompensation ? 1 : 0))
         }
     }
     tapStatsTimer.resume()
