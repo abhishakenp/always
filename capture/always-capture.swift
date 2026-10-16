@@ -306,7 +306,7 @@ func extractorMtime() -> Date? {
 /// at most `ECHO_DUMP_MAX_SECS` per helper run. Local only.
 let ECHO_DUMP_MAX_SECS = 600.0
 final class EchoDump {
-    let mic: FileHandle, ref: FileHandle
+    let mic: FileHandle, ref: FileHandle, idx: FileHandle
     var frames = 0
     var buf = [Int16](repeating: 0, count: 320)
     init?() {
@@ -318,12 +318,18 @@ final class EchoDump {
         for ext in ["mic", "ref"] {
             FileManager.default.createFile(atPath: "\(stem).\(ext).s16", contents: nil, attributes: [.posixPermissions: 0o600])
         }
-        guard let m = FileHandle(forWritingAtPath: "\(stem).mic.s16"), let r = FileHandle(forWritingAtPath: "\(stem).ref.s16") else { return nil }
-        mic = m; ref = r
+        FileManager.default.createFile(atPath: "\(stem).idx", contents: nil, attributes: [.posixPermissions: 0o600])
+        guard let m = FileHandle(forWritingAtPath: "\(stem).mic.s16"), let r = FileHandle(forWritingAtPath: "\(stem).ref.s16"),
+              let ix = FileHandle(forWritingAtPath: "\(stem).idx") else { return nil }
+        mic = m; ref = r; idx = ix
         log("echo dump on: \(stem).{mic,ref}.s16 (max \(Int(ECHO_DUMP_MAX_SECS)) s)")
     }
     func write(_ m: UnsafePointer<Float>, _ r: UnsafePointer<Float>, _ n: Int) {
         guard Double(frames * n) / 16_000 < ECHO_DUMP_MAX_SECS else { return }
+        // Wall clock of every 50th frame (0.5 s): maps the dump onto the logs.
+        if frames % 50 == 0 {
+            idx.write("\(Int(Date().timeIntervalSince1970 * 1000)) \(frames * n)\n".data(using: .utf8)!)
+        }
         frames += 1
         for (h, p) in [(mic, m), (ref, r)] {
             for i in 0..<n { buf[i] = Int16(max(-32768, min(32767, p[i] * 32768))) }
@@ -331,7 +337,27 @@ final class EchoDump {
         }
     }
 }
-let echoDump: EchoDump? = EchoDump()
+// Checked every 10 s (stats timer): the flag appearing starts a dump, the
+// flag removed stops it — no helper restart needed.
+var echoDumpLock = os_unfair_lock()
+var echoDumpShared: EchoDump? = EchoDump()
+func echoDumpFlagPresent() -> Bool {
+    FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Always/tse/dump-echo").path)
+}
+func echoDumpRefresh() {
+    let want = echoDumpFlagPresent()
+    os_unfair_lock_lock(&echoDumpLock)
+    let have = echoDumpShared != nil
+    os_unfair_lock_unlock(&echoDumpLock)
+    if want && !have {
+        let d = EchoDump()
+        os_unfair_lock_lock(&echoDumpLock); echoDumpShared = d; os_unfair_lock_unlock(&echoDumpLock)
+    } else if !want && have {
+        os_unfair_lock_lock(&echoDumpLock); echoDumpShared = nil; os_unfair_lock_unlock(&echoDumpLock)
+        log("echo dump off (flag removed)")
+    }
+}
 
 /// Loads the extractor (nil when disabled, or weights/voiceprint missing).
 func loadExtractor() -> OpaquePointer? {
@@ -427,6 +453,7 @@ final class TapPipeline {
                     for j in 0..<frame { ei += acc[off + j] * acc[off + j]; eo += out[j] * out[j] }
                     erleIn += Double(ei); erleOut += Double(eo)
                 } else { framesPassed += 1 }
+                os_unfair_lock_lock(&echoDumpLock); let echoDump = echoDumpShared; os_unfair_lock_unlock(&echoDumpLock)
                 if ran != 0, let d = echoDump {
                     acc.withUnsafeBufferPointer { a in ref.withUnsafeBufferPointer { r in d.write(a.baseAddress! + off, r.baseAddress!, frame) } }
                 }
@@ -1054,6 +1081,7 @@ if let tp = tapPipeline {
     tapStatsTimer.schedule(deadline: .now() + 10, repeating: 10)
     tapStatsTimer.setEventHandler {
         tp.checkExtractorReload()
+        echoDumpRefresh()
         // Torn reads of these counters are harmless (diagnostics only).
         let run = tp.framesRun, passed = tp.framesPassed, peak = tp.maxRefRms
         tp.framesRun = 0; tp.framesPassed = 0; tp.maxRefRms = 0
