@@ -235,6 +235,47 @@ final class OutputTap {
     }
 }
 
+func extractorWeightsPath() -> String {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Always/tse/current.bin").path
+}
+func extractorMtime() -> Date? {
+    (try? FileManager.default.attributesOfItem(atPath: extractorWeightsPath()))?[.modificationDate] as? Date
+}
+/// Echo recordings for the extractor's training (OFF unless he opts in by
+/// creating Application Support/Always/tse/dump-echo): while the canceller
+/// is engaged, the raw 16 kHz mic and the reference it got, aligned exactly
+/// as the canceller saw them, go to tse/echo/<start>.{mic,ref}.s16 (0600),
+/// at most `ECHO_DUMP_MAX_SECS` per helper run. Local only.
+let ECHO_DUMP_MAX_SECS = 600.0
+final class EchoDump {
+    let mic: FileHandle, ref: FileHandle
+    var frames = 0
+    var buf = [Int16](repeating: 0, count: 320)
+    init?() {
+        let sup = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Always/tse")
+        guard FileManager.default.fileExists(atPath: sup.appendingPathComponent("dump-echo").path) else { return nil }
+        let dir = sup.appendingPathComponent("echo")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let stem = dir.appendingPathComponent("\(Int(Date().timeIntervalSince1970))").path
+        for ext in ["mic", "ref"] {
+            FileManager.default.createFile(atPath: "\(stem).\(ext).s16", contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        guard let m = FileHandle(forWritingAtPath: "\(stem).mic.s16"), let r = FileHandle(forWritingAtPath: "\(stem).ref.s16") else { return nil }
+        mic = m; ref = r
+        log("echo dump on: \(stem).{mic,ref}.s16 (max \(Int(ECHO_DUMP_MAX_SECS)) s)")
+    }
+    func write(_ m: UnsafePointer<Float>, _ r: UnsafePointer<Float>, _ n: Int) {
+        guard Double(frames * n) / 16_000 < ECHO_DUMP_MAX_SECS else { return }
+        frames += 1
+        for (h, p) in [(mic, m), (ref, r)] {
+            for i in 0..<n { buf[i] = Int16(max(-32768, min(32767, p[i] * 32768))) }
+            buf.withUnsafeBytes { h.write(Data($0.prefix(n * 2))) }
+        }
+    }
+}
+let echoDump: EchoDump? = EchoDump()
+
 /// Loads the extractor (nil when disabled, or weights/voiceprint missing).
 func loadExtractor() -> OpaquePointer? {
     if ProcessInfo.processInfo.environment["ALWAYS_CAPTURE_TSE"] == "0" { log("tse off (ALWAYS_CAPTURE_TSE=0)"); return nil }
@@ -281,6 +322,19 @@ final class TapPipeline {
     // tse/current.bin, conditioned on his voiceprint.json. Missing either,
     // or ALWAYS_CAPTURE_TSE=0: the canceller output passes unchanged.
     var tse: OpaquePointer?
+    // Hot reload: a newly promoted model (current.bin mtime changed) is
+    // loaded off the tap thread and swapped in at the next frame.
+    var tseLock = os_unfair_lock()
+    var tsePending: OpaquePointer?
+    var tseHasPending = false
+    var tseMtime: Date? = extractorMtime()
+    func checkExtractorReload() {
+        let m = extractorMtime()
+        guard m != tseMtime else { return }
+        tseMtime = m
+        let t = loadExtractor()
+        os_unfair_lock_lock(&tseLock); tsePending = t; tseHasPending = true; os_unfair_lock_unlock(&tseLock)
+    }
     var tseOut = [Float](repeating: 0, count: Int(AEC_FRAME))
     var tseActive = false
     var tseFrames = 0, tseUs: Double = 0
@@ -309,9 +363,18 @@ final class TapPipeline {
                     }
                 }
                 if ran != 0 { framesRun += 1 } else { framesPassed += 1 }
+                if ran != 0, let d = echoDump {
+                    acc.withUnsafeBufferPointer { a in ref.withUnsafeBufferPointer { r in d.write(a.baseAddress! + off, r.baseAddress!, frame) } }
+                }
                 if (ran != 0) != engaged {
                     engaged = ran != 0
                     log("aec \(engaged ? "engaged" : "bypassed") (tap reference \(engaged ? "playing" : "silent"))")
+                }
+                if tseHasPending {
+                    os_unfair_lock_lock(&tseLock)
+                    let old = tse; tse = tsePending; tsePending = nil; tseHasPending = false; tseActive = false
+                    os_unfair_lock_unlock(&tseLock)
+                    if let old { tse_free(old) }
                 }
                 if let tse {
                     if ran != 0 {
@@ -926,6 +989,7 @@ if let tp = tapPipeline {
     let tapStatsTimer = DispatchSource.makeTimerSource(queue: .main)
     tapStatsTimer.schedule(deadline: .now() + 10, repeating: 10)
     tapStatsTimer.setEventHandler {
+        tp.checkExtractorReload()
         // Torn reads of these counters are harmless (diagnostics only).
         let run = tp.framesRun, passed = tp.framesPassed, peak = tp.maxRefRms
         tp.framesRun = 0; tp.framesPassed = 0; tp.maxRefRms = 0
