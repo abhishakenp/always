@@ -711,9 +711,76 @@ fn media_excise_on() -> bool {
     }
     true
 }
-/// After a tail cut over other output, his continuation joins the same
-/// utterance if one of his windows lands within this long.
-const MEDIA_EXCISE_JOIN_SECS: f64 = 2.5;
+/// Replay A/B switch (tests only): `GATE_REPLAY_FIXED_EXCISE` restores the
+/// old fixed 2.5 s wait for his continuation after an excision (the
+/// 2026-10-16 20:18Z regression: every paste over Spotify 1.2-2.5 s late).
+fn fixed_excise_wait() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if std::env::var_os("GATE_REPLAY_FIXED_EXCISE").is_some() {
+        return Some(std::time::Duration::from_millis(2_500));
+    }
+    None
+}
+
+/// Frames of (end-of-turn state, samples, Silero prob) kept so an excision
+/// can rebuild HIS end-of-turn view from the excision point. A memory
+/// bound, not a decision: an excision point older than this is already
+/// that long past his last word, i.e. past any endpoint.
+const EXCISE_RING_FRAMES: usize = 200;
+
+/// A tail cut over other output (a film, Spotify, Iris): his verified
+/// head is kept, the foreign stretch dropped, and his turn ends exactly
+/// as it would with no media — on his OWN voice: `his` is the end-of-turn
+/// tracker as of the excision point, fed every later frame as not-his
+/// (the speaker model judged it foreign), so the learned EOT model and
+/// the unchanged endpoint decide, never the music.
+struct MediaExcise {
+    /// Head end (buffer index of this generation).
+    head: usize,
+    /// Buffer generation (`committed_samples`) the head belongs to.
+    generation: usize,
+    his: crate::always::eot::EotTracker,
+    /// Test A/B only (`fixed_excise_wait`): the old fixed deadline.
+    deadline: Option<std::time::Instant>,
+}
+
+/// How his turn ended during an excision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HisTurnEnd {
+    /// The learned EOT model judged his turn complete (score).
+    Eot(f32),
+    /// The unchanged no-media endpoint elapsed on his silence.
+    Endpoint,
+}
+
+/// One frame of his end-of-turn view during an excision: the frame is
+/// foreign (not his voice). `endpoint_raw_frames` = the no-media endpoint
+/// in raw frames after his last word; `veto` = the same vetoes as the live
+/// early cut; `hold` = Option held (never ends, as with no media).
+fn his_turn_step(
+    model: Option<&crate::always::eot::EotModel>,
+    his: &mut crate::always::eot::EotTracker,
+    samples: &[i16],
+    prob: f32,
+    endpoint_raw_frames: u32,
+    veto: Option<&'static str>,
+    hold: bool,
+) -> Option<HisTurnEnd> {
+    his.push(samples, prob, false);
+    if hold {
+        his.hold();
+        return None;
+    }
+    if let Some(m) = model
+        && let Some(score) = m.cut_now(his)
+    {
+        if veto.is_none() {
+            return Some(HisTurnEnd::Eot(score));
+        }
+        his.hold();
+    }
+    (his.raw_silence_frames() >= endpoint_raw_frames).then_some(HisTurnEnd::Endpoint)
+}
 
 pub fn record_utterance(
     cfg: &AlwaysConfig,
@@ -1356,6 +1423,10 @@ fn record_with_local_vad(
     let eot_model = crate::always::learn::eot_model();
     let learn_rows = crate::always::learn::enabled();
     let mut eot_tracker = crate::always::eot::EotTracker::default();
+    // Per in-speech frame: (tracker after it, its samples, its prob) — see
+    // `MediaExcise`.
+    let mut eot_ring: VecDeque<(crate::always::eot::EotTracker, Box<[i16]>, f32)> =
+        VecDeque::with_capacity(EXCISE_RING_FRAMES);
     let mut pause_log = crate::always::eot::PauseLog::default();
     // Some((raw silence frames, score)) when the learned cut ended it.
     let mut eot_early: Option<(u32, f32)> = None;
@@ -1543,9 +1614,9 @@ fn record_with_local_vad(
     // dropped, and capture goes on so his continuation joins the SAME
     // utterance (2026-10-16 04:38Z: "Okay, I..." was pasted + Return alone
     // while Iris talked over him, his continuation 0.9 s later became a
-    // second message). (head end, buffer generation, deadline): no window
-    // of his within MEDIA_EXCISE_JOIN_SECS → the head alone is the utterance.
-    let mut media_excise: Option<(usize, usize, std::time::Instant)> = None;
+    // second message). His turn then ends on HIS voice exactly as with no
+    // media (see `MediaExcise`): the music never adds a wait.
+    let mut media_excise: Option<MediaExcise> = None;
     // Live STT (Apple stream + Parakeet preview) waits while other output
     // plays until a window sounds like him: a film's dialogue otherwise
     // streamed through Apple STT nonstop (localspeechrecognition ~90% CPU,
@@ -1562,18 +1633,14 @@ fn record_with_local_vad(
     let mut gate_job: Option<GateJob> = None;
     macro_rules! gate_apply_verdict {
         () => {{
-            if let Some((head, generation, deadline)) = media_excise
-                && std::time::Instant::now() >= deadline
+            if media_excise
+                .as_ref()
+                .and_then(|ex| ex.deadline)
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
             {
-                let head = if generation == committed_samples { head.min(speech_samples.len()) } else { 0 };
-                tracing::info!(
-                    kept_secs = head as f64 / 16_000.0,
-                    trimmed_secs = (speech_samples.len() - head) as f64 / 16_000.0,
-                    "speaker_gate_excise_expired"
-                );
-                speech_samples.truncate(head);
-                speaker_timeline.excise(head, usize::MAX);
-                media_excise = None;
+                // Test A/B only (`fixed_excise_wait`); the end is logged
+                // and applied after the loop.
+                tracing::info!("speaker_gate_excise_expired");
                 break;
             }
             if let Some(score) = gate_job.as_ref().and_then(GateJob::poll) {
@@ -1620,13 +1687,8 @@ fn record_with_local_vad(
                                     confirmed_user_len = confirmed_user_len.min(cut);
                                     tail_fail_streak = 0;
                                     if media_excise.is_none() {
-                                        media_excise = Some((
-                                            cut,
-                                            committed_samples,
-                                            std::time::Instant::now()
-                                                + std::time::Duration::from_secs_f64(MEDIA_EXCISE_JOIN_SECS),
-                                        ));
                                         tracing::info!("speaker_gate_trail_excised");
+                                        excise_begin!(cut, len);
                                     }
                                 } else {
                                     break;
@@ -1659,6 +1721,7 @@ fn record_with_local_vad(
                         && job.kind == GateJobKind::Window
                         && score.is_some_and(|s| {
                             crate::always::speaker_trim::media_window_passes(s, job.media_similarity())
+                                && !crate::always::speaker_trim::cohort_vetoes_media_pass(s, job.cohort())
                         });
                     let media_pass = media_window_ok
                         && media_pass_at.is_some_and(|first| {
@@ -1721,6 +1784,10 @@ fn record_with_local_vad(
                             let tail_pass = if media_excise.is_some() {
                                 let film_pass = score.is_some_and(|s| {
                                     crate::always::speaker_trim::media_window_passes(s, film)
+                                        && !crate::always::speaker_trim::cohort_vetoes_media_pass(
+                                            s,
+                                            job.cohort(),
+                                        )
                                 });
                                 let now = std::time::Instant::now();
                                 let second = film_pass
@@ -1739,7 +1806,7 @@ fn record_with_local_vad(
                                 tail_fail_streak = 0;
                                 confirmed_user_len = job.len_at_submit;
                                 excise_film_pass = None;
-                                if let Some((head, generation, _)) = media_excise.take() {
+                                if let Some(MediaExcise { head, generation, .. }) = media_excise.take() {
                                     // Join: drop the foreign stretch between his head
                                     // and the window that is his again.
                                     let from = if generation == committed_samples { head } else { 0 };
@@ -1771,6 +1838,7 @@ fn record_with_local_vad(
                                             / 16_000.0,
                                         "speaker_gate_tail_cut"
                                     );
+                                    let tail_len_before = speech_samples.len();
                                     apply_speaker_tail_cut(
                                         &mut speech_samples,
                                         confirmed_user_len,
@@ -1784,13 +1852,8 @@ fn record_with_local_vad(
                                         // continuation (see `media_excise`).
                                         tail_fail_streak = 0;
                                         if media_excise.is_none() {
-                                            media_excise = Some((
-                                                confirmed_user_len,
-                                                committed_samples,
-                                                std::time::Instant::now()
-                                                    + std::time::Duration::from_secs_f64(MEDIA_EXCISE_JOIN_SECS),
-                                            ));
                                             tracing::info!("speaker_gate_tail_excised");
+                                            excise_begin!(confirmed_user_len, tail_len_before);
                                         }
                                     } else {
                                         break;
@@ -1944,6 +2007,104 @@ fn record_with_local_vad(
     } else {
         Some(cfg.lang.as_str())
     };
+    // The live early cut's vetoes for an utterance of `len` samples in this
+    // buffer generation (shared by the excision's end-of-turn so both
+    // decide alike).
+    macro_rules! eot_veto {
+        ($len:expr) => {{
+            if is_short_utterance_so_far(committed_samples, $len) {
+                Some("short")
+            } else if partial_hesitating
+                || utt_preview
+                    .open_text()
+                    .is_some_and(|p| partial_says_hesitating(&cfg.localization, &p))
+            {
+                Some("partial_hesitating")
+            } else if pause_text.is_some_and(|v| v != PauseText::Complete) {
+                Some("text_open")
+            } else if keyboard::is_option_held() {
+                Some("option_held")
+            } else {
+                None
+            }
+        }};
+    }
+    // The no-media endpoint for an utterance of `len` samples, in RAW frames
+    // after his last word: the silence window `endpoint_cut_frames` picks,
+    // plus the max-hold of Silero's probability it counts after.
+    macro_rules! his_endpoint_raw_frames {
+        ($len:expr) => {{
+            let base = if is_short_utterance_so_far(committed_samples, $len) {
+                short_silence_frames
+            } else {
+                silence_frames
+            };
+            let cut = endpoint_cut_frames(
+                !pause::is_consume_mode(),
+                base,
+                silence_frames,
+                hesitation_frames,
+                PauseVerdict { text_pending: false, text: pause_text, partial_hesitating },
+            );
+            (cut + smoothing_window - 1) as u32
+        }};
+    }
+    // Start an excision at `head` (buffer index) of a buffer that held
+    // `len_before` samples: rebuild his end-of-turn view at the head from
+    // `eot_ring` and replay the frames since (the speaker model judged
+    // them foreign). If his turn already ended there, end now.
+    macro_rules! excise_begin {
+        ($head:expr, $len_before:expr) => {{
+            let head: usize = $head;
+            let frame = (16 * FRAME_MS) as usize;
+            let n_after = ($len_before as usize).saturating_sub(head).div_ceil(frame);
+            let r = eot_ring.len();
+            let n = n_after.min(r.saturating_sub(1));
+            let mut his = if r > 0 {
+                eot_ring[r - 1 - n].0.clone()
+            } else {
+                crate::always::eot::EotTracker::default()
+            };
+            let endpoint = his_endpoint_raw_frames!(head);
+            let veto = eot_veto!(head);
+            let hold = keyboard::is_option_held();
+            let head_silence_ms = his.raw_silence_frames() * FRAME_MS;
+            let mut end = None;
+            for (_, s, p) in eot_ring.iter().skip(r - n) {
+                // Past his end, frames still count so `his` stays the real
+                // time since his last word (latency accounting).
+                if end.is_some() {
+                    his.push(s, *p, false);
+                    continue;
+                }
+                if let Some(e) = his_turn_step(
+                    eot_model.as_deref().filter(|_| !pause::is_consume_mode()),
+                    &mut his,
+                    s,
+                    *p,
+                    endpoint,
+                    veto,
+                    hold,
+                ) {
+                    end = Some(e);
+                }
+            }
+            let deadline = fixed_excise_wait().map(|w| std::time::Instant::now() + w);
+            tracing::info!(
+                head_silence_ms,
+                his_silence_ms = his.raw_silence_frames() * FRAME_MS,
+                foreign_ms = n_after as u32 * FRAME_MS,
+                endpoint_ms = endpoint * FRAME_MS,
+                end = ?end,
+                fixed_wait = deadline.is_some(),
+                "speaker_gate_excise_his_view"
+            );
+            media_excise = Some(MediaExcise { head, generation: committed_samples, his, deadline });
+            if end.is_some() && deadline.is_none() {
+                break;
+            }
+        }};
+    }
 
     loop {
         // A queued "My Voice" enrollment recording needs the mic and the
@@ -2219,21 +2380,7 @@ fn record_with_local_vad(
                     && !pause::is_consume_mode()
                 {
                     let probe_ms = eot_tracker.raw_silence_frames() * FRAME_MS;
-                    let veto = if is_short_utterance_so_far(committed_samples, speech_samples.len()) {
-                        Some("short")
-                    } else if partial_hesitating
-                        || utt_preview
-                            .open_text()
-                            .is_some_and(|p| partial_says_hesitating(&cfg.localization, &p))
-                    {
-                        Some("partial_hesitating")
-                    } else if pause_text.is_some_and(|v| v != PauseText::Complete) {
-                        Some("text_open")
-                    } else if keyboard::is_option_held() {
-                        Some("option_held")
-                    } else {
-                        None
-                    };
+                    let veto = eot_veto!(speech_samples.len());
                     tracing::info!(probe_ms, score, veto, version = model.version, "eot_early_cut");
                     if veto.is_none() {
                         eot_early = Some((eot_tracker.raw_silence_frames(), score));
@@ -2241,6 +2388,34 @@ fn record_with_local_vad(
                         break;
                     }
                     eot_tracker.hold();
+                }
+            }
+            if speaker_gate.is_some() {
+                if eot_ring.len() == EXCISE_RING_FRAMES {
+                    eot_ring.pop_front();
+                }
+                eot_ring.push_back((eot_tracker.clone(), samples.into(), last_prob));
+            }
+            // During an excision this frame is not his (no window of his
+            // has joined yet): his turn ends on his own voice, as with no
+            // media — the learned EOT model, else the unchanged endpoint.
+            if let Some(head) = media_excise.as_ref().map(|ex| ex.head) {
+                let endpoint = his_endpoint_raw_frames!(head);
+                let veto = eot_veto!(head);
+                let hold = keyboard::is_option_held();
+                let model = eot_model.as_deref().filter(|_| !pause::is_consume_mode());
+                let ex = media_excise.as_mut().expect("excision present");
+                if let Some(end) =
+                    his_turn_step(model, &mut ex.his, samples, last_prob, endpoint, veto, hold)
+                    && ex.deadline.is_none()
+                {
+                    tracing::info!(
+                        his_silence_ms = ex.his.raw_silence_frames() * FRAME_MS,
+                        endpoint_ms = endpoint * FRAME_MS,
+                        end = ?end,
+                        "speaker_gate_excise_his_turn_end"
+                    );
+                    break;
                 }
             }
         }
@@ -3092,17 +3267,26 @@ fn record_with_local_vad(
         }
     }
 
-    // Ended (silence, timeout) while an excision waited for his
-    // continuation: only his head is the utterance.
-    if let Some((head, generation, _)) = media_excise.take() {
+    // Ended during an excision (his turn ended on his voice, or silence /
+    // timeout): only his head is the utterance, and his last word is where
+    // his own end-of-turn view puts it — not the music's last loud frame.
+    if let Some(MediaExcise { head, generation, his, .. }) = media_excise.take() {
         let head = if generation == committed_samples { head.min(speech_samples.len()) } else { 0 };
+        let his_silence_ms = his.raw_silence_frames() * FRAME_MS;
         tracing::info!(
             kept_secs = head as f64 / 16_000.0,
             trimmed_secs = (speech_samples.len() - head) as f64 / 16_000.0,
+            his_silence_ms,
             "speaker_gate_excise_ended"
         );
         speech_samples.truncate(head);
         speaker_timeline.excise(head, usize::MAX);
+        if his.seen_voice()
+            && let Some(t) = frame_captured_at
+                .checked_sub(std::time::Duration::from_millis(his_silence_ms as u64))
+        {
+            last_voiced_at = Some(t);
+        }
     }
     // "Speech end" for latency accounting: the capture time of the frame
     // on which the final-silence cut fired — i.e. when the user's silence
@@ -5536,5 +5720,136 @@ mod tail_session_tests {
         assert!(!retire_for_tail(&mut slot, None, &[0; 10]));
         assert_eq!(slot.as_ref().unwrap().id, 2);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// Music trailing his utterance never extends it: during an excision his
+/// turn ends on HIS voice exactly where it would with no media
+/// (2026-10-16 20:18-20:20Z: every paste over Spotify waited a fixed
+/// 1.2-2.5 s after the trail cut).
+#[cfg(test)]
+mod excise_his_turn_tests {
+    use super::{HisTurnEnd, his_turn_step};
+    use crate::always::eot::{EotModel, EotProbe, EotTracker, NF};
+
+    const FRAME: usize = 480;
+
+    /// A voiced 30 ms frame of his (150 Hz harmonic).
+    fn his_frame(i: usize) -> Vec<i16> {
+        (0..FRAME)
+            .map(|n| {
+                let t = (i * FRAME + n) as f32 / 16_000.0;
+                (6_000.0 * (2.0 * std::f32::consts::PI * 150.0 * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    /// A loud music frame (chord, louder than his voice).
+    fn music_frame(i: usize) -> Vec<i16> {
+        (0..FRAME)
+            .map(|n| {
+                let t = (i * FRAME + n) as f32 / 16_000.0;
+                let v: f32 = [220.0f32, 277.0, 330.0, 440.0]
+                    .iter()
+                    .map(|f| (2.0 * std::f32::consts::PI * f * t).sin())
+                    .sum();
+                (5_000.0 * v) as i16
+            })
+            .collect()
+    }
+
+    /// His tracker after 1.2 s of his voice (the excision head).
+    fn after_his_voice() -> EotTracker {
+        let mut t = EotTracker::default();
+        for i in 0..40 {
+            t.push(&his_frame(i), 0.95, true);
+        }
+        t
+    }
+
+    fn always_done_at(probe_frames: u32) -> EotModel {
+        EotModel {
+            probes: vec![EotProbe {
+                probe_frames,
+                mean: vec![0.0; NF],
+                std: vec![1.0; NF],
+                w: vec![0.0; NF],
+                b: 0.0,
+                threshold: 0.0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Frames of music after his head until his turn ends (None = never).
+    fn frames_to_end(
+        model: Option<&EotModel>,
+        endpoint: u32,
+        veto: Option<&'static str>,
+        hold: bool,
+        max: usize,
+    ) -> Option<(usize, HisTurnEnd)> {
+        let mut his = after_his_voice();
+        for i in 0..max {
+            // Music: Silero-voiced and louder than him — still not his voice.
+            if let Some(e) = his_turn_step(model, &mut his, &music_frame(i), 0.95, endpoint, veto, hold)
+            {
+                return Some((i + 1, e));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn music_after_his_last_word_ends_at_the_no_media_endpoint() {
+        // No model: the unchanged endpoint (29 raw frames = 20 + hold 10 - 1),
+        // counted from his last word, exactly as in a quiet room.
+        let mut quiet = after_his_voice();
+        let quiet_end = (1..=200)
+            .find(|_| {
+                quiet.push(&[0; FRAME], 0.01, false);
+                quiet.raw_silence_frames() >= 29
+            })
+            .unwrap();
+        assert_eq!(frames_to_end(None, 29, None, false, 400), Some((quiet_end, HisTurnEnd::Endpoint)));
+        assert_eq!(quiet_end, 29);
+    }
+
+    #[test]
+    fn the_learned_end_of_turn_decides_over_music() {
+        let m = always_done_at(6);
+        let Some((n, HisTurnEnd::Eot(_))) = frames_to_end(Some(&m), 29, None, false, 400) else {
+            panic!("model's early end expected");
+        };
+        assert_eq!(n, 6, "ends at the model's probe, ~180 ms after his last word");
+    }
+
+    #[test]
+    fn a_vetoed_early_end_falls_through_to_the_endpoint_not_the_music() {
+        let m = always_done_at(6);
+        assert_eq!(
+            frames_to_end(Some(&m), 29, Some("short"), false, 400),
+            Some((29, HisTurnEnd::Endpoint))
+        );
+    }
+
+    #[test]
+    fn option_held_never_ends_as_with_no_media() {
+        assert_eq!(frames_to_end(None, 29, None, true, 400), None);
+    }
+
+    #[test]
+    fn an_excision_found_late_ends_at_once() {
+        // The trail cut lands 1.7 s (57 frames) after his head: replaying
+        // those frames already passes his endpoint, so no frame is waited.
+        let mut his = after_his_voice();
+        let mut ended_at = None;
+        for i in 0..57 {
+            if his_turn_step(None, &mut his, &music_frame(i), 0.95, 29, None, false).is_some() {
+                ended_at = Some(i + 1);
+                break;
+            }
+        }
+        assert_eq!(ended_at, Some(29), "decided inside the already-captured stretch");
     }
 }

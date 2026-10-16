@@ -451,6 +451,15 @@ pub fn media_window_passes(score: f32, media_similarity: Option<f32>) -> bool {
         .is_some_and(|c| score >= MEDIA_PASS_MIN_SCORE && score - c >= MEDIA_PASS_MARGIN)
 }
 
+/// A film-rule pass that sounds more like the impostor just rejected than
+/// like him is that impostor, not him: with no wait after his turn, the
+/// video voice cut from his utterance opens the next recording, where the
+/// film cohort may not hold it yet (synthetic replay: a foreign voice at
+/// 0.31-0.38 to his profile, 0.77-0.91 to the impostor, was verified).
+pub fn cohort_vetoes_media_pass(score: f32, cohort: Option<f32>) -> bool {
+    cohort.is_some_and(|c| c >= score + VETO_MARGIN)
+}
+
 /// A window that clears the gate threshold only barely, while sounding
 /// more like the impostor just rejected, is not a verification.
 pub fn cohort_vetoes_pass(score: f32, cohort: Option<f32>, threshold: f32) -> bool {
@@ -764,6 +773,13 @@ mod tests {
             media_admit(&mut c, t + Duration::from_secs(4 + 2 * k), &e, 0.0);
         }
         assert_eq!(c.len(), MEDIA_COHORT_MAX);
+    }
+
+    #[test]
+    fn a_film_pass_closer_to_the_rejected_impostor_is_vetoed() {
+        assert!(cohort_vetoes_media_pass(0.38, Some(0.89)));
+        assert!(!cohort_vetoes_media_pass(0.38, Some(0.20)), "his window, film voice cohort far");
+        assert!(!cohort_vetoes_media_pass(0.38, None), "no impostor heard: film rule decides");
     }
 
     #[test]
