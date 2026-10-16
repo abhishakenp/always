@@ -88,6 +88,11 @@ impl MicrophoneMonitor {
 /// touches a microphone (observed 2026-10-13: `microphone_auto_paused apps:
 /// music-tap`, pausing Always for 25 minutes and pre-empting a dictation).
 pub(crate) const IRIS_HELPER_BASENAMES: &[&str] = &[
+    // Iris's ducking tap (mutes other apps while she speaks and replays
+    // them): same private-aggregate process tap. 2026-10-16 09:21:50Z it
+    // paused Always every time Iris spoke — "So I'm going out for a bit..."
+    // was pre-empted mid-sentence (capture_preempted_by_mic_conflict).
+    "duck-tap",
     "music-tap",
     "caption-tap",
     "hud-tap",
@@ -1245,6 +1250,7 @@ mod tests {
     #[test]
     fn mic_iris_helpers_are_ignored() {
         for name in [
+            "duck-tap",
             "music-tap",
             "caption-tap",
             "sense-probe",
