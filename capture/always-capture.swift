@@ -441,6 +441,7 @@ final class TapPipeline {
     /// Linear pre-gain applied to the mic before the canceller (and to the dump's mic).
     var micGain: Float = 1
     var stereoAec = true
+    var echoSuppress: Int32 = 0, echoSuppressActive: Int32 = 0
     var aecUs: Double = 0, aecFrames = 0
     var refL = [Float](repeating: 0, count: Int(AEC_FRAME)), refR = [Float](repeating: 0, count: Int(AEC_FRAME))
     init() {
@@ -457,7 +458,13 @@ final class TapPipeline {
         micGain = powf(10, pre / 20)
         // Two-speaker canceller (left/right reference) unless ALWAYS_CAPTURE_STEREO_AEC=0.
         stereoAec = env["ALWAYS_CAPTURE_STEREO_AEC"] != "0"
-        aec = aec_new_mc(tail, 0, 0, pre, stereoAec ? 2 : 1)
+        // Residual echo suppressor depth (speex echo_suppress / echo_suppress_active, negative dB; 0 = speex
+        // default -40/-15; a positive value turns the suppressor off). Measured on his accepted speech mixed
+        // into the 2026-10-17 calibration: the default costs his far voice 2-14 dB, -15/-6 costs 2-8 dB but
+        // leaves up to 9 dB more echo; gate scores within 0.03 either way. Default unchanged.
+        echoSuppress = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS"] ?? "") ?? 0
+        echoSuppressActive = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS_ACTIVE"] ?? "") ?? 0
+        aec = aec_new_mc(tail, echoSuppress, echoSuppressActive, pre, stereoAec ? 2 : 1)
         let g0 = Float(env["ALWAYS_CAPTURE_GAIN_DB"] ?? "") ?? 22
         agc = aec_agc_new(-26, 35 - pre, max(0, g0 - pre))
         tse = loadExtractor()
@@ -1169,9 +1176,9 @@ if let tp = tapPipeline {
             tp.erleIn = 0; tp.erleOut = 0
             let (md, ad, rs, ra) = refRing.takeStats()
             log(String(format: "ref ring: write dev max %d avg %.1f samples, resyncs %d, mic frames reading past the ref %d", md, ad, rs, ra))
-            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB erle=%.1f dB mic=%.1f dBFS tse=%d frames %.0f us/frame drift_comp=%d mic_peak=%.1f dBFS mic_full_scale=%d frame_us=%.0f stereo=%d", run, passed,
+            log(String(format: "aec stats run=%d passed=%d ref_max=%.1f dBFS gain=%.1f dB erle=%.1f dB mic=%.1f dBFS tse=%d frames %.0f us/frame drift_comp=%d mic_peak=%.1f dBFS mic_full_scale=%d frame_us=%.0f stereo=%d es=%d/%d pregain=%.0f dB", run, passed,
                        20 * log10f(max(peak, 1e-6)), aec_agc_gain_db(tp.agc), erle, micDb, tf, tf > 0 ? tu / Double(tf) : 0, tapDriftCompensation ? 1 : 0,
-                       20 * log10f(max(mpk, 1e-6)), mover, aus, tp.stereoAec ? 1 : 0))
+                       20 * log10f(max(mpk, 1e-6)), mover, aus, tp.stereoAec ? 1 : 0, tp.echoSuppress, tp.echoSuppressActive, 20 * log10f(tp.micGain)))
         }
     }
     tapStatsTimer.resume()
