@@ -1388,7 +1388,9 @@ fn deliver_paste(
         // immediate-Return path sees the buffer for clearing.
         pause::dictation_buffer_set(buffer_text.clone());
         let configured = per_app::effective_auto_enter_delay_ms(cfg.auto_enter_delay_ms);
-        let delay = configured.max(commit_hold_ms(&cfg.localization, &buffer_text));
+        // His auto-Enter setting is authoritative: no hidden commit hold
+        // on top of it (0 means Return right after the paste).
+        let delay = configured;
         auto_enter_countdown::schedule(rt, delay);
         if delay == 0 {
             // 0-delay presses Return synchronously inside schedule().
