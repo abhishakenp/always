@@ -821,6 +821,9 @@ while True:
         let done = std::path::PathBuf::from(format!("{stem}.done"));
         let _ = std::fs::remove_file(&done);
         let apple = std::env::var("SESSION_REPLAY_STT").as_deref() == Ok("apple");
+        // `parakeet`: real file passes on the Parakeet helper, for a test
+        // binary without the Speech grant (TCC aborts it on Apple STT).
+        let parakeet = std::env::var("SESSION_REPLAY_STT").as_deref() == Ok("parakeet");
         // SAFETY: set before the recorder spawns; this test runs alone.
         unsafe {
             std::env::set_var("ALWAYS_CAPTURE_BIN", &capture);
@@ -846,6 +849,10 @@ while True:
                 crate::always::stt_apple::AppleTranscriber::new(Some(cfg.lang.clone()))
                     .expect("Apple STT available"),
             )
+        } else if parakeet {
+            cfg.transcriber_backend = crate::stt_dispatch::TranscriberBackendChoice::Groq;
+            cfg.stt_live_preview = false;
+            Arc::new(ParakeetFileTranscriber::spawn())
         } else {
             cfg.transcriber_backend = crate::stt_dispatch::TranscriberBackendChoice::Groq;
             cfg.stt_live_preview = false;
