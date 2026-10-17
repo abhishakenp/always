@@ -440,8 +440,8 @@ final class TapPipeline {
     var erleIn: Double = 0, erleOut: Double = 0
     /// Linear pre-gain applied to the mic before the canceller (and to the dump's mic).
     var micGain: Float = 1
-    var stereoAec = true
-    var echoSuppress: Int32 = 0, echoSuppressActive: Int32 = 0
+    let stereoAec = true
+    let echoSuppress: Int32 = -40, echoSuppressActive: Int32 = -1
     var aecUs: Double = 0, aecFrames = 0
     var refL = [Float](repeating: 0, count: Int(AEC_FRAME)), refR = [Float](repeating: 0, count: Int(AEC_FRAME))
     init() {
@@ -454,19 +454,16 @@ final class TapPipeline {
         // float mic peaks at +8.5 dBFS (probe 2026-10-16, 1.4% of samples
         // over full scale) and the int16 conversion hard-clipped it — the
         // driver does not. The AGC below starts 12 dB higher to compensate.
-        let pre = Float(env["ALWAYS_CAPTURE_PREGAIN_DB"] ?? "") ?? -12
+        let pre: Float = -12
         micGain = powf(10, pre / 20)
-        // Two-speaker canceller (left/right reference) unless ALWAYS_CAPTURE_STEREO_AEC=0.
-        stereoAec = env["ALWAYS_CAPTURE_STEREO_AEC"] != "0"
+        // Two-speaker canceller (left/right reference).
         // Residual echo suppressor depth (speex echo_suppress / echo_suppress_active, negative dB; a positive
         // value turns the suppressor off). Speex blends the two by its speech probability, so "active" is what
         // HIS speech gets. Measured 2026-10-17 on the calibration recording with his accepted speech mixed in
         // (12 clips, near -14.7 / far -22.9 dBFS, volumes 50/75/100, music + film + Iris singly and together):
         // speex default -40/-15 cost his far voice 2.3-11.9 dB; -40/-1 costs 1.2-7.8 dB while still removing
         // 13.7 dB of echo on average (default 16.6, off 7.2); mean gate score near 0.423 -> 0.435, far 0.279 -> 0.298;
-        // echo-only windows never above 0.26 (gate 0.5) for any setting.
-        echoSuppress = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS"] ?? "") ?? -40
-        echoSuppressActive = Int32(env["ALWAYS_CAPTURE_ECHO_SUPPRESS_ACTIVE"] ?? "") ?? -1
+        // echo-only windows never above 0.26 (gate 0.5) for any setting. -> -40/-1 (`echoSuppress*`).
         aec = aec_new_mc(tail, echoSuppress, echoSuppressActive, pre, stereoAec ? 2 : 1)
         let g0 = Float(env["ALWAYS_CAPTURE_GAIN_DB"] ?? "") ?? 22
         agc = aec_agc_new(-26, 35 - pre, max(0, g0 - pre))
