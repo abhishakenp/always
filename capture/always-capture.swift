@@ -32,6 +32,7 @@
 //            never make the user's video quieter)
 // Exits when stdout closes (EPIPE) or the parent process dies.
 
+import Accelerate
 import AVFoundation
 import CoreAudio
 import Foundation
@@ -169,6 +170,14 @@ final class OutputTap {
     var stereo = false
     var rate: Double = 0
     var rateChecked = false, rateT0: UInt64 = 0, rateFrames = 0
+    /// Digital silence on the output (nothing playing): input frames of it in a
+    /// row, and the fractional 16 kHz sample carried between skipped callbacks.
+    var silentFrames = 0
+    var silentFrac: Double = 0
+    let zeros = [Float](repeating: 0, count: 8192)
+    /// Silent input frames that flush the resamplers' filter memory before
+    /// resampling is skipped (quality 4 at 192→16 kHz is 768 taps; generous).
+    static let silenceFlushFrames = 4096
 
     func start() -> String? {
         var outDev = AudioObjectID(kAudioObjectUnknown)
@@ -291,6 +300,33 @@ final class OutputTap {
                 }
             }
             rateFrames += n
+        }
+        // Nothing playing: the tap still delivers every buffer (all zeros) at
+        // the output rate, and resampling zeros through two sinc resamplers
+        // was this helper's whole idle cost (CPU sweep 2026-10-17: ~2% of a
+        // core, `resampler_basic_direct_single`). Once the filters have been
+        // flushed by real zeros, write the zeros the resamplers would have
+        // produced (same count over time, same host-time position) without
+        // running them. Exact zero only — any sound at all takes the full path.
+        var peak: Float = 0
+        mono.withUnsafeBufferPointer { vDSP_maxmgv($0.baseAddress!, 1, &peak, vDSP_Length(n)) }
+        if peak == 0 && stereo {
+            sideIn.withUnsafeBufferPointer { vDSP_maxmgv($0.baseAddress!, 1, &peak, vDSP_Length(n)) }
+        }
+        if peak == 0 {
+            let flushed = silentFrames >= OutputTap.silenceFlushFrames
+            silentFrames = min(silentFrames + n, Int.max / 2)
+            if flushed {
+                silentFrac += Double(n) * 16_000 / rate
+                let out = min(Int(silentFrac), zeros.count)
+                silentFrac -= Double(out)
+                let host = (inTime.pointee.mFlags.contains(.hostTimeValid)) ? inTime.pointee.mHostTime : mach_absolute_time()
+                if out > 0 { zeros.withUnsafeBufferPointer { refRing.write($0.baseAddress!, nil, out, host: host) } }
+                return
+            }
+        } else {
+            silentFrames = 0
+            silentFrac = 0
         }
         var inLen = UInt32(n), outLen = UInt32(res.count)
         mono.withUnsafeBufferPointer { mp in
