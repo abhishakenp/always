@@ -222,6 +222,19 @@ fn speaker_gate_allows_stt(requested: bool, speaker_verified: bool) -> bool {
     !requested || speaker_verified
 }
 
+/// May the live preview's words reach consumers (Iris) as his? Only once the
+/// speaker is VERIFIED (or the gate is off). A live-STT *candidate* (a window
+/// scoring >= STT_CANDIDATE_SCORE over media) opens the recogniser early so his
+/// words are ready the moment he verifies, but it is not verification: logged
+/// 2026-10-17 candidates at 0.30-0.40 were Iris's own spoken brief ("being
+/// built and tested ...", "yesterday about 15:05 ..."), the room, and a
+/// non-enrolled voice - all streamed to Iris as his partials, where a mid-speech
+/// claim/release flips Always's paste. Candidate text stays Pending (dim GUI
+/// only) and is re-sent as verified the instant he verifies.
+fn preview_is_routable(requested: bool, speaker_verified: bool) -> bool {
+    !requested || speaker_verified
+}
+
 fn speaker_gate_ctx(cfg: &AlwaysConfig) -> SpeakerGateContext {
     if !cfg.speaker_gate_enabled {
         return SpeakerGateContext {
@@ -1625,7 +1638,6 @@ fn record_with_local_vad(
     let mut stt_decided = false;
     let mut stt_deferred = false;
     let mut stt_catchup = false;
-    let mut stt_candidate = false;
     let mut excise_film_pass: Option<std::time::Instant> = None;
     // At most one speaker check in flight, scored off this thread (see
     // `GateJob`). Its verdict is applied by `gate_apply_verdict!` on the
@@ -1745,7 +1757,6 @@ fn record_with_local_vad(
                     {
                         stt_deferred = false;
                         stt_catchup = true;
-                        stt_candidate = true;
                         tracing::info!(score = ?score, "stt_live_started_on_candidate");
                     }
                     // Quiet-room early "heard you": the first windows (0.3-0.5 s of
@@ -2492,7 +2503,7 @@ fn record_with_local_vad(
                         utt_preview.start(
                             session,
                             &cfg.lang,
-                            !speaker_gate_requested || speaker_checked || stt_candidate,
+                            preview_is_routable(speaker_gate_requested, speaker_checked),
                         );
                         if stt_catchup {
                             // Opened late (deferred over media): everything he
@@ -2626,7 +2637,7 @@ fn record_with_local_vad(
                 if let Some(session) = stream_session.as_mut() {
                     session.feed(samples);
                 }
-                utt_preview.frame(samples, true, !speaker_gate_requested || speaker_checked || stt_candidate);
+                utt_preview.frame(samples, true, preview_is_routable(speaker_gate_requested, speaker_checked));
                 // Same anchor refresh for the case where we were already in
                 // speech (consecutive_speech overflows min_speech_frames
                 // immediately) — keep the watchdog clock pinned to "right
@@ -4491,7 +4502,7 @@ mod tests {
         chunked_tail_has_voice, early_voice_frame_ok, extended_silence_frames, fast_energy_check,
         fast_normalized_energy, is_short_utterance_so_far, looks_mid_sentence,
         normal_silence_frames, normalized_energy, speaker_gate_allows_score,
-        speaker_gate_allows_stt, speaker_gate_allows_transcription,
+        speaker_gate_allows_stt, speaker_gate_allows_transcription, preview_is_routable,
         speaker_gate_dependencies_ready, voice_activity_energy_threshold,
     };
     use crate::always::AlwaysConfig;
@@ -5339,6 +5350,11 @@ mod tests {
         assert!(speaker_gate_allows_stt(false, false));
         assert!(speaker_gate_allows_stt(true, true));
         assert!(!speaker_gate_allows_stt(true, false));
+        // A candidate (score 0.30-0.40 over media) is not verification: logged 04:55:51Z/04:58:32Z
+        // previews of Iris's own voice (candidate 0.32 / 0.40) must stay Pending.
+        assert!(!preview_is_routable(true, false));
+        assert!(preview_is_routable(true, true));
+        assert!(preview_is_routable(false, false));
     }
 
     #[test]
