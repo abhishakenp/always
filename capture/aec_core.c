@@ -148,6 +148,21 @@ void aec_agc_process(aec_agc *g, float *x, int speech_ok) {
         else g->gain_db = want;
     }
     float lin = powf(10, g->gain_db / 20);
+    float raw_pk = 0;
+    for (int i = 0; i < AEC_FRAME; i++) { float a = fabsf(x[i]); if (a > raw_pk) raw_pk = a; }
+    // Fast-attack onset guard (any frame, `speech_ok` or not): a sudden loud onset (a shout after
+    // quiet) meets the gain set for the quiet — measured 2026-10-17 at +23 dB against a signal that
+    // needed ≤ 0 — and the limiter alone then cuts ~29 dB every frame with a 100 ms release
+    // (pumping, THD+N −8.6 dB in agc_shout_eval). When the limiter WOULD cut, take that cut into the
+    // gain itself at once (one step down, floor 0 dB) and let the speech level follow the loud frame
+    // immediately, so the slow tracker above does not climb straight back into the limiter.
+    if (raw_pk * lin > 0.89f) {
+        float want_db = 20 * log10f(0.89f / raw_pk);
+        g->gain_db = want_db > 0 ? want_db : 0;
+        if (rms > g->speech) g->speech = rms;
+        lin = powf(10, g->gain_db / 20);
+        g->lim = 1;
+    }
     // Peak limiter at −1 dBFS: instant attack, ~100 ms release.
     float pk = 0;
     for (int i = 0; i < AEC_FRAME; i++) { float a = fabsf(x[i]) * lin; if (a > pk) pk = a; }
