@@ -437,6 +437,41 @@ pub fn media_window(embedding: &[f32], score: f32) -> Option<f32> {
     sim
 }
 
+/// A cohort owned by the caller, for offline replays that must not share
+/// (or wait on the wall clock of) the process-wide ones.
+#[cfg(test)]
+pub(crate) type CohortState = VecDeque<(Instant, Vec<f32>)>;
+
+/// [`media_window`] on a caller-owned cohort at `now`; also returns whether
+/// the window was admitted.
+#[cfg(test)]
+pub(crate) fn media_window_in(
+    c: &mut CohortState,
+    now: Instant,
+    e: &[f32],
+    score: f32,
+) -> (Option<f32>, bool) {
+    let sim = similarity(c, now, e);
+    (sim, media_admit(c, now, e, score))
+}
+
+/// [`remember_foreign`] (no own-voice pool) on a caller-owned cohort.
+#[cfg(test)]
+pub(crate) fn remember_foreign_in(
+    c: &mut CohortState,
+    now: Instant,
+    e: &[f32],
+    score: f32,
+) -> bool {
+    admit(c, now, e.to_vec(), score, &[])
+}
+
+/// [`cohort_similarity`] on a caller-owned cohort.
+#[cfg(test)]
+pub(crate) fn cohort_similarity_in(c: &mut CohortState, now: Instant, e: &[f32]) -> Option<f32> {
+    similarity(c, now, e)
+}
+
 /// After he verified over a film, a tail window is still his while it is
 /// no closer to the film than to him (and not near-silent noise).
 pub const MEDIA_TAIL_MIN_SCORE: f32 = 0.15;

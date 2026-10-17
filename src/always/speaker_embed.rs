@@ -103,11 +103,54 @@ pub fn ensure_model() -> Result<PathBuf> {
 /// WeSpeaker ResNet34 speaker-embedding extractor.
 ///
 /// `Session::run` takes `&mut self` in ort 2.0.0-rc.12, so the session
-/// sits behind a `Mutex` — same shape as `SileroVad`. Inference cost
-/// is well under 100 ms on Apple Silicon for a 15 s utterance, paid
-/// once per utterance (not per frame).
+/// sits behind a `Mutex` — same shape as `SileroVad`. Inference runs
+/// once per ladder window / whole-utterance check (see `coreml_cpu_ep`
+/// for its cost).
 pub struct SpeakerEmbedder {
     session: Mutex<Session>,
+    /// The plain ORT CPU session, built only if the CoreML session ever
+    /// returns a non-finite embedding (it is then used for that call).
+    cpu_fallback: Mutex<Option<Session>>,
+}
+
+/// ORT's own CPU kernels, one thread — the original speaker session.
+fn cpu_session_builder() -> Result<ort::session::builder::SessionBuilder> {
+    // rc.12 builder errors carry non-Send/Sync payloads and won't
+    // convert to anyhow via `?` — normalise to plain `ort::Error`
+    // first (same workaround vad-rs uses).
+    Ok(Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| -> ort::Error { e.into() })?
+        .with_intra_threads(1)
+        .map_err(|e| -> ort::Error { e.into() })?
+        .with_inter_threads(1)
+        .map_err(|e| -> ort::Error { e.into() })?)
+}
+
+/// The speaker model runs on CoreML's CPU backend (fp32, Accelerate),
+/// not ORT's CPU kernels: the same embedding (cosine to the old one
+/// >= 0.9999988, scores within 7.5e-7) for a sixth to a ninth of the CPU
+/// (`embed_cost_probe`, 2026-10-17, process CPU per 1.5 s ladder window:
+/// film scenes 169.8 → 20.0 ms, his utterances 132.9 → 17.5 ms; whole-
+/// utterance inputs 260.6 → 27.1 ms). With a film playing the ladder scores
+/// a window every ~0.3 s, which was the daemon's 30-37 % CPU.
+/// `vad::embed_decision_equality` replays both on the same windows: no
+/// gate decision differs.
+///
+/// - `NeuralNetwork`, not `MLProgram`: ORT 1.24's MLProgram path returns
+///   NaN for this graph (its std-pooling tail), on every compute unit.
+/// - `CPUOnly`, not GPU/ANE: those run fp16 and move scores by up to
+///   ~3e-3 — enough to flip a window that sits at a threshold.
+/// - A non-finite embedding is never used: that call re-runs on ORT's CPU
+///   kernels (the old path), see `SpeakerEmbedder::embed_feats`.
+/// - If CoreML cannot be registered at all, ORT falls back to its CPU
+///   kernels — the old behaviour.
+fn coreml_cpu_ep() -> ort::ep::ExecutionProviderDispatch {
+    use ort::ep::coreml::{ComputeUnits, ModelFormat};
+    ort::ep::CoreML::default()
+        .with_model_format(ModelFormat::NeuralNetwork)
+        .with_compute_units(ComputeUnits::CPUOnly)
+        .build()
 }
 
 impl SpeakerEmbedder {
@@ -116,21 +159,42 @@ impl SpeakerEmbedder {
     /// paths; the runtime gate treats a missing model as "gate off".
     pub fn new() -> Result<Self> {
         let path = model_path()?;
-        // rc.12 builder errors carry non-Send/Sync payloads and won't
-        // convert to anyhow via `?` — normalise to plain `ort::Error`
-        // first (same workaround vad-rs uses).
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| -> ort::Error { e.into() })?
-            .with_intra_threads(1)
-            .map_err(|e| -> ort::Error { e.into() })?
-            .with_inter_threads(1)
-            .map_err(|e| -> ort::Error { e.into() })?
+        let builder = cpu_session_builder()?;
+        // Replay A/B only: `SPK_FORCE_ORT_CPU=1` builds the previous session.
+        #[cfg(test)]
+        let builder = if std::env::var_os("SPK_FORCE_ORT_CPU").is_some() {
+            builder
+        } else {
+            builder
+                .with_execution_providers([coreml_cpu_ep()])
+                .map_err(|e| -> ort::Error { e.into() })?
+        };
+        #[cfg(not(test))]
+        let builder = builder
+            .with_execution_providers([coreml_cpu_ep()])
+            .map_err(|e| -> ort::Error { e.into() })?;
+        let mut builder = builder;
+        let session = builder
             .commit_from_file(&path)
             .with_context(|| format!("loading speaker model from {}", path.display()))?;
         Ok(Self {
             session: Mutex::new(session),
+            cpu_fallback: Mutex::new(None),
         })
+    }
+
+    /// Run the model once on `session`; the raw (un-normalised) output.
+    fn run(session: &mut Session, feats: Vec<f32>) -> Result<Vec<f32>> {
+        let num_frames = feats.len() / NUM_MEL_BINS as usize;
+        let tensor = ndarray::Array3::from_shape_vec((1, num_frames, NUM_MEL_BINS as usize), feats)
+            .context("fbank tensor shape")?;
+        let value = Value::from_array(tensor)?;
+        let outputs = session.run(ort::inputs!["feats" => value])?;
+        let (_, raw) = outputs
+            .get("embs")
+            .context("model output `embs` missing")?
+            .try_extract_tensor::<f32>()?;
+        Ok(raw.to_vec())
     }
 
     /// Compute the L2-normalised 256-dim embedding of an utterance.
@@ -142,26 +206,35 @@ impl SpeakerEmbedder {
                 samples.len()
             );
         }
-        let feats = compute_fbank_cmn(samples)?;
-        let num_frames = feats.len() / NUM_MEL_BINS as usize;
+        self.embed_feats(compute_fbank_cmn(samples)?)
+    }
 
-        let tensor = ndarray::Array3::from_shape_vec((1, num_frames, NUM_MEL_BINS as usize), feats)
-            .context("fbank tensor shape")?;
-        let value = Value::from_array(tensor)?;
-
-        let mut session = self.session.lock();
-        let outputs = session.run(ort::inputs!["feats" => value])?;
-        let (_, raw) = outputs
-            .get("embs")
-            .context("model output `embs` missing")?
-            .try_extract_tensor::<f32>()?;
+    /// The model half of [`Self::embed`]: CMN'd fbank `[T * 80]` → embedding.
+    fn embed_feats(&self, feats: Vec<f32>) -> Result<Vec<f32>> {
+        let fallback_feats = feats.clone();
+        let mut raw = Self::run(&mut self.session.lock(), feats)?;
+        if raw.iter().any(|v| !v.is_finite()) {
+            tracing::warn!("speaker_embed_nonfinite_cpu_fallback");
+            let mut slot = self.cpu_fallback.lock();
+            if slot.is_none() {
+                *slot = Some(
+                    cpu_session_builder()?
+                        .commit_from_file(model_path()?)
+                        .context("loading speaker model (cpu fallback)")?,
+                );
+            }
+            raw = Self::run(
+                slot.as_mut().expect("fallback session just built"),
+                fallback_feats,
+            )?;
+        }
         if raw.len() != EMBEDDING_DIM {
             anyhow::bail!(
                 "unexpected embedding size {} (want {EMBEDDING_DIM})",
                 raw.len()
             );
         }
-        Ok(l2_normalize(raw))
+        Ok(l2_normalize(&raw))
     }
 }
 
@@ -352,6 +425,154 @@ mod tests {
             same_score > cross_score,
             "same-source clips ({same_score}) must outscore cross-source ({cross_score})"
         );
+    }
+
+    /// Per-window cost probe (offline, no mic). `SPK_PROBE_WAVS`: 16 kHz
+    /// mono s16 WAVs, comma-separated. `SPK_PROBE_MODE=ladder` (default):
+    /// the ladder's 1.5 s trailing windows at its 0.25 s step; `whole`: the
+    /// whole-utterance inputs (last <= 6 s of each file) plus every prefix
+    /// length from 0.3 s in 0.23 s steps (varied T). `SPK_PROBE_EP`: `old`
+    /// (ORT CPU kernels, the previous session), `shipped`
+    /// (`SpeakerEmbedder::new`), `nn-gpu` / `nn-ane` / `nn-all` (CoreML
+    /// NeuralNetwork on those units). Times fbank and model separately
+    /// (wall + process CPU) and writes every embedding to `SPK_PROBE_OUT`
+    /// (raw f32 LE, 256 per window) for a window-by-window comparison.
+    #[test]
+    #[ignore = "offline cost probe; needs SPK_PROBE_* env + model"]
+    fn embed_cost_probe() {
+        let Ok(wavs) = std::env::var("SPK_PROBE_WAVS") else {
+            return;
+        };
+        let ep = std::env::var("SPK_PROBE_EP").unwrap_or_else(|_| "shipped".into());
+        let out = std::env::var("SPK_PROBE_OUT").expect("SPK_PROBE_OUT");
+        let whole = std::env::var("SPK_PROBE_MODE").is_ok_and(|m| m == "whole");
+        let cpu_s = || {
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            tv(ru.ru_utime) + tv(ru.ru_stime)
+        };
+        let (lc, lt) = (cpu_s(), std::time::Instant::now());
+        let e = probe_embedder(&ep);
+        let _ = e.embed(&synth_voice(1, 1.5));
+        eprintln!(
+            "probe ep={ep} load+first-run wall={:.0} ms cpu={:.0} ms",
+            lt.elapsed().as_secs_f64() * 1e3,
+            (cpu_s() - lc) * 1e3
+        );
+        let mut bytes = Vec::new();
+        let (mut n, mut fb_wall, mut fb_cpu, mut m_wall, mut m_cpu) =
+            (0usize, 0f64, 0f64, 0f64, 0f64);
+        let mut m_walls = Vec::new();
+        let mut secs = 0f64;
+        for wav in wavs.split(',') {
+            let pcm = read_wav_s16(wav);
+            let mut wins: Vec<&[i16]> = Vec::new();
+            if whole {
+                if pcm.len() >= MIN_EMBED_SAMPLES {
+                    wins.push(&pcm[pcm.len() - pcm.len().min(96_000)..]);
+                }
+                let mut l = MIN_EMBED_SAMPLES;
+                while l <= pcm.len().min(96_000) {
+                    wins.push(&pcm[..l]);
+                    l += 3_680;
+                }
+            } else {
+                let mut end = 24_000;
+                while end <= pcm.len() {
+                    wins.push(&pcm[end - 24_000..end]);
+                    end += 4_000;
+                }
+            }
+            for w in wins {
+                let (c0, t0) = (cpu_s(), std::time::Instant::now());
+                let feats = compute_fbank_cmn(w).unwrap();
+                let (c1, t1) = (cpu_s(), std::time::Instant::now());
+                let emb = e.embed_feats(feats).unwrap();
+                let (c2, t2) = (cpu_s(), std::time::Instant::now());
+                fb_wall += (t1 - t0).as_secs_f64();
+                fb_cpu += c1 - c0;
+                m_wall += (t2 - t1).as_secs_f64();
+                m_cpu += c2 - c1;
+                m_walls.push((t2 - t1).as_secs_f64());
+                secs += w.len() as f64 / 16_000.0;
+                for v in &emb {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                n += 1;
+            }
+        }
+        std::fs::write(&out, &bytes).unwrap();
+        m_walls.sort_by(f64::total_cmp);
+        let p = |q: f64| m_walls[((m_walls.len() - 1) as f64 * q) as usize] * 1e3;
+        eprintln!(
+            "probe ep={ep} mode={} windows={n} audio_s/win={:.2} | fbank ms/win wall={:.2} cpu={:.2} | model ms/win wall={:.2} cpu={:.2} p50={:.1} p95={:.1} max={:.1} | cpu fallbacks={}",
+            if whole { "whole" } else { "ladder" },
+            secs / n as f64,
+            fb_wall / n as f64 * 1e3,
+            fb_cpu / n as f64 * 1e3,
+            m_wall / n as f64 * 1e3,
+            m_cpu / n as f64 * 1e3,
+            p(0.5),
+            p(0.95),
+            p(1.0),
+            e.cpu_fallback.lock().is_some()
+        );
+    }
+
+    fn read_wav_s16(path: &str) -> Vec<i16> {
+        let b = std::fs::read(path).unwrap();
+        // Walk RIFF chunks to "data" (16 kHz mono s16 asserted by "fmt ").
+        let mut i = 12;
+        loop {
+            let id = &b[i..i + 4];
+            let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
+            if id == b"fmt " {
+                let ch = u16::from_le_bytes(b[i + 10..i + 12].try_into().unwrap());
+                let sr = u32::from_le_bytes(b[i + 12..i + 16].try_into().unwrap());
+                let bits = u16::from_le_bytes(b[i + 22..i + 24].try_into().unwrap());
+                assert_eq!((ch, sr, bits), (1, 16_000, 16), "{path}");
+            }
+            if id == b"data" {
+                let d = &b[i + 8..(i + 8 + len).min(b.len())];
+                return d
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i16::from_le_bytes(*c))
+                    .collect();
+            }
+            i += 8 + len + (len & 1);
+        }
+    }
+
+    fn probe_embedder(ep: &str) -> SpeakerEmbedder {
+        use ort::ep::coreml::{ComputeUnits, ModelFormat};
+        if ep == "shipped" {
+            return SpeakerEmbedder::new().unwrap();
+        }
+        let nn = |units| {
+            ort::ep::CoreML::default()
+                .with_compute_units(units)
+                .with_model_format(ModelFormat::NeuralNetwork)
+                .build()
+        };
+        let b = cpu_session_builder().unwrap();
+        let mut b = match ep {
+            "old" => b,
+            "nn-gpu" => b
+                .with_execution_providers([nn(ComputeUnits::CPUAndGPU)])
+                .unwrap(),
+            "nn-ane" => b
+                .with_execution_providers([nn(ComputeUnits::CPUAndNeuralEngine)])
+                .unwrap(),
+            "nn-all" => b.with_execution_providers([nn(ComputeUnits::All)]).unwrap(),
+            other => panic!("unknown SPK_PROBE_EP {other}"),
+        };
+        SpeakerEmbedder {
+            session: Mutex::new(b.commit_from_file(model_path().unwrap()).unwrap()),
+            cpu_fallback: Mutex::new(None),
+        }
     }
 
     #[test]

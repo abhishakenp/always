@@ -5870,3 +5870,190 @@ mod excise_his_turn_tests {
         assert_eq!(ended_at, Some(29), "decided inside the already-captured stretch");
     }
 }
+
+/// Offline proof that a speaker-embedding change leaves every gate decision
+/// as it was: two embedding dumps of the SAME windows (`embed_cost_probe` in
+/// `speaker_embed`, e.g. the old ORT-CPU session vs the shipped one) are run
+/// through the window-level decision functions the ladder applies, with the
+/// film and impostor cohorts evolving on sample time (one per input file).
+#[cfg(test)]
+mod embed_decision_equality {
+    use super::*;
+    use crate::always::speaker_trim as st;
+
+    fn wav_len(path: &str) -> usize {
+        let b = std::fs::read(path).unwrap();
+        let mut i = 12;
+        loop {
+            let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
+            if &b[i..i + 4] == b"data" {
+                return len.min(b.len() - i - 8) / 2;
+            }
+            i += 8 + len + (len & 1);
+        }
+    }
+
+    fn load(path: &str) -> Vec<Vec<f32>> {
+        let b = std::fs::read(path).unwrap();
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect::<Vec<_>>()
+            .chunks_exact(crate::always::speaker_embed::EMBEDDING_DIM)
+            .map(<[f32]>::to_vec)
+            .collect()
+    }
+
+    /// Every decision one window feeds, plus the values behind them.
+    #[derive(Debug, PartialEq)]
+    struct Decisions {
+        flags: Vec<bool>,
+    }
+
+    struct Sim {
+        film: st::CohortState,
+        imp: st::CohortState,
+        base: std::time::Instant,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Self {
+                film: Default::default(),
+                imp: Default::default(),
+                base: std::time::Instant::now(),
+            }
+        }
+
+        /// Ladder window ending at `end` samples into the file (`k`-th).
+        fn window(
+            &mut self,
+            e: &[f32],
+            vp: &crate::always::voiceprint::VoiceProfile,
+            thr: f32,
+            end: usize,
+            k: usize,
+        ) -> (Decisions, [f32; 3]) {
+            let now = self.base + std::time::Duration::from_secs_f64(end as f64 / 16_000.0);
+            let (score, _) = best_voiceprint_match(e, vp);
+            let (film, admitted) = st::media_window_in(&mut self.film, now, e, score);
+            let imp = st::cohort_similarity_in(&mut self.imp, now, e);
+            let mut flags = vec![
+                speaker_gate_allows_score(Some(score), thr),
+                speaker_gate_allows_score(Some(score), thr * SPEAKER_TAIL_THRESHOLD_FACTOR),
+                score >= STT_CANDIDATE_SCORE,
+                score >= EARLY_CUE_MIN_SCORE,
+                admitted,
+                film.is_some(),
+                st::media_window_passes(score, film),
+                st::media_tail_is_his(score, film),
+                st::cohort_vetoes_pass(score, imp, thr),
+                st::cohort_vetoes_media_pass(score, imp),
+                imp.is_some(),
+            ];
+            // An impostor reject lands about once per media cycle (4.25 s
+            // of voice + the 4-window streak): admit on that cadence.
+            if k % 17 == 16 {
+                flags.push(st::remember_foreign_in(&mut self.imp, now, e, score));
+            }
+            (
+                Decisions { flags },
+                [score, film.unwrap_or(f32::NAN), imp.unwrap_or(f32::NAN)],
+            )
+        }
+    }
+
+    /// `SPK_CMP_A` / `SPK_CMP_B`: the two dumps; `SPK_PROBE_WAVS` and
+    /// `SPK_PROBE_MODE`: exactly as the probe that wrote them (window counts
+    /// per file are rebuilt from the WAV lengths).
+    #[test]
+    #[ignore = "offline A/B; needs SPK_CMP_* env + enrolled voiceprint"]
+    fn embedding_dumps_decide_identically() {
+        let (Ok(a), Ok(b)) = (std::env::var("SPK_CMP_A"), std::env::var("SPK_CMP_B")) else {
+            return;
+        };
+        let wavs = std::env::var("SPK_PROBE_WAVS").expect("SPK_PROBE_WAVS");
+        let whole = std::env::var("SPK_PROBE_MODE").is_ok_and(|m| m == "whole");
+        let vp = crate::always::voiceprint::current().expect("enrolled voiceprint");
+        let thr = crate::always::config::DEFAULT_SPEAKER_GATE_THRESHOLD as f32;
+        let (ea, eb) = (load(&a), load(&b));
+        assert_eq!(ea.len(), eb.len(), "dumps differ in window count");
+        let (mut i, mut windows, mut differing, mut bitwise) = (0usize, 0usize, 0usize, 0usize);
+        let mut max_d = [0f32; 3];
+        let mut min_cos = 1f32;
+        // Closest any score came to a threshold it is compared with.
+        let mut min_margin = f32::MAX;
+        for wav in wavs.split(',') {
+            let len = wav_len(wav);
+            let ends: Vec<usize> = if whole {
+                let mut v = Vec::new();
+                if len >= crate::always::speaker_embed::MIN_EMBED_SAMPLES {
+                    v.push(len);
+                }
+                let mut l = crate::always::speaker_embed::MIN_EMBED_SAMPLES;
+                while l <= len.min(96_000) {
+                    v.push(l);
+                    l += 3_680;
+                }
+                v
+            } else {
+                (0..)
+                    .map(|k| 24_000 + 4_000 * k)
+                    .take_while(|&e| e <= len)
+                    .collect()
+            };
+            let (mut sa, mut sb) = (Sim::new(), Sim::new());
+            for (k, &end) in ends.iter().enumerate() {
+                let (x, y) = (&ea[i], &eb[i]);
+                i += 1;
+                windows += 1;
+                if x == y {
+                    bitwise += 1;
+                }
+                min_cos = min_cos.min(crate::always::speaker_embed::cosine(x, y));
+                let (da, va) = sa.window(x, &vp, thr, end, k);
+                let (db, vb) = sb.window(y, &vp, thr, end, k);
+                for j in 0..3 {
+                    if va[j].is_finite() && vb[j].is_finite() {
+                        max_d[j] = max_d[j].max((va[j] - vb[j]).abs());
+                    } else {
+                        assert_eq!(
+                            va[j].is_finite(),
+                            vb[j].is_finite(),
+                            "window {i}: one side has no value {j}"
+                        );
+                    }
+                }
+                for t in [
+                    thr,
+                    thr * SPEAKER_TAIL_THRESHOLD_FACTOR,
+                    STT_CANDIDATE_SCORE,
+                    EARLY_CUE_MIN_SCORE,
+                    st::MEDIA_COHORT_ADMIT_MAX_SCORE,
+                    st::MEDIA_TAIL_MIN_SCORE,
+                ] {
+                    min_margin = min_margin.min((va[0] - t).abs());
+                }
+                if da != db {
+                    differing += 1;
+                    eprintln!(
+                        "DIFF {wav} end={end}: {:?} vs {:?} values {va:?} vs {vb:?}",
+                        da.flags, db.flags
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            i,
+            ea.len(),
+            "dump has windows the WAV list does not explain"
+        );
+        eprintln!(
+            "decision A/B: windows={windows} differing={differing} bitwise_equal={bitwise} min_cos={min_cos:.8} \
+             max|Δscore|={:.2e} max|Δfilm|={:.2e} max|Δimpostor|={:.2e} closest score-to-threshold={min_margin:.2e}",
+            max_d[0], max_d[1], max_d[2]
+        );
+        assert_eq!(differing, 0, "a window decided differently");
+    }
+}
