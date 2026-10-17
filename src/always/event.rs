@@ -136,6 +136,10 @@ pub enum DaemonEvent {
         id: String,
         text: String,
         at_us: String,
+        /// `gate=0.556;peak=-9.1;gain=4.2;conf=0.367;secs=1.71` (utt_audio.rs): the audio numbers behind
+        /// the verdict, for a consumer that weighs them. Empty = none; absent on older clients.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        audio: String,
     },
     /// A voice-edit command ran ("scratch that", "change X to Y", …) or
     /// answered an Iris `VoiceEdit*` request (`voice_edit.rs`). Strings
@@ -510,11 +514,12 @@ impl DaemonEvent {
             DaemonEvent::TranscriptFinal { text } => {
                 cap_field(text).map(|text| DaemonEvent::TranscriptFinal { text })
             }
-            DaemonEvent::TranscriptHeld { id, text, at_us } => {
+            DaemonEvent::TranscriptHeld { id, text, at_us, audio } => {
                 cap_field(text).map(|text| DaemonEvent::TranscriptHeld {
                     id: id.clone(),
                     text,
                     at_us: at_us.clone(),
+                    audio: audio.clone(),
                 })
             }
             DaemonEvent::TranscriptionInterim { text } => {
@@ -973,7 +978,7 @@ impl EventBroadcaster {
     }
 
     /// Announce a consume-mode final whose paste is parked under `id`.
-    pub fn transcript_held(&self, id: u64, text: String) {
+    pub fn transcript_held(&self, id: u64, text: String, audio: String) {
         let at_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
@@ -982,6 +987,7 @@ impl EventBroadcaster {
             id: id.to_string(),
             text,
             at_us: at_us.to_string(),
+            audio,
         });
     }
 
@@ -1445,6 +1451,7 @@ mod tests {
             id: "3".into(),
             text: "hi".into(),
             at_us: "1".into(),
+            audio: String::new(),
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(

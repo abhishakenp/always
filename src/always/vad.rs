@@ -1899,6 +1899,7 @@ fn record_with_local_vad(
                             stt_deferred = false;
                             stt_catchup = true;
                         }
+                        crate::always::utt_audio::set_gate(score);
                         tracing::info!(score, via = ?job.kind, "speaker_gate_verified");
                         // Foreign speech BEFORE the user's first words (a
                         // phone reel still talking when he started) never

@@ -90,6 +90,7 @@ impl Logger {
             Event::VoiceDetected {
                 audio_delivery_lag_ms,
             } => {
+                crate::always::utt_audio::reset();
                 tracing::info!(audio_delivery_lag_ms, "voice_detected");
             }
             Event::Transcribed { text, energy } => {

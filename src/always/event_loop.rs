@@ -1160,7 +1160,11 @@ fn handle_speech(
                 );
                 // Held BEFORE final: a consumer that decides synchronously on
                 // the final must already know the id it is deciding about.
-                event::global_broadcaster().transcript_held(id, final_text.clone());
+                event::global_broadcaster().transcript_held(
+                    id,
+                    final_text.clone(),
+                    crate::always::utt_audio::wire(transcription.evidence.confidence),
+                );
                 // Held finals: no cue here. The outcome plays on the verdict
                 // (held.rs): Done on ReleaseHeld, Command on DiscardHeld,
                 // Failure if nobody decides (eyes-free contract, 2026-10-16).
@@ -1948,7 +1952,7 @@ mod tests {
             match boundary {
                 "success" => b.transcript_final("English dictation".into()),
                 "held" => {
-                    b.transcript_held(42, "Iris check this".into());
+                    b.transcript_held(42, "Iris check this".into(), String::new());
                     b.transcript_final_quiet("Iris check this".into());
                 }
                 "cancel" => b.transcription_filtered("cancelled transcription"),

@@ -452,6 +452,11 @@ impl Drop for PreviewUtterance {
                 -120.0
             }
         };
+        crate::always::utt_audio::set_level(
+            db(self.level.peak_env()) as f32,
+            (20.0 * self.level.gain().log10() * 10.0).round() as f32 / 10.0,
+            self.samples as f64 / 16_000.0,
+        );
         tracing::info!(
             seq = self.seq,
             audio_secs = self.samples as f64 / 16_000.0,
