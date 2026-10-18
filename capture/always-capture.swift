@@ -379,42 +379,77 @@ func extractorMtime() -> Date? {
 /// half missing and a session could not be replayed faithfully.)
 let ECHO_DUMP_MAX_SECS = 900.0
 final class EchoDump {
-    let mic: FileHandle, ref: FileHandle, side: FileHandle, out: FileHandle, ran: FileHandle, idx: FileHandle
+    /// mic, ref, side, out, ran, idx — created on the first flush, so a helper
+    /// that never captures (a respawn onto a silent mic) leaves no empty dump.
+    private var files: [FileHandle]? = nil
+    private let stem: String
     var frames = 0
-    var buf = [Int16](repeating: 0, count: 320)
+    /// Frames are kept here and written every `FLUSH_SAMPLES` (0.5 s): six
+    /// write(2) calls per half second instead of five per 10 ms frame plus a
+    /// `Data` per stream per frame. Plain write(2), not `FileHandle.write`,
+    /// which raises (abort) on a full disk.
+    private static let FLUSH_SAMPLES = 8_000
+    private var bMic = [Int16](), bRef = [Int16](), bSide = [Int16](), bOut = [Int16](), bRan = [UInt8](), bIdx = [UInt8]()
     init?() {
         let sup = alwaysSupportDir().appendingPathComponent("tse")
         guard FileManager.default.fileExists(atPath: sup.appendingPathComponent("dump-echo").path) else { return nil }
         let dir = sup.appendingPathComponent("echo")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let stem = dir.appendingPathComponent("\(Int(Date().timeIntervalSince1970))").path
-        for name in ["mic.s16", "ref.s16", "side.s16", "out.s16", "ran", "idx"] {
-            FileManager.default.createFile(atPath: "\(stem).\(name)", contents: nil, attributes: [.posixPermissions: 0o600])
-        }
-        guard let m = FileHandle(forWritingAtPath: "\(stem).mic.s16"), let r = FileHandle(forWritingAtPath: "\(stem).ref.s16"),
-              let o = FileHandle(forWritingAtPath: "\(stem).out.s16"), let sd = FileHandle(forWritingAtPath: "\(stem).side.s16"), let rn = FileHandle(forWritingAtPath: "\(stem).ran"),
-              let ix = FileHandle(forWritingAtPath: "\(stem).idx") else { return nil }
-        mic = m; ref = r; side = sd; out = o; ran = rn; idx = ix
+        stem = dir.appendingPathComponent("\(Int(Date().timeIntervalSince1970))").path
+        bMic.reserveCapacity(EchoDump.FLUSH_SAMPLES + 320); bRef.reserveCapacity(EchoDump.FLUSH_SAMPLES + 320)
+        bSide.reserveCapacity(EchoDump.FLUSH_SAMPLES + 320); bOut.reserveCapacity(EchoDump.FLUSH_SAMPLES + 320)
         log("echo dump on: \(stem).{mic,ref,out}.s16 + .ran, every frame, mic pre-gained (max \(Int(ECHO_DUMP_MAX_SECS)) s)")
     }
+    private func open() -> [FileHandle]? {
+        if let files { return files }
+        var hs: [FileHandle] = []
+        for name in ["mic.s16", "ref.s16", "side.s16", "out.s16", "ran", "idx"] {
+            FileManager.default.createFile(atPath: "\(stem).\(name)", contents: nil, attributes: [.posixPermissions: 0o600])
+            guard let h = FileHandle(forWritingAtPath: "\(stem).\(name)") else { return nil }
+            hs.append(h)
+        }
+        files = hs
+        return hs
+    }
+    deinit { flush() }
     /// The mic is written pre-gained exactly as the canceller sees it (no int16 clipping).
     func write(_ m: UnsafePointer<Float>, _ r: UnsafePointer<Float>, _ sd: UnsafePointer<Float>, _ n: Int, ran didRun: Bool, micGain: Float) {
         guard Double(frames * n) / 16_000 < ECHO_DUMP_MAX_SECS else { return }
         // Wall clock of every 50th frame (0.5 s): maps the dump onto the logs.
         if frames % 50 == 0 {
-            idx.write("\(Int(Date().timeIntervalSince1970 * 1000)) \(frames * n)\n".data(using: .utf8)!)
+            bIdx.append(contentsOf: Array("\(Int(Date().timeIntervalSince1970 * 1000)) \(frames * n)\n".utf8))
         }
         frames += 1
-        for (h, p, g) in [(mic, m, micGain), (ref, r, Float(1)), (side, sd, Float(1))] {
-            for i in 0..<n { buf[i] = Int16(max(-32768, min(32767, p[i] * g * 32768))) }
-            buf.withUnsafeBytes { h.write(Data($0.prefix(n * 2))) }
+        for i in 0..<n {
+            bMic.append(Int16(max(-32768, min(32767, m[i] * micGain * 32768))))
+            bRef.append(Int16(max(-32768, min(32767, r[i] * 32768))))
+            bSide.append(Int16(max(-32768, min(32767, sd[i] * 32768))))
         }
-        ran.write(Data([didRun ? 1 : 0]))
+        bRan.append(didRun ? 1 : 0)
     }
     /// The frame exactly as written to the daemon (after canceller, extractor, AGC).
+    /// One `.out` frame per dumped `.mic` frame: after the cap `frames` stops
+    /// growing, and the old time check let `.out` run on past it (the
+    /// 2026-10-18 dump: out 32.4 MB against mic 28.8 MB).
+    private var outFrames = 0
     func writeOut(_ p: UnsafePointer<Int16>, _ n: Int) {
-        guard Double(frames * n) / 16_000 <= ECHO_DUMP_MAX_SECS + 0.01 else { return }
-        out.write(Data(bytes: p, count: n * 2))
+        guard outFrames < frames else { return }
+        outFrames += 1
+        bOut.append(contentsOf: UnsafeBufferPointer(start: p, count: n))
+        if bOut.count >= EchoDump.FLUSH_SAMPLES || Double(frames * n) / 16_000 >= ECHO_DUMP_MAX_SECS { flush() }
+    }
+    private func flush() {
+        func put(_ h: FileHandle, _ p: UnsafeRawBufferPointer) {
+            var o = 0
+            while o < p.count { let k = Darwin.write(h.fileDescriptor, p.baseAddress! + o, p.count - o); if k <= 0 { return }; o += k }
+        }
+        if !(bMic.isEmpty && bOut.isEmpty), let f = open() {
+            for (h, b) in [(f[0], bMic), (f[1], bRef), (f[2], bSide), (f[3], bOut)] where !b.isEmpty { b.withUnsafeBytes { put(h, $0) } }
+            if !bRan.isEmpty { bRan.withUnsafeBytes { put(f[4], $0) } }
+            if !bIdx.isEmpty { bIdx.withUnsafeBytes { put(f[5], $0) } }
+        }
+        bMic.removeAll(keepingCapacity: true); bRef.removeAll(keepingCapacity: true); bSide.removeAll(keepingCapacity: true)
+        bOut.removeAll(keepingCapacity: true); bRan.removeAll(keepingCapacity: true); bIdx.removeAll(keepingCapacity: true)
     }
 }
 // Checked every 10 s (stats timer): the flag appearing starts a dump, the

@@ -323,16 +323,18 @@ fn speaker_gate_embed_score(gate: &SpeakerGate, samples: &[i16]) -> Option<(f32,
             } else {
                 (enrolled, matched)
             };
-            // Info, not debug: the embedding sits on the badge's critical
-            // path under "My Voice", so its cost must be visible in
-            // production logs.
-            tracing::info!(
+            // Its cost stays visible in production logs, once per utterance:
+            // `speaker_gate_windows` (see `GateWindowLog`). Over a film the
+            // per-window line was ~4 a second, over half the log's bytes.
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            tracing::debug!(
                 score,
                 matched,
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms,
                 audio_secs = samples.len() as f64 / 16_000.0,
                 "speaker_gate_scored"
             );
+            GATE_WINDOW_LOG.lock().push(score, elapsed_ms);
             Some((score, e))
         }
         Err(err) => {
@@ -341,6 +343,51 @@ fn speaker_gate_embed_score(gate: &SpeakerGate, samples: &[i16]) -> Option<(f32,
         }
     }
 }
+
+/// Every speaker-model run of one utterance, logged once at its end as
+/// `speaker_gate_windows`: count, model time (sum, max) and each score in
+/// order (2 decimals) — the evidence the per-window `speaker_gate_scored`
+/// info line carried, at a tenth of the bytes.
+#[derive(Default)]
+struct GateWindowLog {
+    n: u32,
+    ms_sum: u64,
+    ms_max: u64,
+    scores: String,
+}
+
+impl GateWindowLog {
+    fn push(&mut self, score: f32, ms: u64) {
+        use std::fmt::Write;
+        self.n += 1;
+        self.ms_sum += ms;
+        self.ms_max = self.ms_max.max(ms);
+        if !self.scores.is_empty() {
+            self.scores.push(' ');
+        }
+        let _ = write!(self.scores, "{score:.2}");
+    }
+
+    fn flush(&mut self) {
+        let w = std::mem::take(self);
+        if w.n > 0 {
+            tracing::info!(
+                n = w.n,
+                ms_sum = w.ms_sum,
+                ms_max = w.ms_max,
+                scores = %w.scores,
+                "speaker_gate_windows"
+            );
+        }
+    }
+}
+
+static GATE_WINDOW_LOG: parking_lot::Mutex<GateWindowLog> = parking_lot::Mutex::new(GateWindowLog {
+    n: 0,
+    ms_sum: 0,
+    ms_max: 0,
+    scores: String::new(),
+});
 
 /// Feed an accepted utterance into the adaptive own-voice pool, off the
 /// capture thread. Admitted only when it clears the threshold against
@@ -709,6 +756,8 @@ const SPEAKER_GATE_UNVERIFIED_CHECK_EVERY_SAMPLES: usize = 4_000; // 0.25s of vo
 /// stable embedding while keeping the cut ~1.5s behind the user's last
 /// word.
 const SPEAKER_TAIL_WINDOW_SAMPLES: usize = 24_000;
+// The speaker model's GPU session serves exactly this window length.
+const _: () = assert!(SPEAKER_TAIL_WINDOW_SAMPLES == crate::always::speaker_embed::GPU_WINDOW_SAMPLES);
 /// FLOOR on consecutive mismatching windows before the cut. The actual
 /// requirement scales with the user's configured `silence_secs` (see
 /// `speaker_tail_fail_checks` in the record loop) so the pause tolerance
@@ -831,7 +880,9 @@ pub fn record_utterance(
     transcriber: &Arc<dyn Transcriber>,
     rt: &tokio::runtime::Handle,
 ) -> Result<RecordResult> {
-    record_with_local_vad(cfg, log, transcriber, rt)
+    let r = record_with_local_vad(cfg, log, transcriber, rt);
+    GATE_WINDOW_LOG.lock().flush();
+    r
 }
 
 /// No-op stub: wake-on-voice requires the cpal audio path.
@@ -2240,6 +2291,9 @@ fn record_with_local_vad(
         // event-loop thread; the reader thread only fills the queue.
         let read = {
             let mut recorder = recorder_arc.lock();
+            // Back to echo cancellation from a fallback recorder, between
+            // his words only (see `audio::capture_upgrade_tick`).
+            crate::always::audio::capture_upgrade_tick(&mut recorder, !in_speech && consecutive_speech == 0);
             let Some(ref mut rec) = *recorder else {
                 return Err(anyhow::anyhow!("Audio recorder not available"));
             };
@@ -2250,6 +2304,11 @@ fn record_with_local_vad(
             match read {
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Display asleep: the mic is silent, the recorder is
+                    // fine — it carries on when the display wakes.
+                    if recorder.as_mut().is_some_and(|r| r.keep_through_silence()) {
+                        break;
+                    }
                     // Closed the ring so the capture thread stops.
                     // Respawn a fresh source on the next cycle.
                     if recorder.take().is_some() {

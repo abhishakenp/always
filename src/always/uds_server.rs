@@ -821,6 +821,11 @@ fn execute_command(cmd: DaemonCommand, ctx: &ModelCommandCtx, consume_lease: &At
             // Effective may flip because per-app rules differ between
             // the previous and new bundle; broadcast on change so the
             // status bar icon and overlay follow the user's focus.
+            // Leaving the lock screen ends a display-sleep mic outage: the
+            // echo-cancelling helper may be retried at once.
+            if bundle_id.as_deref() != Some("com.apple.loginwindow") {
+                crate::always::audio::capture_retry_now();
+            }
             let (effective, changed) = pause::set_current_app_and_recompute(bundle_id.clone());
             // Persist the now-current bundle so a daemon restart can
             // restore per-app pause state via

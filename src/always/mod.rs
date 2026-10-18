@@ -57,6 +57,7 @@ mod replay_tests;
 pub mod shutdown;
 pub mod snippets;
 pub mod speaker_embed;
+pub(crate) mod onnx_trunk;
 pub mod speaker_trim;
 pub mod speech_action;
 pub mod status_sound;

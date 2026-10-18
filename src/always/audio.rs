@@ -54,6 +54,42 @@ const READ_FRAME_TIMEOUT_MS: i32 = 15_000;
 // 2-3s value that cut utterances off — keep this guard.
 const _: () = assert!(READ_FRAME_TIMEOUT_MS >= 10_000);
 
+/// [`READ_FRAME_TIMEOUT_MS`]; tests shorten it (`READ_TIMEOUT_TEST_MS`).
+fn read_frame_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = READ_TIMEOUT_TEST_MS.load(Ordering::Relaxed);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    Duration::from_millis(READ_FRAME_TIMEOUT_MS as u64)
+}
+#[cfg(test)]
+static READ_TIMEOUT_TEST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The display is asleep (lid closed, display off, screen locked into
+/// sleep): the built-in mic delivers nothing until it wakes. Tests force
+/// it with `DISPLAY_ASLEEP_TEST` (1 asleep, 2 awake).
+#[cfg(target_os = "macos")]
+fn display_asleep() -> bool {
+    #[cfg(test)]
+    match DISPLAY_ASLEEP_TEST.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayIsAsleep(display: u32) -> u32;
+    }
+    // SAFETY: plain CoreGraphics queries, no pointers involved.
+    unsafe { CGDisplayIsAsleep(CGMainDisplayID()) != 0 }
+}
+#[cfg(all(test, target_os = "macos"))]
+static DISPLAY_ASLEEP_TEST: AtomicU32 = AtomicU32::new(0);
+
 /// Conservative hygiene recycle for a healthy recorder. The old call-count
 /// guard (1000 `get_or_spawn` calls ≈ every 100 s while media plays) paid a
 /// device cold start and dropped audio on every recycle to guard against a
@@ -231,6 +267,20 @@ impl FrameRing {
     /// Discard everything queued, plus any frame captured before now that
     /// is still in flight inside SoX. Returns the queued audio dropped,
     /// in bytes.
+    /// Frames queued and not yet read.
+    fn pending_frames(&self) -> usize {
+        self.state.lock().frames.len()
+    }
+
+    /// Drop everything captured before `cut` (queued now or arriving later):
+    /// a recorder taking over from another starts right after the last
+    /// frame the old one delivered — no gap, no repeat.
+    fn discard_before(&self, cut: Instant) {
+        let mut st = self.state.lock();
+        st.frames.retain(|f| f.captured_at >= cut);
+        st.discard_before = Some(cut);
+    }
+
     fn discard_pending(&self) -> usize {
         let mut st = self.state.lock();
         Self::end_overflow_run(&mut st);
@@ -402,6 +452,7 @@ pub struct RecChild {
     spawned_at: std::time::Instant,
     /// Fed by the stderr drainer on CoreAudio buffer overruns.
     overruns: Arc<OverrunWindow>,
+    mode: CaptureMode,
 }
 
 /// Executable name of the echo-cancelling capture helper inside
@@ -415,12 +466,73 @@ pub const CAPTURE_HELPER_NAME: &str = "always-capture";
 #[cfg(target_os = "macos")]
 const CAPTURE_HELPER_FIRST_BYTES_MS: i32 = 4_000;
 
-/// Set after the capture helper failed to start or stay alive; the daemon
-/// then uses `rec` for the rest of its life instead of paying the start-up
-/// timeout on every respawn. Cleared by a default-input-device change.
+/// When the echo-cancelling helper may be tried again after it failed to
+/// start. It used to be a flag set for the daemon's life: on 2026-10-18
+/// 14:57Z the display went off, the mic stopped delivering, both helper
+/// modes timed out and Always sat on SoX `rec` with no echo cancellation
+/// for hours, until a restart. Now each failure backs off (15 s doubling,
+/// at most 10 min); [`capture_retry_now`] (unlock, input-device change)
+/// clears it, and a running fallback is replaced in place once the helper
+/// is back (see [`capture_upgrade_tick`]).
 #[cfg(target_os = "macos")]
-static CAPTURE_HELPER_FAILED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+struct HelperRetry {
+    failures: u32,
+    next_try: Option<Instant>,
+}
+
+#[cfg(target_os = "macos")]
+static HELPER_RETRY: Mutex<HelperRetry> = Mutex::new(HelperRetry { failures: 0, next_try: None });
+
+#[cfg(target_os = "macos")]
+const HELPER_RETRY_FIRST: Duration = Duration::from_secs(15);
+#[cfg(target_os = "macos")]
+const HELPER_RETRY_MAX: Duration = Duration::from_secs(600);
+
+#[cfg(target_os = "macos")]
+fn helper_retry_due() -> bool {
+    HELPER_RETRY.lock().next_try.is_none_or(|t| Instant::now() >= t)
+}
+
+#[cfg(target_os = "macos")]
+fn helper_failed() {
+    let mut r = HELPER_RETRY.lock();
+    r.failures = r.failures.saturating_add(1);
+    let wait = HELPER_RETRY_FIRST
+        .saturating_mul(1u32 << (r.failures - 1).min(10))
+        .min(HELPER_RETRY_MAX);
+    r.next_try = Some(Instant::now() + wait);
+    tracing::info!(failures = r.failures, retry_in_s = wait.as_secs(), "capture_helper_retry_scheduled");
+}
+
+#[cfg(target_os = "macos")]
+fn helper_ok() {
+    let mut r = HELPER_RETRY.lock();
+    r.failures = 0;
+    r.next_try = None;
+}
+
+/// Something that ends a mic outage happened (screen unlocked, input
+/// device changed): the next tick may try the echo-cancelling helper now.
+#[cfg(target_os = "macos")]
+pub fn capture_retry_now() {
+    let mut r = HELPER_RETRY.lock();
+    if r.next_try.is_some() {
+        r.next_try = Some(Instant::now());
+        tracing::info!("capture_helper_retry_now");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn capture_retry_now() {}
+
+/// Which recorder is running (the climb back to echo cancellation).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureMode {
+    Aec,
+    Plain,
+    Rec,
+}
 
 /// Same, for the helper's plain (`--no-vp`) mode: set when even plain
 /// capture failed, so the daemon goes straight to `rec` if one exists.
@@ -715,11 +827,14 @@ impl RecChild {
     fn spawn_from(helper: Option<PathBuf>, aec: bool) -> Result<Self> {
         test_mic_guard(helper.as_deref())?;
         if let Some(helper) = helper.as_deref() {
-            if aec && !CAPTURE_HELPER_FAILED.load(Ordering::Relaxed) {
+            if aec && helper_retry_due() {
                 match Self::spawn_capture_helper(helper, &[]) {
-                    Ok(rec) => return Ok(rec),
+                    Ok(rec) => {
+                        helper_ok();
+                        return Ok(rec);
+                    }
                     Err(error) => {
-                        CAPTURE_HELPER_FAILED.store(true, Ordering::Relaxed);
+                        helper_failed();
                         tracing::warn!(error = %error, "capture_helper_fallback_to_plain");
                     }
                 }
@@ -823,6 +938,7 @@ impl RecChild {
             reuse_count: 0,
             spawned_at: std::time::Instant::now(),
             overruns: Arc::new(OverrunWindow::new()),
+            mode: if args.is_empty() { CaptureMode::Aec } else { CaptureMode::Plain },
         })
     }
 
@@ -940,6 +1056,7 @@ impl RecChild {
             reuse_count: 0,
             spawned_at: std::time::Instant::now(),
             overruns,
+            mode: CaptureMode::Rec,
         })
     }
 
@@ -1005,13 +1122,35 @@ impl RecChild {
             tracing::info!("rec_respawn_due_to_default_input_change");
         }
         // A new input device gets a fresh chance at echo cancellation.
-        CAPTURE_HELPER_FAILED.store(false, Ordering::Relaxed);
+        helper_ok();
         CAPTURE_PLAIN_FAILED.store(false, Ordering::Relaxed);
         // Drop (kill + wait) the old recorder BEFORE spawning the
         // replacement — same I4 invariant as `get_or_spawn`.
         *recorder = None;
         *recorder = Some(Self::spawn()?);
         Ok(())
+    }
+
+    /// A read timed out. Keep this recorder (true) when the silence is the
+    /// display's, not the recorder's: the display is asleep and the process
+    /// and its pipe are alive. The mic delivers again when the display wakes
+    /// and THIS helper — echo cancellation included — carries on in place.
+    /// Evicting it (as on 2026-10-18 14:57:59Z, display off at 14:57:44.8)
+    /// made every respawn time out on the silent mic and left Always on the
+    /// last-resort recorder. Otherwise the caller evicts as before.
+    pub(crate) fn keep_through_silence(&mut self) -> bool {
+        let keep = !self.ring.is_closed()
+            && matches!(self.child.try_wait(), Ok(None))
+            && display_asleep();
+        if keep {
+            tracing::info!(mode = ?self.mode, "capture_silent_display_asleep_kept");
+        }
+        keep
+    }
+
+    /// Which recorder this is.
+    pub(crate) fn mode(&self) -> CaptureMode {
+        self.mode
     }
 
     fn is_healthy(&mut self) -> bool {
@@ -1063,7 +1202,7 @@ impl RecChild {
     pub fn read_frame(&mut self, buf: &mut [u8; FRAME_BYTES]) -> io::Result<usize> {
         let frame = self
             .ring
-            .pop(Duration::from_millis(READ_FRAME_TIMEOUT_MS as u64));
+            .pop(read_frame_timeout());
         self.deliver(frame, buf)
     }
 
@@ -1073,7 +1212,7 @@ impl RecChild {
     pub fn read_newest_frame(&mut self, buf: &mut [u8; FRAME_BYTES]) -> io::Result<usize> {
         let frame = self
             .ring
-            .pop_newest(Duration::from_millis(READ_FRAME_TIMEOUT_MS as u64));
+            .pop_newest(read_frame_timeout());
         self.deliver(frame, buf)
     }
 
@@ -1311,14 +1450,94 @@ impl AudioFrameSource for SoxAudioSource {
             // Wedged recorder: evict from the shared slot (Drop kills the
             // child) so the next `get_or_spawn` recovers with a fresh one.
             Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                *guard = None;
-                tracing::warn!("rec_timeout_recorder_reset");
+                if !rec.keep_through_silence() {
+                    *guard = None;
+                    tracing::warn!("rec_timeout_recorder_reset");
+                }
                 Err(e)
             }
             other => other,
         }
     }
 }
+
+/// A full (echo-cancelling) helper started beside a fallback recorder,
+/// waiting to take over (see [`capture_upgrade_tick`]), and when it started.
+#[cfg(target_os = "macos")]
+static CAPTURE_UPGRADE: Mutex<Option<(RecChild, Instant)>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+static CAPTURE_UPGRADE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// A started helper that found no quiet moment to take over within this is
+/// stopped (two capture processes never run on for long).
+#[cfg(target_os = "macos")]
+const CAPTURE_UPGRADE_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// The climb back from a fallback recorder (plain helper / SoX `rec`) to
+/// the echo-cancelling helper, called by the capture loop on every frame
+/// read BEFORE voice onset. Cheap when there is nothing to do (a field and
+/// an atomic). When the helper's retry is due, it is started on its own
+/// thread beside the running recorder — capture never pauses for its
+/// up-to-4 s start-up. Once it delivers audio and `quiet` (no voice in the
+/// current frames, the running recorder's queue empty), it takes over:
+/// its audio starts right after the last frame the old recorder delivered
+/// ([`FrameRing::discard_before`]), so not a frame of his speech is lost or
+/// repeated. A failed start backs off ([`helper_failed`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_upgrade_tick(slot: &mut Option<RecChild>, quiet: bool) {
+    let Some(rec) = slot.as_ref() else { return };
+    if rec.mode == CaptureMode::Aec {
+        return;
+    }
+    let ready = {
+        let mut up = CAPTURE_UPGRADE.lock();
+        match up.as_ref() {
+            Some((_, at)) if at.elapsed() > CAPTURE_UPGRADE_MAX_WAIT => {
+                tracing::info!("capture_upgrade_abandoned_no_quiet");
+                *up = None;
+                None
+            }
+            Some(_) if quiet && rec.ring.pending_frames() == 0 => up.take(),
+            _ => None,
+        }
+    };
+    if let Some((mut fresh, _)) = ready {
+        if !fresh.is_healthy() {
+            helper_failed();
+            return;
+        }
+        let cut = rec.last_captured_at.unwrap_or_else(Instant::now);
+        fresh.ring.discard_before(cut);
+        let from = rec.mode;
+        // The old recorder is dropped (killed, reaped) right here.
+        *slot = Some(fresh);
+        tracing::info!(from = ?from, "capture_upgraded_to_aec");
+        return;
+    }
+    if !aec_enabled() || !helper_retry_due() || CAPTURE_UPGRADE.lock().is_some() {
+        return;
+    }
+    let Some(helper) = locate_capture_helper() else { return };
+    if CAPTURE_UPGRADE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("capture-upgrade".into()).spawn(move || {
+        match test_mic_guard(Some(&helper)).and_then(|()| RecChild::spawn_capture_helper(&helper, &[])) {
+            Ok(fresh) => {
+                helper_ok();
+                *CAPTURE_UPGRADE.lock() = Some((fresh, Instant::now()));
+            }
+            Err(error) => {
+                helper_failed();
+                tracing::info!(error = %error, "capture_upgrade_failed");
+            }
+        }
+        CAPTURE_UPGRADE_IN_FLIGHT.store(false, Ordering::Release);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn capture_upgrade_tick<T>(_slot: &mut Option<T>, _quiet: bool) {}
 
 /// Linux/Windows stub. Real implementations land with the
 /// `linux`/`windows` features in a follow-up.
@@ -1628,7 +1847,7 @@ mod tests {
     /// new user's Mac). Stand-in helper: exits 4 unless given `--no-vp`.
     /// Serializes tests that set the process-wide capture failure flags.
     #[cfg(target_os = "macos")]
-    static CAPTURE_FLAGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static CAPTURE_FLAGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Privacy: a test whose fake input is missing fails hard — never the
     /// real helper, never `rec`, never the microphone.
@@ -1651,7 +1870,7 @@ mod tests {
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         for (helper, aec) in [(Some(dead.clone()), true), (Some(dead), false), (None, true), (Some(real), true)] {
-            super::CAPTURE_HELPER_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+            super::helper_ok();
             super::CAPTURE_PLAIN_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
             let err = match super::RecChild::spawn_from(helper.clone(), aec) {
                 Ok(_) => panic!("{helper:?}: capture must fail hard, not fall back"),
@@ -1682,13 +1901,13 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        super::CAPTURE_HELPER_FAILED.store(false, Ordering::Relaxed);
+        super::helper_ok();
         super::CAPTURE_PLAIN_FAILED.store(false, Ordering::Relaxed);
 
         let mut rec = super::RecChild::spawn_from(Some(script.clone()), true)
             .expect("plain helper must take over");
         assert!(
-            super::CAPTURE_HELPER_FAILED.load(Ordering::Relaxed),
+            !super::helper_retry_due(),
             "VP failure recorded"
         );
         assert!(
@@ -1699,7 +1918,7 @@ mod tests {
         assert_eq!(rec.read_frame(&mut buf).expect("read"), super::FRAME_BYTES);
         assert!(rec.peek_newest_frame().is_some() || rec.read_frame(&mut buf).is_ok());
         drop(rec);
-        super::CAPTURE_HELPER_FAILED.store(false, Ordering::Relaxed);
+        super::helper_ok();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1739,7 +1958,7 @@ mod tests {
             return;
         }
         let mut rec = super::RecChild::spawn().expect("fallback recorder");
-        assert!(super::CAPTURE_HELPER_FAILED.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!super::helper_retry_due());
         let mut buf = [0u8; super::FRAME_BYTES];
         assert_eq!(rec.read_frame(&mut buf).unwrap(), super::FRAME_BYTES);
         eprintln!("fallback rec pid streaming");
@@ -1905,5 +2124,175 @@ mod aec_edge_tracking_tests {
             "the silent edge restarts the quiet clock"
         );
         assert!(!quiet(), "long playback just ended is not a quiet room");
+    }
+}
+
+/// The display-off case of 2026-10-18 14:57Z: the mic stops delivering,
+/// then resumes. A fake helper (never the mic) sends frames, goes silent
+/// past the read timeout, then sends again.
+#[cfg(all(test, target_os = "macos"))]
+mod silent_mic_tests {
+    use super::*;
+
+    const FAKE: &str = r#"
+import sys, time
+out = sys.stdout.buffer
+def burst(v, n):
+    for _ in range(n):
+        out.write(bytes([v, 0]) * 480); out.flush(); time.sleep(0.03)
+burst(1, 10)
+time.sleep(1.2)
+burst(2, 60)
+"#;
+
+    fn fake_helper(dir: &std::path::Path) -> PathBuf {
+        let py = dir.join("fake.py");
+        std::fs::write(&py, FAKE).unwrap();
+        let sh = dir.join("fake-capture.sh");
+        std::fs::write(&sh, format!("#!/bin/sh\nexec /usr/bin/python3 -I '{}'\n", py.display())).unwrap();
+        std::fs::set_permissions(&sh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        sh
+    }
+
+    fn read_until_value(rec: &mut RecChild, v: u8) -> io::Result<()> {
+        let mut buf = [0u8; FRAME_BYTES];
+        loop {
+            rec.read_frame(&mut buf)?;
+            if buf[0] == v {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Display asleep: the silent recorder is kept and the SAME process
+    /// delivers again when frames return. Awake: it is not kept (evicted
+    /// and respawned, as before).
+    #[test]
+    fn display_sleep_silence_keeps_the_helper_and_frames_resume_in_place() {
+        let _flags = super::tests::CAPTURE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("always-silent-mic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = fake_helper(&dir);
+        READ_TIMEOUT_TEST_MS.store(400, Ordering::Relaxed);
+
+        DISPLAY_ASLEEP_TEST.store(1, Ordering::Relaxed);
+        let mut rec = RecChild::spawn_capture_helper(&helper, &[]).expect("fake helper starts");
+        assert_eq!(rec.mode(), CaptureMode::Aec);
+        let pid = rec.child.id();
+        read_until_value(&mut rec, 1).unwrap();
+        let mut buf = [0u8; FRAME_BYTES];
+        // Drain the first burst, then the silence times the read out.
+        let err = loop {
+            match rec.read_frame(&mut buf) {
+                Ok(_) if buf[0] == 1 => continue,
+                Ok(_) => panic!("frame during the silence"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(rec.keep_through_silence(), "display asleep: kept");
+        // Frames resume on the same helper — no respawn. Until they do,
+        // every read times out and the recorder is kept each time.
+        let mut timeouts = 0;
+        loop {
+            match read_until_value(&mut rec, 2) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut && timeouts < 10 => {
+                    assert!(rec.keep_through_silence());
+                    timeouts += 1;
+                }
+                Err(e) => panic!("frames never resumed: {e}"),
+            }
+        }
+        assert_eq!(rec.child.id(), pid);
+        drop(rec);
+
+        DISPLAY_ASLEEP_TEST.store(2, Ordering::Relaxed);
+        let mut rec = RecChild::spawn_capture_helper(&helper, &[]).unwrap();
+        read_until_value(&mut rec, 1).unwrap();
+        let err = loop {
+            match rec.read_frame(&mut buf) {
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(!rec.keep_through_silence(), "display awake: a silent recorder is replaced");
+        drop(rec);
+        DISPLAY_ASLEEP_TEST.store(0, Ordering::Relaxed);
+        READ_TIMEOUT_TEST_MS.store(0, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a fallback recorder, the tick starts the full helper beside it and,
+    /// at a quiet moment, hands over: the audio carries on with no frame
+    /// captured before the old recorder's last one (no repeat) and no
+    /// recorder gap.
+    #[test]
+    fn fallback_climbs_back_to_the_aec_helper_in_place() {
+        let _flags = super::tests::CAPTURE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("always-climb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("fake.py");
+        std::fs::write(
+            &py,
+            "import sys, time\nv = 3 if '--no-vp' in sys.argv else 4\nout = sys.stdout.buffer\nwhile True:\n    out.write(bytes([v, 0]) * 480); out.flush(); time.sleep(0.03)\n",
+        )
+        .unwrap();
+        let sh = dir.join("fake-capture.sh");
+        std::fs::write(&sh, format!("#!/bin/sh\nexec /usr/bin/python3 -I '{}' \"$@\"\n", py.display())).unwrap();
+        std::fs::set_permissions(&sh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let old_bin = std::env::var_os("ALWAYS_CAPTURE_BIN");
+        // SAFETY: serialized by CAPTURE_FLAGS; restored below.
+        unsafe { std::env::set_var("ALWAYS_CAPTURE_BIN", &sh) };
+        helper_ok();
+
+        let mut slot = Some(RecChild::spawn_capture_helper(&sh, &["--no-vp"]).unwrap());
+        assert_eq!(slot.as_ref().unwrap().mode(), CaptureMode::Plain);
+        let mut buf = [0u8; FRAME_BYTES];
+        let mut last_old: Option<Instant> = None;
+        let started = Instant::now();
+        while slot.as_ref().unwrap().mode() != CaptureMode::Aec {
+            assert!(started.elapsed() < Duration::from_secs(10), "never climbed back");
+            capture_upgrade_tick(&mut slot, true);
+            let rec = slot.as_mut().unwrap();
+            if rec.mode() == CaptureMode::Aec {
+                break;
+            }
+            rec.read_frame(&mut buf).unwrap();
+            assert_eq!(buf[0], 3);
+            last_old = rec.last_captured_at();
+        }
+        let rec = slot.as_mut().unwrap();
+        rec.read_frame(&mut buf).unwrap();
+        assert_eq!(buf[0], 4, "the AEC helper's audio follows");
+        assert!(rec.last_captured_at() >= last_old, "nothing from before the hand-over");
+        drop(slot);
+        *CAPTURE_UPGRADE.lock() = None;
+        // SAFETY: as above.
+        unsafe {
+            match old_bin {
+                Some(v) => std::env::set_var("ALWAYS_CAPTURE_BIN", v),
+                None => std::env::remove_var("ALWAYS_CAPTURE_BIN"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The retry backoff doubles from 15 s and is cleared by an event.
+    #[test]
+    fn helper_retry_backs_off_and_an_event_clears_it() {
+        let _flags = super::tests::CAPTURE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        helper_ok();
+        assert!(helper_retry_due());
+        helper_failed();
+        assert!(!helper_retry_due(), "15 s after the first failure");
+        let first = HELPER_RETRY.lock().next_try.unwrap();
+        helper_failed();
+        let second = HELPER_RETRY.lock().next_try.unwrap();
+        assert!(second > first + Duration::from_secs(10), "doubles");
+        capture_retry_now();
+        assert!(helper_retry_due(), "unlock / device change retries now");
+        helper_ok();
     }
 }

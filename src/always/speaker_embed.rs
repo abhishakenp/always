@@ -108,6 +108,71 @@ pub fn ensure_model() -> Result<PathBuf> {
 /// for its cost).
 pub struct SpeakerEmbedder {
     session: Mutex<Session>,
+    /// Set when `session` is the ResNet trunk only (output `trunk`
+    /// `[1, 256, 10, T']`): the statistics pooling and the projection run
+    /// here, in f32, exactly as the full graph's tail does.
+    tail: Option<PoolingTail>,
+    /// The GPU trunk session (see [`coreml_gpu_ep`]) for inputs of exactly
+    /// [`GPU_WINDOW_SAMPLES`] — the ladder's trailing window, ~87 % of all
+    /// embeddings while media plays. Every other length stays on `session`:
+    /// the ML Program re-plans for each new input shape (whole-utterance
+    /// inputs of varied length cost MORE CPU there, 110.7 vs 94.5 ms).
+    window: Option<Box<SpeakerEmbedder>>,
+}
+
+/// Input length routed to the GPU trunk: `vad::SPEAKER_TAIL_WINDOW_SAMPLES`.
+pub(crate) const GPU_WINDOW_SAMPLES: usize = 24_000;
+/// Fbank frames of a [`GPU_WINDOW_SAMPLES`] input (25 ms / 10 ms, snip edges).
+const GPU_WINDOW_FRAMES: usize = 1 + (GPU_WINDOW_SAMPLES - 400) / 160;
+
+/// The full graph's tail after the last ResNet block: mean and unbiased
+/// standard deviation (+1e-7 under the root) over time, concatenated
+/// `[mean(2560); std(2560)]`, `Gemm` to 256, minus `mean_vec`.
+pub(crate) struct PoolingTail {
+    /// `[256 * 5120]` row-major (`transB` = 1: one row per output).
+    weight: Vec<f32>,
+    bias: Vec<f32>,
+    mean_vec: Vec<f32>,
+}
+
+const POOL_CHANNELS: usize = 2560;
+
+impl PoolingTail {
+    pub(crate) fn from_le_bytes(bytes: &[u8]) -> Result<Self> {
+        let want = (EMBEDDING_DIM * 2 * POOL_CHANNELS + 2 * EMBEDDING_DIM) * 4;
+        anyhow::ensure!(bytes.len() == want, "pooling tail: {} bytes, want {want}", bytes.len());
+        let v: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let w = EMBEDDING_DIM * 2 * POOL_CHANNELS;
+        Ok(Self {
+            weight: v[..w].to_vec(),
+            bias: v[w..w + EMBEDDING_DIM].to_vec(),
+            mean_vec: v[w + EMBEDDING_DIM..].to_vec(),
+        })
+    }
+
+    /// `h`: trunk output `[2560 * t]` (channel-major, time innermost).
+    fn apply(&self, h: &[f32], t: usize) -> Result<Vec<f32>> {
+        anyhow::ensure!(t >= 2 && h.len() == POOL_CHANNELS * t, "trunk output {} for t={t}", h.len());
+        let n = t as f32;
+        let mut z = vec![0f32; 2 * POOL_CHANNELS];
+        for (c, row) in h.chunks_exact(t).enumerate() {
+            let mean = row.iter().sum::<f32>() / n;
+            let var = row.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+            z[c] = mean;
+            z[POOL_CHANNELS + c] = (var * n / (n - 1.0) + 1e-7).sqrt();
+        }
+        Ok(self
+            .weight
+            .chunks_exact(2 * POOL_CHANNELS)
+            .zip(self.bias.iter().zip(&self.mean_vec))
+            .map(|(w, (b, m))| w.iter().zip(&z).map(|(a, x)| a * x).sum::<f32>() + b - m)
+            .collect())
+    }
 }
 
 /// ORT's own CPU kernels, one thread — the original speaker session.
@@ -124,22 +189,17 @@ fn cpu_session_builder() -> Result<ort::session::builder::SessionBuilder> {
         .map_err(|e| -> ort::Error { e.into() })?)
 }
 
-/// The speaker model runs on CoreML's CPU backend (fp32, Accelerate),
-/// not ORT's CPU kernels: the same embedding (cosine to the old one
-/// >= 0.9999988, scores within 7.5e-7) for a sixth to a ninth of the CPU
-/// (`embed_cost_probe`, 2026-10-17, process CPU per 1.5 s ladder window:
-/// film scenes 169.8 → 20.0 ms, his utterances 132.9 → 17.5 ms; whole-
-/// utterance inputs 260.6 → 27.1 ms). With a film playing the ladder scores
-/// a window every ~0.3 s, which was the daemon's 30-37 % CPU.
-/// `vad::embed_decision_equality` replays both on the same windows: no
-/// gate decision differs.
+/// The CPU session: CoreML's CPU backend (fp32, Accelerate), not ORT's CPU
+/// kernels: the same embedding (cosine to ORT's >= 0.9999988, scores within
+/// 7.5e-7) for a sixth to a ninth of the CPU (`embed_cost_probe`,
+/// 2026-10-17). Since 2026-10-19 it is the FALLBACK and the reference the
+/// GPU session is checked against at load (see [`SpeakerEmbedder::new`]).
 ///
-/// - `NeuralNetwork`, not `MLProgram`: ORT 1.24's MLProgram path returns
-///   NaN for this graph (its std-pooling tail), on every compute unit.
-/// - `CPUOnly`, not GPU/ANE: those run fp16 and move scores by up to
-///   ~3e-3 — enough to flip a window that sits at a threshold (re-measured
-///   2026-10-18 on 648 ladder windows: ANE max 8.3e-4, p99 3.9e-4, one
-///   cohort decision different, 0.17 ms CPU a window saved).
+/// - `NeuralNetwork`, not `MLProgram`: ORT's MLProgram path returns NaN for
+///   the whole graph (its std-pooling tail) — the GPU session runs the
+///   trunk only for that reason.
+/// - Not the NeuralNetwork GPU/ANE paths: those run fp16 and move scores by
+///   up to ~3e-3 (measured 2.8e-3 on 547 windows, 2026-10-19).
 /// - A non-finite embedding is an error: the speaker is not verified.
 /// - If CoreML cannot be registered at all, ORT itself runs its CPU kernels.
 fn coreml_cpu_ep() -> ort::ep::ExecutionProviderDispatch {
@@ -150,35 +210,132 @@ fn coreml_cpu_ep() -> ort::ep::ExecutionProviderDispatch {
         .build()
 }
 
+/// The trunk as an ML Program on the GPU, fp32 (low-precision GPU
+/// accumulation off): per 1.5 s ladder window 5.0 ms process CPU against
+/// the CPU session's 40 ms under the same background QoS (`embed_cost_probe`,
+/// ser-18 scene, 547 windows, 2026-10-19), scores within 8.1e-7 of it.
+fn coreml_gpu_ep() -> ort::ep::ExecutionProviderDispatch {
+    use ort::ep::coreml::{ComputeUnits, ModelFormat};
+    ort::ep::CoreML::default()
+        .with_model_format(ModelFormat::MLProgram)
+        .with_compute_units(ComputeUnits::CPUAndGPU)
+        .with_low_precision_accumulation_on_gpu(false)
+        .build()
+}
+
+/// Largest L2 distance between the GPU and CPU embeddings of the load-time
+/// probes for the GPU session to be used: fp32 agreement is ~4e-6, an fp16
+/// path ~1e-2, so this separates them with room on both sides.
+const GPU_AGREEMENT_MAX_L2: f32 = 1e-4;
+
+/// Deterministic voice-like probes for the load-time agreement check
+/// (harmonics on a wavering pitch + noise; two window-length voices).
+fn agreement_probes() -> Vec<Vec<i16>> {
+    [(GPU_WINDOW_SAMPLES, 140.0f32, 1u32), (GPU_WINDOW_SAMPLES, 210.0, 7)]
+        .iter()
+        .map(|&(n, f0, seed)| {
+            let mut rng = seed.wrapping_mul(2_654_435_761);
+            let mut phase = 0f32;
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / SAMPLE_RATE;
+                    phase += std::f32::consts::TAU * f0 * (1.0 + 0.08 * (t * 3.1).sin()) / SAMPLE_RATE;
+                    let voiced: f32 = (1..8).map(|h| (phase * h as f32).sin() / h as f32).sum();
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    let noise = (rng as f32 / u32::MAX as f32) - 0.5;
+                    ((voiced * (0.6 + 0.4 * (t * 4.0).sin().abs()) + 0.1 * noise) * 6_000.0) as i16
+                })
+                .collect()
+        })
+        .collect()
+}
+
 impl SpeakerEmbedder {
     /// Load the model from the cache dir. Errors if it hasn't been
     /// downloaded yet — call `ensure_model()` first on enrollment
     /// paths; the runtime gate treats a missing model as "gate off".
+    ///
+    /// The GPU trunk session takes the ladder windows only when its
+    /// embeddings of [`agreement_probes`] match the CPU session's within
+    /// [`GPU_AGREEMENT_MAX_L2`]; otherwise (no GPU, a CoreML change, any
+    /// load error) the CPU session runs everything, as before. Either way
+    /// the gate sees the same scores.
     pub fn new() -> Result<Self> {
         let path = model_path()?;
-        let mut builder = cpu_session_builder()?
+        let mut cpu = Self::cpu(&path)?;
+        let started = std::time::Instant::now();
+        match Self::gpu_trunk(&path).and_then(|gpu| {
+            let mut worst = 0f32;
+            for probe in agreement_probes() {
+                let (a, b) = (gpu.embed(&probe)?, cpu.embed(&probe)?);
+                let l2 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt();
+                worst = worst.max(l2);
+            }
+            Ok((gpu, worst))
+        }) {
+            Ok((gpu, l2)) if l2 <= GPU_AGREEMENT_MAX_L2 => {
+                tracing::info!(
+                    backend = "coreml-gpu-trunk",
+                    agreement_l2 = l2,
+                    check_ms = started.elapsed().as_millis() as u64,
+                    "speaker_model_backend"
+                );
+                cpu.window = Some(Box::new(gpu));
+                Ok(cpu)
+            }
+            Ok((_, l2)) => {
+                tracing::warn!(backend = "coreml-cpu", agreement_l2 = l2, "speaker_model_backend");
+                Ok(cpu)
+            }
+            Err(e) => {
+                tracing::warn!(backend = "coreml-cpu", error = %e, "speaker_model_backend");
+                Ok(cpu)
+            }
+        }
+    }
+
+    fn cpu(path: &std::path::Path) -> Result<Self> {
+        let session = cpu_session_builder()?
             .with_execution_providers([coreml_cpu_ep()])
-            .map_err(|e| -> ort::Error { e.into() })?;
-        let session = builder
-            .commit_from_file(&path)
+            .map_err(|e| -> ort::Error { e.into() })?
+            .commit_from_file(path)
             .with_context(|| format!("loading speaker model from {}", path.display()))?;
-        Ok(Self {
-            session: Mutex::new(session),
-        })
+        Ok(Self { session: Mutex::new(session), tail: None, window: None })
+    }
+
+    fn gpu_trunk(path: &std::path::Path) -> Result<Self> {
+        let split = crate::always::onnx_trunk::split(&std::fs::read(path)?)?;
+        let tail = PoolingTail::from_le_bytes(&split.tail)?;
+        let session = cpu_session_builder()?
+            .with_execution_providers([coreml_gpu_ep().error_on_failure()])
+            .map_err(|e| -> ort::Error { e.into() })?
+            .commit_from_memory(&split.model)
+            .context("loading the speaker trunk")?;
+        Ok(Self { session: Mutex::new(session), tail: Some(tail), window: None })
     }
 
     /// Run the model once on `session`; the raw (un-normalised) output.
-    fn run(session: &mut Session, feats: Vec<f32>) -> Result<Vec<f32>> {
+    fn run(session: &mut Session, tail: Option<&PoolingTail>, feats: Vec<f32>) -> Result<Vec<f32>> {
         let num_frames = feats.len() / NUM_MEL_BINS as usize;
         let tensor = ndarray::Array3::from_shape_vec((1, num_frames, NUM_MEL_BINS as usize), feats)
             .context("fbank tensor shape")?;
         let value = Value::from_array(tensor)?;
         let outputs = session.run(ort::inputs!["feats" => value])?;
-        let (_, raw) = outputs
-            .get("embs")
-            .context("model output `embs` missing")?
+        let Some(tail) = tail else {
+            let (_, raw) = outputs
+                .get("embs")
+                .context("model output `embs` missing")?
+                .try_extract_tensor::<f32>()?;
+            return Ok(raw.to_vec());
+        };
+        let (shape, h) = outputs
+            .get(crate::always::onnx_trunk::TRUNK_OUTPUT)
+            .context("trunk output missing")?
             .try_extract_tensor::<f32>()?;
-        Ok(raw.to_vec())
+        let t = *shape.last().context("trunk shape")? as usize;
+        tail.apply(h, t)
     }
 
     /// Compute the L2-normalised 256-dim embedding of an utterance.
@@ -195,7 +352,12 @@ impl SpeakerEmbedder {
 
     /// The model half of [`Self::embed`]: CMN'd fbank `[T * 80]` → embedding.
     fn embed_feats(&self, feats: Vec<f32>) -> Result<Vec<f32>> {
-        let raw = Self::run(&mut self.session.lock(), feats)?;
+        if let Some(window) = &self.window
+            && feats.len() == GPU_WINDOW_FRAMES * NUM_MEL_BINS as usize
+        {
+            return window.embed_feats(feats);
+        }
+        let raw = Self::run(&mut self.session.lock(), self.tail.as_ref(), feats)?;
         // Never seen on this backend (0 of 14,900 windows, 2026-10-17); if it
         // ever happens the speaker is simply not verified (the gate rejects).
         if raw.iter().any(|v| !v.is_finite()) {
@@ -517,8 +679,115 @@ mod tests {
     }
 
     fn probe_embedder(ep: &str) -> SpeakerEmbedder {
-        assert_eq!(ep, "shipped", "SPK_PROBE_EP: only the shipped session exists");
-        SpeakerEmbedder::new().unwrap()
+        use ort::ep::coreml::{ComputeUnits, ModelFormat};
+        let ep_name = ep;
+        let (fmt, units) = match ep {
+            "shipped" => return SpeakerEmbedder::new().unwrap(),
+            "cpu" => return SpeakerEmbedder::cpu(&model_path().unwrap()).unwrap(),
+            "gpu" => return SpeakerEmbedder::gpu_trunk(&model_path().unwrap()).unwrap(),
+            "ort-cpu" => (ModelFormat::NeuralNetwork, ComputeUnits::CPUOnly),
+            "nn-gpu" => (ModelFormat::NeuralNetwork, ComputeUnits::CPUAndGPU),
+            "nn-all" => (ModelFormat::NeuralNetwork, ComputeUnits::All),
+            "nn-ane" => (ModelFormat::NeuralNetwork, ComputeUnits::CPUAndNeuralEngine),
+            "ml-cpu" => (ModelFormat::MLProgram, ComputeUnits::CPUOnly),
+            "ml-gpu" => (ModelFormat::MLProgram, ComputeUnits::CPUAndGPU),
+            "ml-ane" => (ModelFormat::MLProgram, ComputeUnits::CPUAndNeuralEngine),
+            other => panic!("SPK_PROBE_EP {other}"),
+        };
+        let ep = ort::ep::CoreML::default()
+            .with_model_format(fmt)
+            .with_compute_units(units)
+            .with_profile_compute_plan(std::env::var_os("SPK_PROBE_PLAN").is_some())
+            .build();
+        // SPK_PROBE_TRUNK=<trunk.onnx>,<tail.bin>: the trunk-only graph.
+        let trunk = std::env::var("SPK_PROBE_TRUNK").ok();
+        let (path, tail) = match &trunk {
+            Some(t) => {
+                let (m, w) = t.split_once(',').unwrap();
+                (PathBuf::from(m), Some(PoolingTail::from_le_bytes(&std::fs::read(w).unwrap()).unwrap()))
+            }
+            None => (model_path().unwrap(), None),
+        };
+        let mut b = cpu_session_builder().unwrap();
+        if ep_name != "ort-cpu" {
+            b = b.with_execution_providers([ep]).map_err(|e| -> ort::Error { e.into() }).unwrap();
+        }
+        let session = b.commit_from_file(path).unwrap();
+        SpeakerEmbedder { session: Mutex::new(session), tail, window: None }
+    }
+
+    fn footprint_mb() -> f64 {
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V2,
+                (&mut info as *mut libc::rusage_info_v2).cast(),
+            )
+        };
+        assert_eq!(r, 0);
+        info.ri_phys_footprint as f64 / 1048576.0
+    }
+
+    /// Process footprint of each session kind after 50 window embeds:
+    /// `SPK_MEM=cpu|gpu|both cargo test --release --lib speaker_mem -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "memory probe; one session kind per process"]
+    fn speaker_mem() {
+        let Ok(kind) = std::env::var("SPK_MEM") else { return };
+        let base = footprint_mb();
+        let path = model_path().unwrap();
+        let e = match kind.as_str() {
+            "cpu" => SpeakerEmbedder::cpu(&path).unwrap(),
+            "gpu" => SpeakerEmbedder::gpu_trunk(&path).unwrap(),
+            _ => SpeakerEmbedder::new().unwrap(),
+        };
+        let loaded = footprint_mb();
+        for i in 0..50 {
+            e.embed(&synth_voice(i, 1.5)).unwrap();
+        }
+        e.embed(&synth_voice(1, 3.7)).unwrap();
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        if std::env::var_os("SPK_MEM_HOLD").is_some() {
+            eprintln!("holding pid {}", std::process::id());
+            std::thread::sleep(std::time::Duration::from_secs(std::env::var("SPK_MEM_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(8)));
+        }
+        eprintln!("speaker_mem {kind}: base {base:.1} MB, loaded +{:.1} MB, after embeds +{:.1} MB", loaded - base, footprint_mb() - base);
+    }
+
+    /// The in-memory split (trunk graph + Rust pooling tail) computes the
+    /// full graph's embedding: both on ORT's own CPU kernels (no CoreML),
+    /// then the shipped GPU trunk against the CPU session.
+    #[test]
+    fn trunk_split_matches_full_graph() {
+        let Ok(path) = model_path() else { return };
+        if !path.exists() {
+            return;
+        }
+        let split = crate::always::onnx_trunk::split(&std::fs::read(&path).unwrap()).unwrap();
+        let trunk = SpeakerEmbedder {
+            session: Mutex::new(cpu_session_builder().unwrap().commit_from_memory(&split.model).unwrap()),
+            tail: Some(PoolingTail::from_le_bytes(&split.tail).unwrap()),
+            window: None,
+        };
+        let full = SpeakerEmbedder {
+            session: Mutex::new(cpu_session_builder().unwrap().commit_from_file(&path).unwrap()),
+            tail: None,
+            window: None,
+        };
+        let cpu = SpeakerEmbedder::cpu(&path).unwrap();
+        let gpu = SpeakerEmbedder::gpu_trunk(&path).unwrap();
+        let l2 = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt();
+        for secs in [0.3f32, 1.5, 4.0] {
+            let v = synth_voice(3, secs);
+            let d = l2(&trunk.embed(&v).unwrap(), &full.embed(&v).unwrap());
+            assert!(d < 1e-5, "split vs full graph at {secs}s: {d}");
+            let g = l2(&gpu.embed(&v).unwrap(), &cpu.embed(&v).unwrap());
+            assert!(g < GPU_AGREEMENT_MAX_L2, "gpu trunk vs cpu at {secs}s: {g}");
+        }
     }
 
     #[test]
