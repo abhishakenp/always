@@ -294,8 +294,11 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
     let mut was_gated = false;
 
     crate::always::shutdown::report_pending_on_start();
+    crate::always::stall_watch::spawn();
+    use crate::always::stall_watch::{Phase, set_phase};
 
     loop {
+        set_phase(Phase::LoopTop);
         // SIGTERM/SIGINT (shutdown.rs): the utterance in progress has been
         // finished by the cycle that just returned; take no new one. The
         // signal task exits the process once the drain is done.
@@ -307,6 +310,7 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
             }
         }
         if last_dup_check.elapsed() >= Duration::from_secs(30) {
+            set_phase(Phase::Housekeeping);
             last_dup_check = Instant::now();
             daemon::reconcile_duplicate_processes();
 
@@ -365,6 +369,7 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
         // pause) must still silence capture even while a stream consumer
         // (Iris) is listening.
         if pause::should_gate_capture() {
+            set_phase(Phase::Gated);
             // Remember that capture was silenced, so the audio `rec`
             // queues up meanwhile is dropped rather than transcribed
             // when listening resumes (see the drain below).
@@ -581,6 +586,7 @@ fn process_one(
     // live focused app so a master-pause paste can only ever land back in
     // the app the words came from. See `pause::dictation_origin_app`.
     pause::set_dictation_origin_app(crate::always::focus_state::load());
+    crate::always::stall_watch::set_phase(crate::always::stall_watch::Phase::Recording);
     let record_result = match vad::record_utterance(&cfg, log, transcriber, rt) {
         Ok(r) => r,
         Err(e) => {
@@ -590,6 +596,7 @@ fn process_one(
             return Err(e).context("failed to record/transcribe utterance");
         }
     };
+    crate::always::stall_watch::set_phase(crate::always::stall_watch::Phase::AfterRecord);
     let outcome = match record_result {
         vad::RecordResult::Speech {
             text,
@@ -598,6 +605,7 @@ fn process_one(
             timing,
         } => {
             crate::always::shutdown::set_text(&text);
+            crate::always::stall_watch::set_phase(crate::always::stall_watch::Phase::HandleSpeech);
             let r = handle_speech(
                 &cfg,
                 log,
@@ -634,6 +642,7 @@ fn process_one(
             Ok(())
         }
         vad::RecordResult::DroppedSpeaker { score } => {
+            crate::always::stall_watch::set_phase(crate::always::stall_watch::Phase::HandleDrop);
             log.write(Event::DroppedSpeaker {
                 score: score as f64,
             });

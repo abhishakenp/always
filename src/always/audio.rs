@@ -274,6 +274,9 @@ fn pump_frames<R: Read>(mut reader: R, ring: &FrameRing) {
                     });
                 }
                 pending.drain(..complete * FRAME_BYTES);
+                if complete > 0 {
+                    crate::always::stall_watch::frame_pushed();
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -1098,6 +1101,7 @@ impl RecChild {
             Ok(Some(frame)) => {
                 buf.copy_from_slice(&frame.bytes);
                 self.last_captured_at = Some(frame.captured_at);
+                crate::always::stall_watch::frame_taken();
                 Ok(FRAME_BYTES)
             }
             Ok(None) => {

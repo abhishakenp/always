@@ -2,6 +2,7 @@
 //! and free your hands from the affordance.
 
 pub mod audio;
+pub mod stall_watch;
 pub mod utt_audio;
 pub mod auto_enter_countdown;
 pub mod ax_edit;

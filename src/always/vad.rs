@@ -3540,6 +3540,7 @@ fn record_with_local_vad(
             });
         }
     }
+    crate::always::stall_watch::set_phase(crate::always::stall_watch::Phase::Transcribing);
     // Segment-level "My Voice": the utterance is the user's, but foreign
     // speech around his words (a phone reel talking before he started /
     // after he stopped) is cut before STT — see `speaker_trim`. Nothing
