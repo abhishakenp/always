@@ -76,9 +76,9 @@ fn replay_his_utterances_through_the_voice_hold() {
         100.0 * caught as f64 / not_his.len() as f64,
         unsure.len()
     );
-    assert_eq!((his.len(), not_his.len()), (768, 94));
+    assert_eq!((his.len(), not_his.len()), (773, 95));
     assert!(false_holds <= 11, "his speech held {false_holds}");
-    assert!(caught >= 88, "caught {caught}");
+    assert!(caught >= 89, "caught {caught}");
 }
 
 #[test]
