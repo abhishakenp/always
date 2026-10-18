@@ -259,7 +259,8 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
-        while results.len() < n_files * 3 && idle < max_idle {
+        let mut heard = 0;
+        while heard < n_files * 3 && idle < if heard > 0 { 2 } else { max_idle } {
             let started = wall_ms();
             let r = vad::record_utterance(&cfg, &mut log, &transcriber, rt.handle());
             let ended = wall_ms();
@@ -282,6 +283,7 @@ mod tests {
                 idle += 1;
             } else {
                 idle = 0;
+                heard += 1;
             }
             if kind == "error" {
                 // recorder ended (helper exited) — done
