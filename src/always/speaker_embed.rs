@@ -108,9 +108,6 @@ pub fn ensure_model() -> Result<PathBuf> {
 /// for its cost).
 pub struct SpeakerEmbedder {
     session: Mutex<Session>,
-    /// The plain ORT CPU session, built only if the CoreML session ever
-    /// returns a non-finite embedding (it is then used for that call).
-    cpu_fallback: Mutex<Option<Session>>,
 }
 
 /// ORT's own CPU kernels, one thread — the original speaker session.
@@ -140,11 +137,11 @@ fn cpu_session_builder() -> Result<ort::session::builder::SessionBuilder> {
 /// - `NeuralNetwork`, not `MLProgram`: ORT 1.24's MLProgram path returns
 ///   NaN for this graph (its std-pooling tail), on every compute unit.
 /// - `CPUOnly`, not GPU/ANE: those run fp16 and move scores by up to
-///   ~3e-3 — enough to flip a window that sits at a threshold.
-/// - A non-finite embedding is never used: that call re-runs on ORT's CPU
-///   kernels (the old path), see `SpeakerEmbedder::embed_feats`.
-/// - If CoreML cannot be registered at all, ORT falls back to its CPU
-///   kernels — the old behaviour.
+///   ~3e-3 — enough to flip a window that sits at a threshold (re-measured
+///   2026-10-18 on 648 ladder windows: ANE max 8.3e-4, p99 3.9e-4, one
+///   cohort decision different, 0.17 ms CPU a window saved).
+/// - A non-finite embedding is an error: the speaker is not verified.
+/// - If CoreML cannot be registered at all, ORT itself runs its CPU kernels.
 fn coreml_cpu_ep() -> ort::ep::ExecutionProviderDispatch {
     use ort::ep::coreml::{ComputeUnits, ModelFormat};
     ort::ep::CoreML::default()
@@ -159,27 +156,14 @@ impl SpeakerEmbedder {
     /// paths; the runtime gate treats a missing model as "gate off".
     pub fn new() -> Result<Self> {
         let path = model_path()?;
-        let builder = cpu_session_builder()?;
-        // Replay A/B only: `SPK_FORCE_ORT_CPU=1` builds the previous session.
-        #[cfg(test)]
-        let builder = if std::env::var_os("SPK_FORCE_ORT_CPU").is_some() {
-            builder
-        } else {
-            builder
-                .with_execution_providers([coreml_cpu_ep()])
-                .map_err(|e| -> ort::Error { e.into() })?
-        };
-        #[cfg(not(test))]
-        let builder = builder
+        let mut builder = cpu_session_builder()?
             .with_execution_providers([coreml_cpu_ep()])
             .map_err(|e| -> ort::Error { e.into() })?;
-        let mut builder = builder;
         let session = builder
             .commit_from_file(&path)
             .with_context(|| format!("loading speaker model from {}", path.display()))?;
         Ok(Self {
             session: Mutex::new(session),
-            cpu_fallback: Mutex::new(None),
         })
     }
 
@@ -211,22 +195,11 @@ impl SpeakerEmbedder {
 
     /// The model half of [`Self::embed`]: CMN'd fbank `[T * 80]` → embedding.
     fn embed_feats(&self, feats: Vec<f32>) -> Result<Vec<f32>> {
-        let fallback_feats = feats.clone();
-        let mut raw = Self::run(&mut self.session.lock(), feats)?;
+        let raw = Self::run(&mut self.session.lock(), feats)?;
+        // Never seen on this backend (0 of 14,900 windows, 2026-10-17); if it
+        // ever happens the speaker is simply not verified (the gate rejects).
         if raw.iter().any(|v| !v.is_finite()) {
-            tracing::warn!("speaker_embed_nonfinite_cpu_fallback");
-            let mut slot = self.cpu_fallback.lock();
-            if slot.is_none() {
-                *slot = Some(
-                    cpu_session_builder()?
-                        .commit_from_file(model_path()?)
-                        .context("loading speaker model (cpu fallback)")?,
-                );
-            }
-            raw = Self::run(
-                slot.as_mut().expect("fallback session just built"),
-                fallback_feats,
-            )?;
+            anyhow::bail!("speaker embedding is not finite");
         }
         if raw.len() != EMBEDDING_DIM {
             anyhow::bail!(
@@ -431,10 +404,8 @@ mod tests {
     /// mono s16 WAVs, comma-separated. `SPK_PROBE_MODE=ladder` (default):
     /// the ladder's 1.5 s trailing windows at its 0.25 s step; `whole`: the
     /// whole-utterance inputs (last <= 6 s of each file) plus every prefix
-    /// length from 0.3 s in 0.23 s steps (varied T). `SPK_PROBE_EP`: `old`
-    /// (ORT CPU kernels, the previous session), `shipped`
-    /// (`SpeakerEmbedder::new`), `nn-gpu` / `nn-ane` / `nn-all` (CoreML
-    /// NeuralNetwork on those units). Times fbank and model separately
+    /// length from 0.3 s in 0.23 s steps (varied T). Measures the shipped
+    /// session (`SpeakerEmbedder::new`; `SPK_PROBE_EP` names it in the output). Times fbank and model separately
     /// (wall + process CPU) and writes every embedding to `SPK_PROBE_OUT`
     /// (raw f32 LE, 256 per window) for a window-by-window comparison.
     #[test]
@@ -506,7 +477,7 @@ mod tests {
         m_walls.sort_by(f64::total_cmp);
         let p = |q: f64| m_walls[((m_walls.len() - 1) as f64 * q) as usize] * 1e3;
         eprintln!(
-            "probe ep={ep} mode={} windows={n} audio_s/win={:.2} | fbank ms/win wall={:.2} cpu={:.2} | model ms/win wall={:.2} cpu={:.2} p50={:.1} p95={:.1} max={:.1} | cpu fallbacks={}",
+            "probe ep={ep} mode={} windows={n} audio_s/win={:.2} | fbank ms/win wall={:.2} cpu={:.2} | model ms/win wall={:.2} cpu={:.2} p50={:.1} p95={:.1} max={:.1}",
             if whole { "whole" } else { "ladder" },
             secs / n as f64,
             fb_wall / n as f64 * 1e3,
@@ -516,7 +487,6 @@ mod tests {
             p(0.5),
             p(0.95),
             p(1.0),
-            e.cpu_fallback.lock().is_some()
         );
     }
 
@@ -547,32 +517,8 @@ mod tests {
     }
 
     fn probe_embedder(ep: &str) -> SpeakerEmbedder {
-        use ort::ep::coreml::{ComputeUnits, ModelFormat};
-        if ep == "shipped" {
-            return SpeakerEmbedder::new().unwrap();
-        }
-        let nn = |units| {
-            ort::ep::CoreML::default()
-                .with_compute_units(units)
-                .with_model_format(ModelFormat::NeuralNetwork)
-                .build()
-        };
-        let b = cpu_session_builder().unwrap();
-        let mut b = match ep {
-            "old" => b,
-            "nn-gpu" => b
-                .with_execution_providers([nn(ComputeUnits::CPUAndGPU)])
-                .unwrap(),
-            "nn-ane" => b
-                .with_execution_providers([nn(ComputeUnits::CPUAndNeuralEngine)])
-                .unwrap(),
-            "nn-all" => b.with_execution_providers([nn(ComputeUnits::All)]).unwrap(),
-            other => panic!("unknown SPK_PROBE_EP {other}"),
-        };
-        SpeakerEmbedder {
-            session: Mutex::new(b.commit_from_file(model_path().unwrap()).unwrap()),
-            cpu_fallback: Mutex::new(None),
-        }
+        assert_eq!(ep, "shipped", "SPK_PROBE_EP: only the shipped session exists");
+        SpeakerEmbedder::new().unwrap()
     }
 
     #[test]
