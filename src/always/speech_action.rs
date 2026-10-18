@@ -50,6 +50,10 @@ pub enum SpeechAction {
     /// (e.g. Nepali to family transcribed as "And a baggy?"). Never pasted,
     /// never auto-Entered — kept recoverable in the rejected ring.
     ForeignSpeech { reason: String },
+    /// The voice never reached his profile (only a media-window admission)
+    /// and the recognizer was unsure: not his — held, recoverable, never
+    /// pasted (`hallucination::not_his_voice`).
+    NotHisVoice { reason: String },
     /// Accepted — daemon should copy + paste this final text.
     Paste { text: String },
 }
@@ -152,6 +156,14 @@ pub fn classify_transcription(
 ) -> SpeechAction {
     if in_cooldown(now, last_process, cfg.cooldown_ms) {
         return SpeechAction::InCooldown;
+    }
+
+    // Not his voice: decided on the speaker gate's own evidence, so it runs
+    // whatever the content-filter settings (the gate is the user's setting).
+    if let Some(reason) = crate::always::hallucination::not_his_voice(transcription) {
+        return SpeechAction::NotHisVoice {
+            reason: reason.to_string(),
+        };
     }
 
     // Out-of-language speech, judged from engine ACOUSTIC evidence (not the
@@ -597,6 +609,31 @@ mod tests {
             ),
             SpeechAction::Hallucinated { .. }
         ));
+    }
+
+    /// 2026-10-18 17:24:58: a film line admitted by the media-window rule
+    /// was pasted. Held now, even with content filtering off.
+    #[test]
+    fn classify_holds_media_admitted_low_voice() {
+        let mut cfg = test_config();
+        cfg.filter_enabled = false;
+        let text = "If you return, I did one Christmas department.";
+        let mut tr = empty_transcription(text);
+        tr.evidence.confidence = Some(0.238);
+        tr.evidence.voice_best = Some(0.37);
+        tr.evidence.voice_bar = Some(0.5);
+        let now = Instant::now();
+        let action = classify_transcription(&cfg, text, &tr, now, now - Duration::from_secs(10));
+        assert!(
+            matches!(action, SpeechAction::NotHisVoice { .. }),
+            "got {action:?}"
+        );
+        tr.evidence.voice_best = Some(0.62);
+        let action = classify_transcription(&cfg, text, &tr, now, now - Duration::from_secs(10));
+        assert!(
+            !matches!(action, SpeechAction::NotHisVoice { .. }),
+            "got {action:?}"
+        );
     }
 
     /// The 2026-10-14 bug: Nepali to mom → "And a baggy?" was pasted AND

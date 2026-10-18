@@ -86,4 +86,17 @@ final class TranscriptHistoryStoreTests: XCTestCase {
         store.clear(now: now)
         XCTAssertEqual(store.todayEntries(now: now), [])
     }
+
+    func testHeldLinesAreMarked() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("history.jsonl")
+        try """
+        {"ts":1792323598049,"raw_text":"Film line.","processed_text":"Film line.","held":"not_his_voice"}
+        {"ts":1792323598050,"raw_text":"Mine.","processed_text":"Mine."}
+        """.write(to: url, atomically: true, encoding: .utf8)
+        let entries = TranscriptHistoryStore.parseHistory(at: url)
+        XCTAssertEqual(entries.map(\.held), ["not_his_voice", nil])
+        XCTAssertEqual(entries.map(\.displayText), ["Film line.", "Mine."])
+    }
 }

@@ -182,6 +182,13 @@ pub struct RecognitionEvidence {
     /// (audio saved to the failed-chunks dir): the text is incomplete, so
     /// the paste path cues the loss and does not auto-submit it.
     pub unrecovered_parts: usize,
+    /// Best speaker-gate score any window of this utterance reached (the
+    /// verifying window or any later 1.5 s timeline window). `None` when
+    /// the speaker gate did not score it (gate off / engine unavailable).
+    pub voice_best: Option<f32>,
+    /// His profile threshold the gate verified against
+    /// (`speaker_gate_threshold`). `None` when the gate was not requested.
+    pub voice_bar: Option<f32>,
 }
 
 /// Streaming transcription result with progressive updates.

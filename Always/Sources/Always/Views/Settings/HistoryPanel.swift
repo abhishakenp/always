@@ -124,9 +124,14 @@ private struct HistoryEntryRow: View {
                 Text(entry.displayText)
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(entry.timestamp, style: .time)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    Text(entry.timestamp, style: .time)
+                    if entry.held != nil {
+                        Text("Held — not pasted (didn't sound like you)")
+                    }
+                }
+                .font(.caption2)
+                .foregroundColor(entry.held != nil ? .orange : .secondary)
             }
             Spacer()
             Button {

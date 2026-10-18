@@ -256,6 +256,14 @@ impl Timeline {
         self.windows.is_empty()
     }
 
+    /// Highest profile score of any kept window (`None` when empty).
+    pub fn max_score(&self) -> Option<f32> {
+        self.windows
+            .iter()
+            .map(|w| w.score)
+            .fold(None, |m, s| Some(m.map_or(s, |m: f32| m.max(s))))
+    }
+
     /// Compact per-utterance log line: `end_ms:score:cohort,…`
     /// (`-` = no cohort). Scores only — never embeddings or audio.
     pub fn summary(&self) -> String {

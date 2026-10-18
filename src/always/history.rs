@@ -62,6 +62,39 @@ pub fn append(raw: &str, processed: &str) {
     }
 }
 
+/// Record one utterance that was HELD, not pasted (`held` = why). Shown
+/// in History marked held so he can copy it back. Never fails the caller.
+pub fn append_held(raw: &str, held: &str) {
+    let path = history_path();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Err(err) = append_held_at(&path, raw, held, ts) {
+        tracing::warn!(error = %err, path = %path.display(), "history_append_failed");
+    }
+}
+
+/// Testable core of [`append_held`]: `{ts, raw_text, processed_text, held}`.
+pub fn append_held_at(path: &Path, raw: &str, held: &str, ts_ms: u64) -> anyhow::Result<()> {
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    rotate_if_needed(path)?;
+    let line = serde_json::json!({
+        "ts": ts_ms,
+        "raw_text": raw,
+        "processed_text": raw,
+        "held": held,
+    });
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
 /// Testable core: append `{ts, raw_text, processed_text}` as one JSON line,
 /// creating the directory on first run and rotating to `<path>.old` first
 /// when the file is oversized.
@@ -100,6 +133,29 @@ fn rotate_if_needed(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_line_is_marked_and_keeps_the_text() {
+        let path = temp_path("held");
+        append_held_at(
+            &path,
+            "If you return, I did one Christmas department.",
+            "not_his_voice",
+            7,
+        )
+        .unwrap();
+        append_held_at(&path, "   ", "not_his_voice", 8).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["held"], "not_his_voice");
+        assert_eq!(
+            v["raw_text"],
+            "If you return, I did one Christmas department."
+        );
+        assert_eq!(v["ts"], 7);
+    }
 
     fn temp_path(tag: &str) -> PathBuf {
         let dir =

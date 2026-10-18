@@ -6,11 +6,15 @@ struct TranscriptEntry: Identifiable, Equatable {
     let timestamp: Date
     let rawText: String
     let processedText: String
+    /// Why the daemon held it instead of pasting (`held` in history.jsonl),
+    /// `nil` for a pasted utterance.
+    var held: String? = nil
 
     var displayText: String { processedText.isEmpty ? rawText : processedText }
 
     static func == (a: TranscriptEntry, b: TranscriptEntry) -> Bool {
         a.timestamp == b.timestamp && a.rawText == b.rawText && a.processedText == b.processedText
+            && a.held == b.held
     }
 }
 
@@ -79,7 +83,8 @@ struct TranscriptHistoryStore {
             if raw.isEmpty && processed.isEmpty { continue }
             result.append(TranscriptEntry(
                 timestamp: Date(timeIntervalSince1970: ts / 1000),
-                rawText: raw, processedText: processed))
+                rawText: raw, processedText: processed,
+                held: json["held"] as? String))
         }
         return result
     }

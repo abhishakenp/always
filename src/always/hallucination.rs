@@ -249,6 +249,36 @@ pub fn foreign_speech(
     None
 }
 
+/// The voice gate's paste decision. The speaker gate admits audio to STT
+/// over media on a weaker rule (a window clearly closer to his profile than
+/// to the film, `speaker_trim::media_window_passes`); that admission alone
+/// no longer pastes. When NO window of the utterance reached his profile
+/// threshold (`voice_bar`, his `speaker_gate_threshold`), the text is held:
+/// recoverable, never pasted, never auto-Entered.
+///
+/// Voice only, by design: the 2026-10-18 12:09:42Z Instagram-reel line
+/// ("…Wall Street smart money…", best window 0.40) had recognizer
+/// confidence 0.82, so no confidence bar can release a low voice score.
+///
+/// The bar is his own threshold, checked against his data 2026-10-15..18
+/// (`tests/not_his_voice_replay.rs`, 862 hand-labelled utterances): at
+/// 0.50 it holds 11/768 of his and catches 88/94 not-his (Youden J 0.922);
+/// the J optimum, 0.512 (0.945), holds 18 of his for 3 more catches, and
+/// J is flat (0.92-0.945) over 0.48-0.56.
+///
+/// Ungated utterances (no voice evidence) are unaffected. Pure, O(1).
+#[must_use]
+pub fn not_his_voice(result: &TranscriptionResult) -> Option<&'static str> {
+    if result.text.trim().is_empty() {
+        return None;
+    }
+    let ev = &result.evidence;
+    let (Some(best), Some(bar)) = (ev.voice_best, ev.voice_bar) else {
+        return None;
+    };
+    (best < bar).then_some("not his voice: no window reached his profile")
+}
+
 /// Rule 1 alone: the mean word confidence when it is below
 /// [`FOREIGN_SPEECH_MAX_CONFIDENCE`] (non-empty text only), else `None`.
 #[must_use]
@@ -990,9 +1020,71 @@ mod tests {
                 live_stream,
                 preview_text: preview.map(str::to_string),
                 unrecovered_parts: 0,
+                ..Default::default()
             },
             ..Default::default()
         }
+    }
+
+    fn voiced(
+        text: &str,
+        best: Option<f32>,
+        bar: Option<f32>,
+        conf: Option<f32>,
+    ) -> TranscriptionResult {
+        let mut r = heard(text, conf, LiveStreamOutcome::NotRun, None);
+        r.evidence.voice_best = best;
+        r.evidence.voice_bar = bar;
+        r
+    }
+
+    /// The reported paste, 2026-10-18T11:39:58Z: a film line verified only
+    /// by the media-window rule (best window 0.37 < his 0.50), Apple 0.24.
+    #[test]
+    fn holds_the_film_line_the_media_window_let_through() {
+        let r = voiced(
+            "If you return, I did one Christmas department.",
+            Some(0.37),
+            Some(0.5),
+            Some(0.238),
+        );
+        assert_eq!(
+            not_his_voice(&r),
+            Some("not his voice: no window reached his profile")
+        );
+        // No recognizer confidence at all is no reason to trust it either.
+        let r = voiced("If you return.", Some(0.37), Some(0.5), None);
+        assert!(not_his_voice(&r).is_some());
+    }
+
+    #[test]
+    fn holds_the_reel_line_whatever_the_recognizer_says() {
+        // 2026-10-18T12:09:42Z, Instagram reel: best 0.40, ASR 0.82.
+        let r = voiced(
+            "my research, what's the Wall Street smart money",
+            Some(0.40),
+            Some(0.5),
+            Some(0.82),
+        );
+        assert!(not_his_voice(&r).is_some());
+    }
+
+    #[test]
+    fn pastes_when_a_window_reached_his_profile() {
+        // 2026-10-16 04:49 "So when the movie is playing…" scored ASR 0.15.
+        assert!(
+            not_his_voice(&voiced(
+                "So when the movie is playing",
+                Some(0.57),
+                Some(0.5),
+                Some(0.15)
+            ))
+            .is_none()
+        );
+        assert!(not_his_voice(&voiced("exactly at the bar", Some(0.5), Some(0.5), None)).is_none());
+        // Ungated: no voice evidence, no decision.
+        assert!(not_his_voice(&voiced("hello", None, None, Some(0.1))).is_none());
+        assert!(not_his_voice(&voiced("   ", Some(0.1), Some(0.5), Some(0.1))).is_none());
     }
 
     /// The reported bug, exactly as logged 2026-10-14T03:45:05Z: user

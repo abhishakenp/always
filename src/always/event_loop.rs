@@ -906,6 +906,45 @@ fn handle_speech(
             );
             Ok(())
         }
+        SpeechAction::NotHisVoice { reason } => {
+            // The gate never heard his profile in it (a film line admitted
+            // by the media-window rule) and the recognizer was unsure.
+            // Never pasted, never auto-Entered, never lost: the recoverable
+            // ring (`PasteRejected { id }` pastes it), a `TranscriptRejected`
+            // with the speaker reason (Iris shows it on the notch), and the
+            // History tab, marked held.
+            let decided = Instant::now();
+            let evidence = &transcription.evidence;
+            let score = evidence.voice_best.unwrap_or(0.0).max(0.0);
+            *PASTE_CTX.lock().unwrap_or_else(|p| p.into_inner()) = Some((cfg.clone(), rt.clone()));
+            let id = crate::always::rejected::push(text, score);
+            crate::always::history::append_held(text, "not_his_voice");
+            if crate::always::telemetry::should_log_transcripts() {
+                tracing::info!(text, "not_his_voice_held_text");
+            }
+            tracing::info!(
+                id,
+                reason = %reason,
+                voice_best = ?evidence.voice_best,
+                voice_bar = ?evidence.voice_bar,
+                confidence = ?evidence.confidence,
+                chars = text.chars().count(),
+                "not_his_voice_held"
+            );
+            pause::set_last_filtered(text);
+            event::global_broadcaster().voice_activity_ended();
+            event::global_broadcaster().transcript_rejected_for(
+                id,
+                text.to_string(),
+                score,
+                event::RejectReason::Speaker,
+            );
+            tracing::info!(
+                held_us = decided.elapsed().as_micros() as u64,
+                "not_his_voice_hold_done"
+            );
+            Ok(())
+        }
         SpeechAction::Paste { text: transformed } => {
             // Foreign-speech rule 1 (low confidence) in LOG-ONLY mode
             // (pref `foreign_speech_confidence_enforce` off): record what

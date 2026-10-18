@@ -1617,6 +1617,11 @@ fn record_with_local_vad(
     // End (absolute sample) of the first window that passed the film rule
     // (`speaker_trim::media_window_passes`) in this utterance.
     let mut media_pass_at: Option<usize> = None;
+    // Score of the window that verified the speaker. With the timeline's
+    // best window it is the voice evidence the paste decision weighs
+    // (`hallucination::not_his_voice`): a media-window pass admits the
+    // audio to STT but no longer, by itself, authorizes a paste.
+    let mut verified_score: Option<f32> = None;
     // Actual voiced audio accumulated (excludes pre-buffer and the
     // trailing-silence frames that also land in `speech_samples`) —
     // the embedding needs real voice, not padded silence.
@@ -1930,6 +1935,7 @@ fn record_with_local_vad(
                             stt_catchup = true;
                         }
                         crate::always::utt_audio::set_gate(score);
+                        verified_score = Some(score);
                         tracing::info!(score, via = ?job.kind, "speaker_gate_verified");
                         // Foreign speech BEFORE the user's first words (a
                         // phone reel still talking when he started) never
@@ -3547,6 +3553,17 @@ fn record_with_local_vad(
     if speaker_gate_requested && !speaker_timeline.is_empty() {
         tracing::info!(windows = %speaker_timeline.summary(), "speaker_gate_timeline");
     }
+    // Voice evidence for the paste decision: the best window of the
+    // utterance against his profile threshold (both `None` when ungated).
+    let voice_evidence: (Option<f32>, Option<f32>) = if speaker_gate_requested {
+        let best = match (verified_score, speaker_timeline.max_score()) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        (best, speaker_gate.as_ref().map(|g| g.threshold))
+    } else {
+        (None, None)
+    };
     if !final_trim.is_empty() {
         let (lead, trail) = final_trim.apply(&mut speech_samples);
         speaker_trimmed = true;
@@ -3619,6 +3636,7 @@ fn record_with_local_vad(
             voice_end_at,
             false,
         )
+        .map(|r| with_voice_evidence(r, voice_evidence))
         .map(|r| apply_mic_conflict_preemption(r, mic_conflict_preempted));
     }
 
@@ -3859,6 +3877,7 @@ fn record_with_local_vad(
     }
     result.evidence.live_stream = live_stream;
     result.evidence.preview_text = preview_text;
+    (result.evidence.voice_best, result.evidence.voice_bar) = voice_evidence;
 
     let raw = result.text.clone();
 
@@ -3878,6 +3897,7 @@ fn record_with_local_vad(
             voice_end_at,
             speculation_used,
         )
+        .map(|r| with_voice_evidence(r, voice_evidence))
         .map(|r| apply_mic_conflict_preemption(r, mic_conflict_preempted));
     }
 
@@ -3933,6 +3953,15 @@ fn record_with_local_vad(
 /// Non-speech outcomes (silence, noise, a speaker-gate drop) pass
 /// through unchanged — there is nothing to keep and nothing to suppress.
 #[cfg(target_os = "macos")]
+/// A chunked dictation's assembled result carries the utterance's voice
+/// evidence too, so the paste decision weighs it the same way.
+fn with_voice_evidence(mut result: RecordResult, voice: (Option<f32>, Option<f32>)) -> RecordResult {
+    if let RecordResult::Speech { transcription, .. } = &mut result {
+        (transcription.evidence.voice_best, transcription.evidence.voice_bar) = voice;
+    }
+    result
+}
+
 fn apply_mic_conflict_preemption(result: RecordResult, preempted: bool) -> RecordResult {
     if !preempted {
         return result;
