@@ -73,6 +73,14 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
     // Spawn + warm the Parakeet live-preview helper now (model load and
     // first ANE inference), so the user's first word is never cold.
     crate::always::preview_asr::prewarm(&cfg.lang, cfg.transcriber_backend.is_apple());
+    // The speaker model (two sessions + their agreement check, ~0.3-0.5 s)
+    // loads off the capture thread: loaded there lazily it stalled the
+    // first frames by 480 ms (2026-10-18 20:45:10Z).
+    if cfg.speaker_gate_enabled {
+        let _ = std::thread::Builder::new()
+            .name("speaker-model-load".into())
+            .spawn(|| drop(crate::always::speaker_embed::global()));
+    }
 
     // Self-heal the speaker-gate model after a cache wipe. macOS can
     // purge ~/Library/Caches between runs; Silero re-materialises from
