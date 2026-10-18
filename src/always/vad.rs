@@ -269,6 +269,36 @@ pub(crate) fn speaker_gate_ready(cfg: &AlwaysConfig) -> bool {
     speaker_gate_ctx(cfg).gate.is_some()
 }
 
+/// The speaker model's one worker: every window score and pool admission runs
+/// on this long-lived thread, in submission order, instead of a new OS thread
+/// per window (the ladder submits one every ~0.25-0.3 s while he talks or a
+/// film plays). Same embedder, same inputs: the scores are the ones a spawned
+/// thread computed; a job only waits behind the one before it (~9 ms each on
+/// the CoreML CPU session).
+fn gate_worker_run(job: impl FnOnce() + Send + 'static) {
+    type Job = Box<dyn FnOnce() + Send>;
+    static WORKER: std::sync::OnceLock<parking_lot::Mutex<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("speaker-gate".into())
+            .spawn(move || {
+                for job in rx {
+                    // Tests (panic = unwind): a panicking job must not take the worker and every
+                    // later verdict with it. Release builds abort on panic, as a spawned thread did.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .expect("spawn speaker-gate worker");
+        parking_lot::Mutex::new(tx)
+    });
+    if let Err(std::sync::mpsc::SendError(job)) = tx.lock().send(Box::new(job)) {
+        // The worker is gone (cannot happen short of a process abort): run it inline.
+        job();
+    }
+}
+
 /// Score `samples` against the enrolled voiceprint. `None` means the
 /// speaker could not be verified; gated callers must not treat it as a
 /// match.
@@ -324,7 +354,7 @@ fn speaker_gate_admit_accepted(gate: &SpeakerGate, samples: &[i16], voiced_sampl
     let embedder = Arc::clone(&gate.embedder);
     let voiceprint = Arc::clone(&gate.voiceprint);
     let threshold = gate.threshold;
-    std::thread::spawn(move || {
+    gate_worker_run(move || {
         let Ok(e) = embedder.embed(&samples) else {
             return;
         };
@@ -483,7 +513,7 @@ impl GateJob {
         // Window checks while other output plays also measure (and feed)
         // the film's recent-window cohort — see `speaker_trim::media_window`.
         let media = kind == GateJobKind::Window && speaker_gate_media_playing();
-        std::thread::spawn(move || {
+        gate_worker_run(move || {
             let local = SpeakerGate {
                 embedder,
                 voiceprint,
@@ -5876,6 +5906,27 @@ mod excise_his_turn_tests {
 /// `speaker_embed`, e.g. the old ORT-CPU session vs the shipped one) are run
 /// through the window-level decision functions the ladder applies, with the
 /// film and impostor cohorts evolving on sample time (one per input file).
+#[cfg(test)]
+mod gate_worker_tests {
+    use super::gate_worker_run;
+
+    #[test]
+    fn jobs_run_in_order_on_one_named_thread_and_survive_a_panic() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        gate_worker_run(|| panic!("a bad job"));
+        for i in 0..50 {
+            let tx = tx.clone();
+            gate_worker_run(move || {
+                let name = std::thread::current().name().map(str::to_owned);
+                tx.send((i, name)).unwrap();
+            });
+        }
+        let got: Vec<_> = (0..50).map(|_| rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()).collect();
+        assert!(got.iter().enumerate().all(|(k, (i, _))| k == *i), "in submission order");
+        assert!(got.iter().all(|(_, n)| n.as_deref() == Some("speaker-gate")), "all on the one worker");
+    }
+}
+
 #[cfg(test)]
 mod embed_decision_equality {
     use super::*;
