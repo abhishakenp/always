@@ -253,7 +253,13 @@ mod tests {
         let mut log = Logger;
         let mut results = Vec::new();
         let mut idle = 0;
-        while results.len() < n_files * 3 && idle < 2 {
+        // `REPLAY_MAX_IDLE`: empty cycles tolerated before stopping (idle→speech
+        // runs stream minutes of room tone first).
+        let max_idle: usize = std::env::var("REPLAY_MAX_IDLE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        while results.len() < n_files * 3 && idle < max_idle {
             let started = wall_ms();
             let r = vad::record_utterance(&cfg, &mut log, &transcriber, rt.handle());
             let ended = wall_ms();

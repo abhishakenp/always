@@ -81,7 +81,8 @@ pub fn frame_taken() {
 /// Pure verdict, for tests: stalled for how long, if at all.
 #[must_use]
 pub fn stalled_for(now_us: u64, pushed_us: u64, taken_us: u64) -> Option<Duration> {
-    if pushed_us == 0 || pushed_us <= taken_us {
+    // Nothing taken yet = still starting up (model loads), not a stall.
+    if pushed_us == 0 || taken_us == 0 || pushed_us <= taken_us {
         return None;
     }
     let waited = Duration::from_micros(now_us.saturating_sub(taken_us.max(1)));
@@ -178,7 +179,8 @@ mod tests {
         assert_eq!(stalled_for(10_000 * ms, 10_000 * ms, 9_800 * ms), None);
         // Helper silent (nothing pushed for 2 s): not a consumer stall.
         assert_eq!(stalled_for(10_000 * ms, 8_000 * ms, 7_000 * ms), None);
-        // Nothing ever pushed.
+        // Nothing ever pushed / nothing taken yet (startup).
         assert_eq!(stalled_for(10_000 * ms, 0, 0), None);
+        assert_eq!(stalled_for(10_000 * ms, 10_000 * ms, 0), None);
     }
 }

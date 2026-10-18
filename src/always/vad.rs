@@ -1220,6 +1220,22 @@ impl UtterancePreview {
         lang: &str,
         verified: bool,
     ) {
+        self.open(lang, verified);
+        self.attach(session);
+    }
+
+    /// The Apple session joined (opened off the loop): its partials join
+    /// the preview already running.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn attach(&mut self, session: &mut crate::always::apple_stt::StreamSession) {
+        if let Some(preview) = &self.preview {
+            session.set_partial_sink(Arc::clone(preview));
+        }
+    }
+
+    /// Open the preview (Parakeet when English and warm) at speech onset,
+    /// before any Apple session exists.
+    fn open(&mut self, lang: &str, verified: bool) {
         if self.preview.is_some() {
             return;
         }
@@ -1227,7 +1243,6 @@ impl UtterancePreview {
             verified,
             crate::always::live_preview::LivePreview::broadcaster(),
         );
-        session.set_partial_sink(Arc::clone(&preview));
         if crate::always::preview_asr::lang_is_english(lang)
             && let Some(asr) = crate::always::preview_asr::global()
         {
@@ -2035,6 +2050,13 @@ fn record_with_local_vad(
     // round trip. `None` on other backends or when the engine is
     // unavailable — everything below degrades to the existing paths.
     let mut stream_session: Option<crate::always::apple_stt::StreamSession> = None;
+    // A live session being opened off this thread. Opening one is a
+    // synchronous XPC round trip to the speech service, which after idle
+    // can take seconds; on this thread it stopped the frame loop with it
+    // (`audio_delivery_lag_ms` 6066 at 2026-10-18 12:00:13Z, overlay 6.3 s
+    // late). The loop keeps reading; the session joins when it is ready
+    // and catches up on everything said so far.
+    let mut stream_opening: Option<std::sync::mpsc::Receiver<Option<crate::always::apple_stt::StreamSession>>> = None;
     // `stream_session` is the live session for the open TAIL of a chunked
     // utterance once this is set: at every hard chunk flush a fresh session
     // (fed the carried audio) REPLACES the running one, so at the end its
@@ -2522,6 +2544,7 @@ fn record_with_local_vad(
                     }
                 }
                 if stream_session.is_none()
+                    && stream_opening.is_none()
                     && !stt_deferred
                     && matches!(
                         cfg.transcriber_backend,
@@ -2529,24 +2552,46 @@ fn record_with_local_vad(
                     )
                     && crate::always::apple_stt::check_availability()
                 {
-                    stream_session = crate::always::apple_stt::StreamSession::start(
-                        stream_session_lang,
-                        &crate::always::stt_apple::context_phrases(),
+                    stream_opening = Some(open_stream_session(
+                        stream_session_lang.map(str::to_string),
+                    ));
+                    // The preview (Parakeet) does not wait for Apple.
+                    let opened_now = utt_preview.preview.is_none();
+                    utt_preview.open(
+                        &cfg.lang,
+                        preview_is_routable(speaker_gate_requested, speaker_checked),
                     );
+                    if opened_now && stt_catchup {
+                        // Deferred over media until now: Parakeet hears
+                        // everything he said so far.
+                        utt_preview.catch_up(&speech_samples);
+                    }
+                }
+                if let Some(rx) = stream_opening.as_ref()
+                    && let Ok(opened) = rx.try_recv()
+                {
+                    stream_opening = None;
+                    stream_session = opened;
                     if stream_session.is_none() {
                         tracing::debug!("apple_stream_session_unavailable");
+                    } else {
+                        // Everything said while it opened, at once.
+                        stt_catchup = true;
                     }
                     if let Some(session) = stream_session.as_mut() {
+                        let preview_was_open = utt_preview.preview.is_some();
                         utt_preview.start(
                             session,
                             &cfg.lang,
                             preview_is_routable(speaker_gate_requested, speaker_checked),
                         );
                         if stt_catchup {
-                            // Opened late (deferred over media): everything he
-                            // said so far, at once.
+                            // Opened late (deferred over media, or opening
+                            // off the loop): everything said so far, at once.
                             session.feed(&speech_samples);
-                            utt_preview.catch_up(&speech_samples);
+                            if !preview_was_open {
+                                utt_preview.catch_up(&speech_samples);
+                            }
                             stt_catchup = false;
                         }
                     }
@@ -3961,6 +4006,31 @@ fn with_voice_evidence(mut result: RecordResult, voice: (Option<f32>, Option<f32
         (transcription.evidence.voice_best, transcription.evidence.voice_bar) = voice;
     }
     result
+}
+
+/// Open an Apple live session on its own thread (see `stream_opening`).
+/// The receiver yields once: the session, or `None` when unavailable.
+fn open_stream_session(
+    lang: Option<String>,
+) -> std::sync::mpsc::Receiver<Option<crate::always::apple_stt::StreamSession>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let phrases = crate::always::stt_apple::context_phrases();
+    let spawned = std::thread::Builder::new()
+        .name("apple-stream-open".into())
+        .spawn(move || {
+            let t = std::time::Instant::now();
+            let session = crate::always::apple_stt::StreamSession::start(lang.as_deref(), &phrases);
+            tracing::info!(
+                elapsed_ms = t.elapsed().as_millis() as u64,
+                ok = session.is_some(),
+                "apple_stream_opened"
+            );
+            let _ = tx.send(session);
+        });
+    if spawned.is_err() {
+        tracing::warn!("apple_stream_open_thread_failed");
+    }
+    rx
 }
 
 fn apply_mic_conflict_preemption(result: RecordResult, preempted: bool) -> RecordResult {
