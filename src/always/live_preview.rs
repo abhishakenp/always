@@ -33,6 +33,9 @@ struct State {
     last_sent: String,
     last_sent_verified: bool,
     first_sent_logged: bool,
+    /// First non-empty text from each engine, ms after the preview opened.
+    first_parakeet_ms: Option<u64>,
+    first_apple_ms: Option<u64>,
 }
 
 pub struct LivePreview {
@@ -113,6 +116,21 @@ pub fn merge(apple: &str, parakeet: &str) -> String {
     format!("{} {}", apple, p[cut..].join(" "))
 }
 
+impl Drop for LivePreview {
+    /// Each engine's first words, once per preview: which one is the
+    /// first-text bottleneck, measured instead of assumed.
+    fn drop(&mut self) {
+        let st = self.state.lock();
+        if st.first_parakeet_ms.is_some() || st.first_apple_ms.is_some() {
+            tracing::info!(
+                parakeet_ms = st.first_parakeet_ms,
+                apple_ms = st.first_apple_ms,
+                "live_preview_first_by_engine"
+            );
+        }
+    }
+}
+
 impl LivePreview {
     pub fn new(verified: bool, emit: Emit) -> Arc<Self> {
         Arc::new(Self {
@@ -125,6 +143,8 @@ impl LivePreview {
                 last_sent: String::new(),
                 last_sent_verified: false,
                 first_sent_logged: false,
+                first_parakeet_ms: None,
+                first_apple_ms: None,
             }),
             emit,
             onset: Instant::now(),
@@ -177,12 +197,18 @@ impl LivePreview {
     pub fn on_parakeet(&self, text: &str) {
         let mut st = self.state.lock();
         st.parakeet = text.trim().to_string();
+        if st.first_parakeet_ms.is_none() && !st.parakeet.is_empty() {
+            st.first_parakeet_ms = Some(self.onset.elapsed().as_millis() as u64);
+        }
         self.publish(&mut st, "parakeet");
     }
 
     pub fn on_apple(&self, text: &str) {
         let mut st = self.state.lock();
         st.apple = text.trim().to_string();
+        if st.first_apple_ms.is_none() && !st.apple.is_empty() {
+            st.first_apple_ms = Some(self.onset.elapsed().as_millis() as u64);
+        }
         self.publish(&mut st, "apple");
     }
 

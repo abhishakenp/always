@@ -2439,10 +2439,7 @@ fn record_with_local_vad(
         // once, dimmed, with no Listening cue and no listening look
         // (`VoiceOnsetPending`); the cue and the look come when the gate
         // verifies him. Over media nothing shows before the verdict.
-        let onset_pending_ok = speaker_gate_requested
-            && !onset_pending_sent
-            && crate::always::audio::other_output_quiet();
-        if !in_speech && !voice_activity_announced && (instant_announce_ok || onset_pending_ok) {
+        if !in_speech && !voice_activity_announced && instant_announce_ok {
             if early_voice_frame_ok(
                 frame_energy,
                 last_prob,
@@ -2453,15 +2450,7 @@ fn record_with_local_vad(
             } else {
                 early_voice_streak = 0;
             }
-            if early_voice_streak >= EARLY_VOICE_MIN_FRAMES && !instant_announce_ok {
-                onset_pending_sent = true;
-                tracing::info!(
-                    latency_ms = first_voice_at.map(|t| t.elapsed().as_millis() as u64),
-                    "voice_onset_pending_shown"
-                );
-                event::global_broadcaster().voice_onset_pending();
-                early_voice_streak = 0;
-            } else if early_voice_streak >= EARLY_VOICE_MIN_FRAMES {
+            if early_voice_streak >= EARLY_VOICE_MIN_FRAMES {
                 // Show the listening overlay IMMEDIATELY on voice onset.
                 // Without a speaker gate there is nothing to verify against,
                 // so waiting would only add 0.2-4.3s of dead time before the
@@ -2605,6 +2594,28 @@ fn record_with_local_vad(
             consecutive_speech += 1;
             consecutive_silence = 0;
             if consecutive_speech >= min_speech_frames {
+                // With "My Voice" on, a quiet room's speech onset shows his
+                // preview at once, dimmed, with no Listening cue and no
+                // listening look (`VoiceOnsetPending`); the cue and the look
+                // come when the gate verifies him. Over media nothing shows
+                // before the verdict. Gated on confirmed speech (Silero >= the
+                // speech threshold for `onset_ms`), not the early-voice
+                // streak: on 1.65 h of night room audio the streak fired 208
+                // times an hour, speech onset 56, for +30 ms on his onsets
+                // (p50 60 ms after his speech starts; `onset_gate_eval`).
+                if !in_speech
+                    && speaker_gate_requested
+                    && !onset_pending_sent
+                    && !voice_activity_announced
+                    && crate::always::audio::other_output_quiet()
+                {
+                    onset_pending_sent = true;
+                    tracing::info!(
+                        latency_ms = first_voice_at.map(|t| t.elapsed().as_millis() as u64),
+                        "voice_onset_pending_shown"
+                    );
+                    event::global_broadcaster().voice_onset_pending();
+                }
                 in_speech = true;
                 // Start live recognition the moment speech is confirmed —
                 // partials flowing early is the whole point. Only the Apple
@@ -6282,5 +6293,84 @@ mod embed_decision_equality {
             max_d[0], max_d[1], max_d[2]
         );
         assert_eq!(differing, 0, "a window decided differently");
+    }
+}
+
+/// Quiet-room onset gate, offline: how often each candidate gate for the
+/// dimmed `VoiceOnsetPending` fires on audio with no speech for the
+/// computer (`OG_NEG`: comma-separated raw s16 16 kHz files, e.g. night echo
+/// dumps' `.out.s16`) and how early/often it fires on his utterances
+/// (`OG_POS`: JSON [{wav}]). `cargo test --release --lib onset_gate_eval -- --ignored --nocapture`.
+#[cfg(test)]
+mod onset_gate_eval {
+    #[test]
+    #[ignore = "offline; needs OG_NEG/OG_POS"]
+    fn onset_gate_eval() {
+        let (Ok(neg), Ok(pos)) = (std::env::var("OG_NEG"), std::env::var("OG_POS")) else { return };
+        let cfg = crate::always::AlwaysConfig::default();
+        let early_thr = (super::voice_activity_energy_threshold(&cfg) * super::EARLY_VOICE_ENERGY_RATIO)
+            .max(cfg.hear_energy_threshold);
+        let speech = cfg.silero_threshold;
+        let fast = cfg.energy_threshold <= 0.01;
+        let energy = |f: &[i16]| if fast { super::fast_normalized_energy(f) } else { super::normalized_energy(f) };
+        // Gate variants: (name, energy factor, silero floor, frames).
+        let gates: [(&str, f64, f32, usize); 5] = [
+            ("current e>=early p>=0.225 x2", 1.0, speech * 0.45, 2),
+            ("p>=0.5 x2", 1.0, speech, 2),
+            ("p>=0.7 x2", 1.0, 0.7, 2),
+            ("p>=0.5 x3", 1.0, speech, 3),
+            ("e>=2x p>=0.5 x2", 2.0, speech, 2),
+        ];
+        let vad = crate::always::vad_silero::SileroVad::new().unwrap();
+        let frames_of = |pcm: &[i16]| -> Vec<(f64, f32)> {
+            pcm.chunks(480).filter(|c| c.len() == 480).map(|f| (energy(f), vad.predict(f).unwrap_or(0.0))).collect()
+        };
+        // Onsets: a streak of `n` passing frames, re-armed after 300 ms of
+        // non-passing frames.
+        let onsets = |fr: &[(f64, f32)], g: (f64, f32, usize)| -> Vec<usize> {
+            let (mut out, mut streak, mut quiet, mut armed) = (Vec::new(), 0usize, 0usize, true);
+            for (k, &(e, p)) in fr.iter().enumerate() {
+                let ok = e >= early_thr * g.0 && p >= g.1;
+                if ok { streak += 1; quiet = 0 } else { streak = 0; quiet += 1; if quiet >= 10 { armed = true } }
+                if armed && streak >= g.2 { out.push(k + 1 - g.2); armed = false }
+            }
+            out
+        };
+        let mut neg_frames = Vec::new();
+        for f in neg.split(',').filter(|s| !s.is_empty()) {
+            let b = std::fs::read(f).unwrap();
+            let pcm: Vec<i16> = b.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
+            neg_frames.push(frames_of(&pcm));
+        }
+        let neg_hours = neg_frames.iter().map(|f| f.len()).sum::<usize>() as f64 * 0.03 / 3600.0;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(pos).unwrap()).unwrap();
+        let mut pos_frames = Vec::new();
+        for r in &rows {
+            let b = std::fs::read(r["wav"].as_str().unwrap()).unwrap();
+            let pcm: Vec<i16> = b[44..].as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
+            pos_frames.push(frames_of(&pcm));
+        }
+        eprintln!("negatives {neg_hours:.2} h, positives {} utterances", pos_frames.len());
+        for (name, ef, pf, n) in gates {
+            let g = (ef, pf, n);
+            let false_n: usize = neg_frames.iter().map(|f| onsets(f, g).len()).sum();
+            // Positives: first onset vs the daemon's speech onset (p>=0.5 x2 start).
+            let mut deltas = Vec::new();
+            let mut missed = 0;
+            for f in &pos_frames {
+                let speech_on = (0..f.len().saturating_sub(1)).find(|&k| f[k].1 >= speech && f[k + 1].1 >= speech);
+                match (onsets(f, g).first(), speech_on) {
+                    (Some(&o), Some(s)) => deltas.push((o as i64 - s as i64) * 30 + (n as i64) * 30),
+                    _ => missed += 1,
+                }
+            }
+            deltas.sort();
+            let q = |p: f64| deltas.get(((deltas.len().max(1) - 1) as f64 * p) as usize).copied().unwrap_or(0);
+            eprintln!(
+                "{name:32} false onsets {false_n} ({:.1}/h) | his: missed {missed}, fire ms after speech onset p10 {} p50 {} p90 {}",
+                false_n as f64 / neg_hours,
+                q(0.1), q(0.5), q(0.9)
+            );
+        }
     }
 }

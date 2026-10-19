@@ -821,3 +821,128 @@ mod tests {
         assert!(!lang_is_english("es"));
     }
 }
+
+/// Offline first-text latency + accuracy of the preview path, the daemon's
+/// way: real-time 30 ms frames, the utterance opened 60 ms after the first
+/// voiced frame (`onset_ms`) with up to 480 ms of pre-roll, fed through
+/// [`PreviewUtterance`] (level normaliser, IPC) to the helper. Per file: ms
+/// from the first voiced frame's capture to the first partial, and the
+/// final text. `PV_CORPUS=<json [{wav,ref}]> PV_OUT=<jsonl>
+/// ALWAYS_PREVIEW_ASR_BIN=… cargo test --release --lib preview_latency_probe -- --ignored`.
+#[cfg(test)]
+mod latency_probe {
+    use super::*;
+
+    fn read_wav(path: &str) -> Vec<i16> {
+        let b = std::fs::read(path).unwrap();
+        let mut i = 12;
+        loop {
+            let id = &b[i..i + 4];
+            let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
+            if id == b"data" {
+                return b[i + 8..(i + 8 + len).min(b.len())]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i16::from_le_bytes(*c))
+                    .collect();
+            }
+            i += 8 + len + (len & 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "real-time preview probe; needs PV_* env + the helper"]
+    fn preview_latency_probe() {
+        let Ok(corpus) = std::env::var("PV_CORPUS") else { return };
+        let out = std::env::var("PV_OUT").expect("PV_OUT");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(corpus).unwrap()).unwrap();
+        let asr = global().expect("preview helper");
+        let t = Instant::now();
+        while !asr.is_ready() && t.elapsed() < Duration::from_secs(120) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(asr.is_ready(), "helper not ready");
+        let mut f = std::fs::File::create(&out).unwrap();
+        const FRAME: usize = 480;
+        let voiced = |fr: &[i16]| {
+            let rms = (fr.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / fr.len() as f64).sqrt();
+            rms >= 0.0056 * 32768.0 // -45 dBFS
+        };
+        let limit: usize = std::env::var("PV_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        for row in rows.into_iter().take(limit) {
+            let wav = row["wav"].as_str().unwrap();
+            let pcm = read_wav(wav);
+            let frames: Vec<&[i16]> = pcm.chunks(FRAME).filter(|c| c.len() == FRAME).collect();
+            // The daemon's onset: two consecutive Silero frames >= 0.5
+            // (onset_ms 60); the preview opens on the second.
+            let vad = crate::always::vad_silero::SileroVad::new().unwrap();
+            let probs: Vec<f32> = frames.iter().map(|fr| vad.predict(fr).unwrap_or(0.0)).collect();
+            let _ = &voiced;
+            let Some(onset) = (0..probs.len().saturating_sub(1)).find(|&k| probs[k] >= 0.5 && probs[k + 1] >= 0.5)
+            else {
+                continue;
+            };
+            let open_at = onset + 1;
+            let (tx, rx) = std::sync::mpsc::channel::<(Instant, String, bool)>();
+            let start = Instant::now();
+            let mut utt: Option<PreviewUtterance> = None;
+            for (k, fr) in frames.iter().enumerate() {
+                let due = start + Duration::from_millis(30 * (k as u64 + 1));
+                if let Some(d) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(d);
+                }
+                if k == open_at {
+                    let tx = tx.clone();
+                    let mut u = asr
+                        .begin(Arc::new(move |ev| match ev {
+                            PreviewEvent::Partial(t) => {
+                                let _ = tx.send((Instant::now(), t, false));
+                            }
+                            PreviewEvent::Final(t) => {
+                                let _ = tx.send((Instant::now(), t, true));
+                            }
+                        }))
+                        .expect("begin");
+                    let pre_n: usize = std::env::var("PV_PREROLL").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+                    let pre: Vec<i16> = frames[k.saturating_sub(pre_n)..=k].concat();
+                    u.feed(&pre);
+                    utt = Some(u);
+                } else if let Some(u) = utt.as_mut() {
+                    u.feed(fr);
+                }
+            }
+            // End WITHOUT detaching, to hear the final.
+            let seq = utt.as_ref().map(|u| u.seq);
+            if let Some(u) = utt {
+                asr.send(Frame::End(u.seq));
+                std::mem::forget(u);
+            }
+            let onset_wall = start + Duration::from_millis(30 * (onset as u64 + 1));
+            let mut first: Option<f64> = None;
+            let mut fin = String::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while let Ok((at, text, is_final)) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                if !is_final && first.is_none() && !text.trim().is_empty() {
+                    first = Some(at.saturating_duration_since(onset_wall).as_secs_f64() * 1e3);
+                }
+                if is_final {
+                    fin = text;
+                    break;
+                }
+            }
+            {
+                let mut cur = asr.current.lock();
+                if cur.as_ref().map(|(s, _)| *s) == seq {
+                    *cur = None;
+                }
+            }
+            let line = serde_json::json!({"wav": wav, "ref": row["ref"], "first_ms": first, "final": fin});
+            use std::io::Write;
+            writeln!(f, "{line}").unwrap();
+            eprintln!("{line}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+}

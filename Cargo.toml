@@ -168,6 +168,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+# Stall samples (stall_watch) from a stripped daemon are addresses only:
+# keep line tables in a separate dSYM (target/release/always.dSYM), saved
+# per build next to the rollback copies.
+debug = "line-tables-only"
+split-debuginfo = "packed"
 
 # ── Linux packaging (.deb / .rpm) ──────────────────────────────────────────
 # Built by .github/workflows/release.yml with:
