@@ -489,7 +489,8 @@ class StateMonitor: ObservableObject {
         // silently discarded previews the daemon deliberately produced
         // on the cloud backend.
         // Preview heard before speaker verification: shown at once, dimmed.
-        if partialUnverified && !partialTranscript.isEmpty && !isTranscribing {
+        // A quiet-room voice onset opens it before any words (VoiceOnsetPending).
+        if partialUnverified && !isTranscribing && !isVoiceActivity {
             return .unverifiedPreview(text: partialTranscript)
         }
         if isTranscribing {
@@ -732,6 +733,16 @@ class StateMonitor: ObservableObject {
                 unverifiedLeaseWork?.cancel()
                 partialTranscript = text
                 armTranscribingLease()
+                updateOverlay()
+            }
+        case .voiceOnsetPending:
+            // His voice started in a quiet room; not verified yet. The dimmed
+            // preview opens now (no cue, no listening look) and fills with
+            // his words as they come; VoiceActivityDetected upgrades it.
+            if !isVoiceActivity && !isTranscribing {
+                partialTranscript = ""
+                partialUnverified = true
+                armUnverifiedLease()
                 updateOverlay()
             }
         case .transcriptionInterimPending:

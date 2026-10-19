@@ -177,6 +177,11 @@ pub enum DaemonEvent {
     TranscriptionInterimPending {
         text: String,
     },
+    /// Voice onset in a quiet room, BEFORE "My Voice" verified the speaker:
+    /// the GUI opens the dimmed preview at once (no Listening cue, no
+    /// listening look). `VoiceActivityDetected` follows on verification;
+    /// `VoiceActivityEnded` retracts it. GUI-only, like the pending text.
+    VoiceOnsetPending,
     /// Speaking-loudness meter (~20 Hz). Sent ONLY for voiced frames of
     /// the user's own speech: VAD says voice AND the speaker is verified
     /// (or My Voice is off) — never for room noise, fans, or media that
@@ -858,6 +863,8 @@ pub struct EventBroadcaster {
     /// the call when nothing is active, so idle `Silence` cycles don't
     /// flood the UDS clients with redundant terminal events.
     voice_active: Arc<AtomicBool>,
+    /// A `VoiceOnsetPending` is showing (cleared by verification or end).
+    onset_pending: Arc<AtomicBool>,
     /// Same transition guard for `TranscribingStarted`/`TranscribingStopped`.
     transcribing_active: Arc<AtomicBool>,
     /// Audio cue lifetime is the entire process_one cycle, not a speculative
@@ -887,6 +894,7 @@ impl EventBroadcaster {
         Self {
             tx,
             voice_active: Arc::new(AtomicBool::new(false)),
+            onset_pending: Arc::new(AtomicBool::new(false)),
             transcribing_active: Arc::new(AtomicBool::new(false)),
             transcribing_cued: Arc::new(AtomicBool::new(false)),
             listening_cued: Arc::new(AtomicBool::new(false)),
@@ -1010,6 +1018,15 @@ impl EventBroadcaster {
         self.send(DaemonEvent::TranscriptionInterimPending { text });
     }
 
+    /// Quiet-room voice onset before verification (see
+    /// `DaemonEvent::VoiceOnsetPending`). No cue.
+    pub fn voice_onset_pending(&self) {
+        if !self.voice_active.load(Ordering::SeqCst) {
+            self.onset_pending.store(true, Ordering::SeqCst);
+            self.send(DaemonEvent::VoiceOnsetPending);
+        }
+    }
+
     /// Live capture level tick (see `DaemonEvent::VoiceLevel`).
     pub fn voice_level(&self, energy: f64, voiced: bool, bands: [f32; 5]) {
         let energy_db = if energy > 1e-5 {
@@ -1089,6 +1106,7 @@ impl EventBroadcaster {
     /// Send voice activity detected event. Always broadcast (re-emits
     /// double as a keep-alive heartbeat for the GUI's stale-state watchdog).
     pub fn voice_activity_detected(&self) {
+        self.onset_pending.store(false, Ordering::SeqCst);
         if !self.voice_active.swap(true, Ordering::SeqCst)
             && !self.listening_cued.swap(true, Ordering::SeqCst)
         {
@@ -1100,7 +1118,8 @@ impl EventBroadcaster {
     /// Send voice activity ended event — only when voice activity was
     /// announced and not yet ended (safe to call from any exit path).
     pub fn voice_activity_ended(&self) {
-        if self.voice_active.swap(false, Ordering::SeqCst) {
+        let pending = self.onset_pending.swap(false, Ordering::SeqCst);
+        if self.voice_active.swap(false, Ordering::SeqCst) || pending {
             self.send(DaemonEvent::VoiceActivityEnded);
         }
     }
@@ -1490,6 +1509,25 @@ mod tests {
         assert!(matches!(events[0], DaemonEvent::VoiceActivityDetected));
         assert!(matches!(events[1], DaemonEvent::VoiceActivityEnded));
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn voice_onset_pending_is_cue_free_and_retracted_by_the_end() {
+        let b = EventBroadcaster::new();
+        let mut rx = b.subscribe();
+        b.voice_onset_pending();
+        b.voice_activity_ended();
+        let events: Vec<DaemonEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(matches!(events[0], DaemonEvent::VoiceOnsetPending));
+        assert!(matches!(events[1], DaemonEvent::VoiceActivityEnded), "the dimmed onset is retracted");
+        // After verification, the end is the ordinary one (sent once).
+        b.voice_onset_pending();
+        b.voice_activity_detected();
+        b.voice_activity_ended();
+        b.voice_activity_ended();
+        let events: Vec<DaemonEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let ends = events.iter().filter(|e| matches!(e, DaemonEvent::VoiceActivityEnded)).count();
+        assert_eq!(ends, 1);
     }
 
     #[test]

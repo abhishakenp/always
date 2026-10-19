@@ -39,6 +39,15 @@ import Foundation
 
 signal(SIGPIPE, SIG_IGN)
 let args = Set(CommandLine.arguments.dropFirst())
+/// Live capture is latency-critical: without this activity the system may
+/// coalesce and defer this process's work once the display sleeps (App
+/// Nap / timer coalescing), and the mic audio then reaches the daemon in
+/// bursts — 2026-10-19 05:54:16 the display went off and 8.9 s of audio
+/// arrived at once; 5.6 s and 12.7 s later with the display still off.
+/// Idle system sleep stays allowed; it never keeps the display awake.
+let captureActivity = ProcessInfo.processInfo.beginActivity(
+    options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+    reason: "live microphone capture for dictation")
 let parentPid = getppid()
 
 func log(_ s: String) {
@@ -875,7 +884,19 @@ func stopRawMeter() {
 // touches them.
 var monoBuf: AVAudioPCMBuffer?
 var outBuf: AVAudioPCMBuffer?
+/// Mic tap callbacks arrive every ~21 ms; a gap past 500 ms is logged (the
+/// device or this process was late), so a daemon-side stall has its source.
+var lastTapAt: UInt64 = 0
 input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buffer, when in
+    let tapNow = mach_absolute_time()
+    if lastTapAt != 0 {
+        let gapMs = Double(tapNow &- lastTapAt) / hostTicksPerSec * 1000
+        if gapMs >= 500 {
+            let lateMs = when.isHostTimeValid ? Double(Int64(bitPattern: tapNow &- when.hostTime)) / hostTicksPerSec * 1000 : -1
+            log(String(format: "mic tap gap %.0f ms (buffer captured %.0f ms ago)", gapMs, lateMs))
+        }
+    }
+    lastTapAt = tapNow
     let frames = Int(buffer.frameLength)
     guard frames > 0, let src = buffer.floatChannelData?[0] else { return }
     if rawLevelsEnabled { procMeter.add(src, frames, rate: inFormat.sampleRate) }

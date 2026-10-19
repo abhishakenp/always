@@ -29,6 +29,7 @@ enum DaemonEventType: String, Codable {
     // Live preview heard before "My Voice" verified the speaker: shown
     // immediately but DIMMED (decision 2026-10-14). Strings only.
     case transcriptionInterimPending = "TranscriptionInterimPending"
+    case voiceOnsetPending = "VoiceOnsetPending"
     // ~20 Hz speaking-loudness meter (numeric payload). Consumed by Iris's
     // notch; the GUI decodes it only so it never counts as a decode failure.
     case voiceLevel = "VoiceLevel"

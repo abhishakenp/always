@@ -1542,6 +1542,8 @@ fn record_with_local_vad(
     // The loop ended at the endpoint (base window / holds / learned cut),
     // not at a cap, a recorder EOF or a gate drop.
     let mut ended_at_endpoint = false;
+    // `VoiceOnsetPending` sent for this utterance (once).
+    let mut onset_pending_sent = false;
     let mut early_voice_streak = 0usize;
     let mut long_recording_warned = false;
     let mut total_frames = 0usize;
@@ -2433,7 +2435,14 @@ fn record_with_local_vad(
                 instant_announce_blocked_until,
                 std::time::Instant::now(),
             );
-        if !in_speech && !voice_activity_announced && instant_announce_ok {
+        // With "My Voice" on, a quiet room's voice onset shows his preview at
+        // once, dimmed, with no Listening cue and no listening look
+        // (`VoiceOnsetPending`); the cue and the look come when the gate
+        // verifies him. Over media nothing shows before the verdict.
+        let onset_pending_ok = speaker_gate_requested
+            && !onset_pending_sent
+            && crate::always::audio::other_output_quiet();
+        if !in_speech && !voice_activity_announced && (instant_announce_ok || onset_pending_ok) {
             if early_voice_frame_ok(
                 frame_energy,
                 last_prob,
@@ -2444,7 +2453,15 @@ fn record_with_local_vad(
             } else {
                 early_voice_streak = 0;
             }
-            if early_voice_streak >= EARLY_VOICE_MIN_FRAMES {
+            if early_voice_streak >= EARLY_VOICE_MIN_FRAMES && !instant_announce_ok {
+                onset_pending_sent = true;
+                tracing::info!(
+                    latency_ms = first_voice_at.map(|t| t.elapsed().as_millis() as u64),
+                    "voice_onset_pending_shown"
+                );
+                event::global_broadcaster().voice_onset_pending();
+                early_voice_streak = 0;
+            } else if early_voice_streak >= EARLY_VOICE_MIN_FRAMES {
                 // Show the listening overlay IMMEDIATELY on voice onset.
                 // Without a speaker gate there is nothing to verify against,
                 // so waiting would only add 0.2-4.3s of dead time before the

@@ -304,11 +304,21 @@ impl FrameRing {
 fn pump_frames<R: Read>(mut reader: R, ring: &FrameRing) {
     let mut chunk = vec![0u8; READER_CHUNK_BYTES];
     let mut pending: Vec<u8> = Vec::with_capacity(READER_CHUNK_BYTES + FRAME_BYTES);
+    let mut last_read: Option<Instant> = None;
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
                 let now = Instant::now();
+                // Nothing reached the pipe for a while: the recorder (or the
+                // device behind it) was late, not this process — named here so
+                // a `capture_consumer_stall` that follows has its source.
+                if let Some(gap) = last_read.map(|t| now - t)
+                    && gap >= DELIVERY_GAP_LOG
+                {
+                    tracing::info!(gap_ms = gap.as_millis() as u64, bytes = n, "capture_delivery_gap");
+                }
+                last_read = Some(now);
                 capture_heartbeat(&chunk[..n]);
                 pending.extend_from_slice(&chunk[..n]);
                 let complete = pending.len() / FRAME_BYTES;
@@ -335,6 +345,10 @@ fn pump_frames<R: Read>(mut reader: R, ring: &FrameRing) {
     }
     ring.close();
 }
+
+/// A pause in the recorder's output at least this long is logged
+/// (`capture_delivery_gap`); frames arrive every ~30-100 ms.
+const DELIVERY_GAP_LOG: Duration = Duration::from_millis(500);
 
 static TEMP_WAV_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -956,6 +970,13 @@ impl RecChild {
         std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
+                // The mic's path into the daemon: never deferred by QoS
+                // clamping while the display sleeps (see the helper's
+                // latency-critical activity).
+                // SAFETY: sets this thread's own QoS class; no pointers.
+                unsafe {
+                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+                }
                 // Log when the first audio lands: the device cold
                 // start, measured instead of assumed.
                 let mut first = FirstRead {
