@@ -894,9 +894,9 @@ var outBuf: AVAudioPCMBuffer?
 let micRing = rt_ring_create(1 << 19)!   // floats: ~5.4 s at 96 kHz
 let micReady = DispatchSemaphore(value: 0)
 let micStride = inFormat.isInterleaved ? UInt32(inFormat.channelCount) : 1
-/// The processing thread is woken once per ~1024 input frames (the old tap's
-/// block, ~11 ms at 96 kHz), not per IO cycle: same latency, fewer wakeups.
-let MIC_WAKE_FRAMES: UInt32 = 1024
+/// The processing thread is woken once per ~2048 input frames (~21 ms at
+/// 96 kHz, the tap's cadence), not per IO cycle.
+let MIC_WAKE_FRAMES: UInt32 = 2048
 var micPendingFrames: UInt32 = 0   // IO thread only
 let micSink = AVAudioSinkNode { ts, frameCount, abl -> OSStatus in
     let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
@@ -956,16 +956,25 @@ func processMic(_ src: UnsafePointer<Float>, _ frames: Int, host: UInt64) {
     }
 }
 
+/// Everything queued since the last wake is converted and processed as ONE
+/// block (stamped with its first IO block's capture time): the converter and
+/// canceller run ~47 times a second as with the tap, not once per IO cycle.
 let micThread = Thread {
-    var block = [Float](repeating: 0, count: 1 << 15)
-    var host: UInt64 = 0
+    let cap = 1 << 16
+    var block = [Float](repeating: 0, count: cap)
+    var host: UInt64 = 0, firstHost: UInt64 = 0
     while true {
         micReady.wait()
-        while true {
-            let n = block.withUnsafeMutableBufferPointer { rt_ring_read(micRing, $0.baseAddress!, UInt32($0.count), &host) }
+        var filled = 0
+        while filled < cap - 8192 {
+            let n = block.withUnsafeMutableBufferPointer {
+                rt_ring_read(micRing, $0.baseAddress! + filled, UInt32(cap - filled), &host)
+            }
             if n == 0 { break }
-            block.withUnsafeBufferPointer { processMic($0.baseAddress!, Int(n), host: host) }
+            if filled == 0 { firstHost = host }
+            filled += Int(n)
         }
+        if filled > 0 { block.withUnsafeBufferPointer { processMic($0.baseAddress!, filled, host: firstHost) } }
     }
 }
 micThread.name = "mic-process"
