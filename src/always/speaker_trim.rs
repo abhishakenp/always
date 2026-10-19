@@ -91,7 +91,7 @@ impl WindowVerdict {
             // A margin, not just "closer": 2026-10-16 14:37:49Z his own words
             // under a full-volume YouTube voice scored 0.32 him / 0.37 video,
             // counted foreign, and his sentence was cut mid-way.
-            let margin = if old_trail_rule() { f32::MIN_POSITIVE } else { MEDIA_FOREIGN_MARGIN };
+            let margin = MEDIA_FOREIGN_MARGIN;
             let media_foreign =
                 self.media && (c - self.score >= margin || self.score < MEDIA_TAIL_MIN_SCORE);
             clear || media_foreign
@@ -378,25 +378,6 @@ pub fn clear_cohort() {
 // (his recordings + a TTS film through the real canceller, SER -18 dB):
 // utterances with a passing window 2/8 → 7/8, film windows passing 0/154.
 
-/// The film rules below are on (always, except offline "before" replays
-/// with `GATE_REPLAY_BASELINE` set).
-/// Replay A/B: `GATE_REPLAY_OLD_TRAIL=1` restores the 7a84839e9d700f120cc0b2996d41740e09c43d94 media rule
-/// (any window closer to the impostor is foreign; a trail cut ends the utterance).
-pub fn old_trail_rule() -> bool {
-    #[cfg(test)]
-    if std::env::var_os("GATE_REPLAY_OLD_TRAIL").is_some() {
-        return true;
-    }
-    false
-}
-
-pub fn media_rules_on() -> bool {
-    #[cfg(test)]
-    if std::env::var_os("GATE_REPLAY_BASELINE").is_some() {
-        return false;
-    }
-    true
-}
 
 /// Windows this far from his profile while output plays are the film.
 pub const MEDIA_COHORT_ADMIT_MAX_SCORE: f32 = 0.12;

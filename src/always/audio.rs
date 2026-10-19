@@ -713,10 +713,6 @@ fn wait_readable(fd: i32, timeout_ms: i32) -> io::Result<Readiness> {
     }
 }
 
-/// When the capture helper last switched its echo canceller from bypass to
-/// engaged because ANOTHER process started output (not for one of our own
-/// cues). Microseconds on [`aec_clock`]; 0 = never.
-static AEC_OUTPUT_ENGAGED_US: AtomicU64 = AtomicU64::new(0);
 
 fn aec_clock() -> &'static std::time::Instant {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -728,12 +724,7 @@ fn aec_clock() -> &'static std::time::Instant {
 /// newly started playback reaches the mic unfiltered (the helper reacts to
 /// the output starting; it cannot precede it).
 fn note_capture_helper_line(line: &str) {
-    if line.contains("aec engaged (output pids") {
-        let us = aec_clock().elapsed().as_micros() as u64;
-        AEC_OUTPUT_ENGAGED_US.store(us.max(1), Ordering::Relaxed);
-        OTHER_OUTPUT.store(OUTPUT_PLAYING, Ordering::Relaxed);
-        note_output_playing();
-    } else if line.contains("aec engaged (tap reference playing)") {
+    if line.contains("aec engaged (tap reference playing)") {
         // Tap-referenced AEC (System Audio Recording granted): the helper
         // reports the global output tap, not pids. Missing this left the
         // state QUIET through music, so the quiet-room instant Listening
@@ -751,16 +742,6 @@ fn note_capture_helper_line(line: &str) {
         // voice's tail cued Listening — 5 false cues in a minute.
         note_output_playing();
         OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
-    } else if line.contains("aec bypassed (") {
-        // The helper only bypasses after its hangover with NO other
-        // process playing (2 s after short sounds, 120 s after media).
-        OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
-        OUTPUT_LAST_PLAYING_US.store(0, Ordering::Relaxed);
-    } else if line.contains("aec gate on: other output pids now []") {
-        OTHER_OUTPUT.store(OUTPUT_QUIET, Ordering::Relaxed);
-        OUTPUT_LAST_PLAYING_US.store(0, Ordering::Relaxed);
-    } else if line.contains("aec gate on: other output pids now [") {
-        OTHER_OUTPUT.store(OUTPUT_PLAYING, Ordering::Relaxed);
     }
 }
 
@@ -805,13 +786,6 @@ fn note_output_playing() {
     OUTPUT_LAST_PLAYING_US.store(us.max(1), Ordering::Relaxed);
 }
 
-/// Instant of the last bypass→engaged edge caused by other playback.
-pub(crate) fn aec_output_engaged_at() -> Option<std::time::Instant> {
-    match AEC_OUTPUT_ENGAGED_US.load(Ordering::Relaxed) {
-        0 => None,
-        us => Some(*aec_clock() + std::time::Duration::from_micros(us)),
-    }
-}
 
 /// Test hook: pretend the helper reported an output-triggered engage now.
 #[cfg(test)]
@@ -1170,6 +1144,7 @@ impl RecChild {
     }
 
     /// Which recorder this is.
+    #[cfg(test)]
     pub(crate) fn mode(&self) -> CaptureMode {
         self.mode
     }
@@ -2091,40 +2066,10 @@ mod tests {
 }
 
 #[cfg(test)]
-mod aec_edge_tracking_tests {
+mod output_state_tests {
     #[test]
-    fn only_output_triggered_engage_lines_set_the_edge() {
-        use super::{aec_output_engaged_at, note_capture_helper_line_for_test as note};
-        let before = aec_output_engaged_at();
-        note("always-capture: aec engaged (cue) tap=7ch@44100");
-        note("always-capture: aec bypassed (no other output) tap=7ch@44100");
-        assert_eq!(aec_output_engaged_at(), before);
-        let t = std::time::Instant::now();
-        note(
-            "always-capture: aec engaged (output pids [\"1252:com.apple.WebKit.GPU\"]) tap=7ch@44100",
-        );
-        let got = aec_output_engaged_at().expect("edge recorded");
-        assert!(got + std::time::Duration::from_millis(5) >= t && got <= std::time::Instant::now());
-
-        // Quiet-room state (instant Listening cue with My Voice on), from
-        // the exact helper lines logged 2026-10-15. Same test: one global.
-        use super::other_output_quiet as quiet;
-        assert!(!quiet(), "media just engaged");
-        note("always-capture: aec bypassed (no other output for 120s) tap=7ch@44100");
-        assert!(quiet());
-        note("always-capture: aec engaged (cue) tap=7ch@44100");
-        assert!(quiet(), "our own cue is not other output");
-        note(
-            "always-capture: aec engaged (output pids [\"1252:com.apple.WebKit.GPU\"]) tap=7ch@44100",
-        );
-        assert!(!quiet());
-        note(
-            "always-capture: aec gate on: other output pids now [\"88:node\"] (bypassed after 2.0s of none)",
-        );
-        assert!(!quiet());
-        note("always-capture: aec gate on: other output pids now [] (bypassed after 2.0s of none)");
-        assert!(quiet());
-
+    fn tap_reference_lines_set_the_room_state() {
+        use super::{note_capture_helper_line_for_test as note, other_output_quiet as quiet};
         // Tap-referenced mode (22:12Z): music = "tap reference playing";
         // a gap = "tap reference silent" — not quiet until 3 s pass.
         note("always-capture: aec engaged (tap reference playing)");

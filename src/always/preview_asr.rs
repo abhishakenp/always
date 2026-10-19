@@ -229,7 +229,7 @@ impl PreviewAsr {
             seq,
             started: Instant::now(),
             samples: 0,
-            level: LevelNormalizer::new(),
+            level: PeakMeter::default(),
         })
     }
 
@@ -253,8 +253,8 @@ impl PreviewAsr {
         let mut queued = true;
         for part in samples.chunks(16_000) {
             utt.samples += part.len();
-            let boosted = utt.level.process(part);
-            queued &= self.send(Frame::Audio(utt.seq, boosted));
+            utt.level.push(part);
+            queued &= self.send(Frame::Audio(utt.seq, part.to_vec()));
         }
         // End WITHOUT detaching the sink (Drop detaches first, which would
         // discard the very `final` this call waits for).
@@ -283,133 +283,29 @@ fn writer_loop(mut stdin: ChildStdin, rx: mpsc::Receiver<Frame>, alive: Arc<Atom
     }
 }
 
-/// Speech level the preview engine is fed at: per-30 ms-frame RMS envelope
-/// of −20 dBFS. Parakeet EOU has a hard input-level floor — measured
-/// 2026-10-14 on a 16 kHz TTS sentence fed at real time through the
-/// helper: utterance RMS −24.6/−27.4/−32.6 dBFS → first partial 401–409 ms,
-/// −38.4 and −48.8 dBFS → NO text at all. Apple's recognizer, the VAD and
-/// the speaker gate have no such floor, so only this feed is normalised.
-const PREVIEW_TARGET_RMS: f32 = 0.1 * 32768.0;
-/// Never boost more than +24 dB (room tone stays room tone).
-const PREVIEW_MAX_GAIN: f32 = 15.85;
-/// Frames quieter than −50 dBFS RMS never change the gain. Measured room
-/// tone on the user's MacBook Air: −73…−83 dBFS bypassed, −55…−70 dBFS
-/// through voice processing; quiet speech frames sit above −50.
-const PREVIEW_VOICE_GATE: f32 = 0.003_16 * 32768.0;
-/// Envelope release per 30 ms frame (≈ −10 dB/s); attack is instant.
-const PREVIEW_ENV_RELEASE: f32 = 0.966;
-const PREVIEW_GAIN_FRAME: usize = 480;
-
-/// Level normaliser for the Parakeet feed. Why it exists: the capture
-/// helper bypasses voice processing while nothing else plays, and the
-/// bypassed (raw-mic) signal is quieter than the processed one — on the
-/// user's MacBook Air the post-bypass utterances landed at −29…−37 dBFS
-/// against a −23 dBFS median before, under Parakeet's floor. Boost-only
-/// (gain ≥ 1): speech whose loud frames already reach −20 dBFS is passed
-/// through bit-identical.
-#[derive(Debug, Clone)]
-pub(crate) struct LevelNormalizer {
-    env: f32,
-    gain: f32,
-    peak_env: f32,
+/// Loudest 30 ms frame RMS of one utterance's preview feed (i16 units),
+/// for the per-utterance level log. The feed itself is passed through as
+/// captured: the old +24 dB boost toward −20 dBFS was removed 2026-10-19
+/// (his decision — without it Parakeet shows short words like "yes":
+/// 90-utterance replay, see `preview_latency_probe`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PeakMeter {
+    peak: f32,
 }
 
-impl LevelNormalizer {
-    pub(crate) fn new() -> Self {
-        Self {
-            env: 0.0,
-            gain: 1.0,
-            peak_env: 0.0,
-        }
-    }
-
-    /// Gain currently applied (linear).
-    pub(crate) fn gain(&self) -> f32 {
-        self.gain
-    }
-
-    /// Loudest per-frame RMS seen (i16 units).
-    pub(crate) fn peak_env(&self) -> f32 {
-        self.peak_env
-    }
-
-    pub(crate) fn process(&mut self, samples: &[i16]) -> Vec<i16> {
-        if boost_disabled() {
-            return samples.to_vec();
-        }
-        let frame_rms = |frame: &[i16]| {
-            (frame.iter().map(|&s| (s as f32) * (s as f32)).sum::<f32>()
+impl PeakMeter {
+    pub(crate) fn push(&mut self, samples: &[i16]) {
+        for frame in samples.chunks(480) {
+            let rms = (frame.iter().map(|&s| (s as f32) * (s as f32)).sum::<f32>()
                 / frame.len().max(1) as f32)
-                .sqrt()
-        };
-        // Look-ahead over the whole block. The utterance opens with the
-        // daemon's pre-roll (~480 ms handed over in one call): its
-        // first frames are the quiet rise of the first word, and sizing
-        // the gain on them alone pumped it to +24 dB right before the
-        // loud syllable — which then clipped (measured −2.7 dBFS frames)
-        // and Parakeet lost the first word. Seeding the envelope with the
-        // block's loudest voiced frame sizes the gain on the word itself.
-        let block_peak = samples
-            .chunks(PREVIEW_GAIN_FRAME)
-            .map(frame_rms)
-            .fold(0.0f32, f32::max);
-        if block_peak >= PREVIEW_VOICE_GATE && block_peak > self.env {
-            self.env = block_peak;
+                .sqrt();
+            self.peak = self.peak.max(rms);
         }
-        let mut out = Vec::with_capacity(samples.len());
-        for frame in samples.chunks(PREVIEW_GAIN_FRAME) {
-            let rms = frame_rms(frame);
-            self.peak_env = self.peak_env.max(rms);
-            self.env = if rms >= self.env {
-                rms
-            } else {
-                (self.env * PREVIEW_ENV_RELEASE).max(rms)
-            };
-            // Only plausible voice moves the gain: room tone holds it, so
-            // a word onset after a pause is never hit by a gain that
-            // drifted up on silence.
-            let mut target = if rms >= PREVIEW_VOICE_GATE {
-                (PREVIEW_TARGET_RMS / self.env).clamp(1.0, PREVIEW_MAX_GAIN)
-            } else {
-                self.gain
-            };
-            // Never clip: the frame's own peak bounds the gain (−0.3 dBFS).
-            let peak = frame
-                .iter()
-                .map(|&s| (s as i32).unsigned_abs())
-                .max()
-                .unwrap_or(0) as f32;
-            if peak > 0.0 {
-                target = target.min((32_000.0 / peak).max(1.0));
-            }
-            // Cuts apply to the whole frame at once (the frame is known
-            // before it is scaled, so this is look-ahead, not a click);
-            // raises ramp across the frame.
-            let g0 = if target < self.gain {
-                target
-            } else {
-                self.gain
-            };
-            let n = frame.len() as f32;
-            for (i, &s) in frame.iter().enumerate() {
-                let g = g0 + (target - g0) * ((i + 1) as f32 / n);
-                out.push(
-                    (s as f32 * g)
-                        .round()
-                        .clamp(i16::MIN as f32, i16::MAX as f32) as i16,
-                );
-            }
-            self.gain = target;
-        }
-        out
     }
-}
 
-/// `ALWAYS_PREVIEW_BOOST=0` turns the Parakeet level boost off (A/B in the
-/// field without a rebuild).
-fn boost_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("ALWAYS_PREVIEW_BOOST").as_deref() == Ok("0"))
+    pub(crate) fn peak(&self) -> f32 {
+        self.peak
+    }
 }
 
 /// One utterance's feed into the helper. Dropping it ends the utterance.
@@ -418,7 +314,7 @@ pub struct PreviewUtterance {
     seq: u32,
     started: Instant,
     samples: usize,
-    level: LevelNormalizer,
+    level: PeakMeter,
 }
 
 impl PreviewUtterance {
@@ -427,8 +323,8 @@ impl PreviewUtterance {
             return;
         }
         self.samples += samples.len();
-        let boosted = self.level.process(samples);
-        self.asr.send(Frame::Audio(self.seq, boosted));
+        self.level.push(samples);
+        self.asr.send(Frame::Audio(self.seq, samples.to_vec()));
     }
 }
 
@@ -443,8 +339,8 @@ impl Drop for PreviewUtterance {
             }
         }
         self.asr.send(Frame::End(self.seq));
-        // Info, once per utterance: the input level and the boost applied
-        // are what tell a quiet-mic miss from a helper fault in the log.
+        // Info, once per utterance: the input level is what
+        // tells a quiet-mic miss from a helper fault in the log.
         let db = |v: f32| {
             if v > 0.0 {
                 (20.0 * (v / 32768.0).log10() * 10.0).round() / 10.0
@@ -453,8 +349,8 @@ impl Drop for PreviewUtterance {
             }
         };
         crate::always::utt_audio::set_level(
-            db(self.level.peak_env()) as f32,
-            (20.0 * self.level.gain().log10() * 10.0).round() as f32 / 10.0,
+            db(self.level.peak()) as f32,
+            0.0,
             self.samples as f64 / 16_000.0,
         );
         tracing::info!(
@@ -462,8 +358,7 @@ impl Drop for PreviewUtterance {
             audio_secs = self.samples as f64 / 16_000.0,
             wall_ms = self.started.elapsed().as_millis() as u64,
             dropped_frames = self.asr.dropped_frames.load(Ordering::Relaxed),
-            peak_frame_dbfs = db(self.level.peak_env()),
-            end_gain_db = (20.0 * self.level.gain().log10() * 10.0).round() / 10.0,
+            peak_frame_dbfs = db(self.level.peak()),
             "preview_asr_utterance_end"
         );
     }
@@ -582,182 +477,6 @@ mod tests {
         );
         assert_eq!(parse_line(r#"{"ev":"ready","load_ms":1}"#), None);
         assert_eq!(parse_line("not json"), None);
-    }
-
-    fn tone(amp: f32, n: usize) -> Vec<i16> {
-        (0..n)
-            .map(|i| (amp * (i as f32 * 0.11).sin()) as i16)
-            .collect()
-    }
-
-    fn rms(s: &[i16]) -> f32 {
-        (s.iter().map(|&v| (v as f32).powi(2)).sum::<f32>() / s.len() as f32).sqrt()
-    }
-
-    #[test]
-    fn loud_speech_passes_through_unchanged() {
-        let mut n = LevelNormalizer::new();
-        let x = tone(8000.0, 4800); // ≈ −15 dBFS RMS
-        assert_eq!(n.process(&x), x);
-        assert_eq!(n.gain(), 1.0);
-    }
-
-    #[test]
-    fn quiet_speech_is_raised_to_target_within_a_frame() {
-        let mut n = LevelNormalizer::new();
-        let x = tone(400.0, 4800); // ≈ −41 dBFS RMS: below Parakeet's floor
-        let y = n.process(&x);
-        let tail = &y[960..];
-        let got = rms(tail);
-        assert!(
-            (got - PREVIEW_TARGET_RMS).abs() / PREVIEW_TARGET_RMS < 0.05,
-            "rms {got}"
-        );
-        // Same waveform, only scaled.
-        assert!(
-            y.iter()
-                .zip(&x)
-                .all(|(a, b)| (*a >= 0) == (*b >= 0) || *b == 0)
-        );
-    }
-
-    #[test]
-    fn gain_is_capped_and_room_tone_never_moves_it() {
-        let mut n = LevelNormalizer::new();
-        assert!(n.process(&vec![0; 4800]).iter().all(|&v| v == 0));
-        let room = tone(20.0, 4800); // −64 dBFS room tone
-        assert_eq!(n.process(&room), room);
-        assert_eq!(n.gain(), 1.0);
-        n.process(&tone(150.0, 4800)); // −47 dBFS: voice, very quiet
-        assert!((n.gain() - PREVIEW_MAX_GAIN).abs() < 1e-3);
-        // A pause after it holds the gain (no drift either way).
-        n.process(&room);
-        assert!((n.gain() - PREVIEW_MAX_GAIN).abs() < 1e-3);
-    }
-
-    #[test]
-    fn loud_onset_after_quiet_pause_is_never_clipped() {
-        let mut n = LevelNormalizer::new();
-        n.process(&tone(150.0, 4800)); // very quiet voice: gain at max
-        n.process(&vec![0; 4800]); // pause holds it
-        // The loud frame is known before it is scaled: the cut applies to
-        // all of it — no wrap, no clipping, unity gain at once.
-        let y = n.process(&tone(30000.0, 480));
-        assert_eq!(n.gain(), 1.0);
-        assert_eq!(y, tone(30000.0, 480));
-    }
-
-    /// The 2026-10-14 onset failure: a pre-buffer whose first frames are
-    /// the quiet rise of a word must not pump the gain to +24 dB onto the
-    /// word's loud frames (which clipped to −2.7 dBFS frames and lost the
-    /// first word). The block's loudest frame sizes the gain.
-    #[test]
-    fn prebuffer_block_is_sized_on_its_loudest_frame() {
-        let mut n = LevelNormalizer::new();
-        let mut block = tone(60.0, 480 * 4); // rise: ≈ −58 dBFS (below gate)
-        block.extend(tone(300.0, 480 * 2)); // ≈ −44 dBFS
-        block.extend(tone(6000.0, 480 * 6)); // the word: ≈ −18 dBFS
-        let y = n.process(&block);
-        assert!(
-            y.iter().all(|&v| v != i16::MAX && v != i16::MIN),
-            "no clipping"
-        );
-        // Loud part ≈ unchanged (gain ≈ 1), quiet rise not boosted 24 dB.
-        let tail = &y[480 * 7..];
-        assert!((rms(tail) / rms(&block[480 * 7..]) - 1.0).abs() < 0.05);
-        assert!(rms(&y[480 * 4..480 * 6]) < 3.0 * rms(&block[480 * 4..480 * 6]));
-    }
-
-    /// Real helper, real time, quiet speech (TTS at −20 dB ≈ the bypassed
-    /// raw-mic level): the boost must bring Parakeet's first partial back.
-    /// `ALWAYS_PREVIEW_ASR_BIN=/Applications/Always.app/Contents/MacOS/always-preview-asr
-    ///  cargo test --lib live_quiet_speech_preview -- --ignored --nocapture`
-    #[test]
-    #[ignore = "needs the preview helper + `say`; run explicitly"]
-    fn live_quiet_speech_preview() {
-        let dir = std::env::temp_dir().join(format!("always-preview-live-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let wav = dir.join("tts.wav");
-        let ok = Command::new("/usr/bin/say")
-            .args(["-o", wav.to_str().unwrap(), "--data-format=LEI16@16000"])
-            .arg("Okay so I want to check how fast the live preview shows my words on the screen today.")
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok);
-        let bytes = std::fs::read(&wav).unwrap();
-        let data = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
-        let speech: Vec<i16> = bytes[data..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        let bin = locate_helper().expect("helper binary");
-        for (gain, label) in [(0.5f32, "-6 dB"), (0.1, "-20 dB"), (0.03, "-30 dB")] {
-            let asr = PreviewAsr::new(bin.clone());
-            assert!(asr.ensure_spawned());
-            let t = Instant::now();
-            while !asr.is_ready() && t.elapsed() < Duration::from_secs(60) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let first: Arc<Mutex<Option<(Duration, String)>>> = Arc::default();
-            let f = Arc::clone(&first);
-            let onset = Arc::new(Mutex::new(Instant::now()));
-            let o = Arc::clone(&onset);
-            let mut utt = asr
-                .begin(Arc::new(move |ev| {
-                    if let PreviewEvent::Partial(text) = ev
-                        && !text.is_empty()
-                    {
-                        let at = Instant::now().saturating_duration_since(*o.lock());
-                        f.lock().get_or_insert((at, text));
-                    }
-                }))
-                .expect("helper ready");
-            let scaled: Vec<i16> = speech.iter().map(|&s| (s as f32 * gain) as i16).collect();
-            let rms_dbfs = 20.0 * (rms(&scaled) / 32768.0).log10();
-            // The daemon opens every utterance with its 200 ms pre-buffer
-            // (room tone before the VAD fired); latency counts from speech.
-            // Real microphones never deliver digital zeros: room tone at
-            // −75 dBFS (the measured bypassed floor) under and before it.
-            let lead = 3_200usize;
-            let mut rng = 0x2545_f491_u32;
-            let fed: Vec<i16> = std::iter::repeat_n(0i16, lead)
-                .chain(scaled.iter().copied())
-                .map(|s| {
-                    rng ^= rng << 13;
-                    rng ^= rng >> 17;
-                    rng ^= rng << 5;
-                    s.saturating_add(((rng % 21) as i16) - 10)
-                })
-                .collect();
-            let t0 = Instant::now();
-            *onset.lock() = t0 + Duration::from_millis(200);
-            for (i, frame) in fed.chunks(480).enumerate() {
-                utt.feed(frame);
-                let due = t0 + Duration::from_millis(30 * (i as u64 + 1));
-                if let Some(d) = due.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(d);
-                }
-            }
-            drop(utt);
-            std::thread::sleep(Duration::from_millis(300));
-            let got = first.lock().clone();
-            eprintln!(
-                "live_quiet_speech_preview {label} (utterance rms {rms_dbfs:.1} dBFS): first partial {got:?}"
-            );
-            let (lat, _) = got.unwrap_or_else(|| panic!("no Parakeet partial at {label}"));
-            assert!(
-                lat < Duration::from_millis(700),
-                "{label}: first partial {lat:?}"
-            );
-            if let Some(mut p) = asr.proc_.lock().take() {
-                let _ = p.child.kill();
-                let _ = p.child.wait();
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Real helper: a finished span fed at once comes back as one final

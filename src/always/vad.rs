@@ -459,35 +459,6 @@ fn speaker_gate_reject_from(media_playing: bool) -> usize {
 
 const SPEAKER_GATE_EARLY_SAMPLES_MEDIA: usize = 68_000;
 
-/// Capture-path slack added before the scored audio's start: the helper
-/// delivers in ~100 ms bursts behind the voice processor, and its stderr
-/// line about the engage edge is read asynchronously.
-const AEC_EDGE_GUARD: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Did the echo canceller switch from bypass to engaged (because another
-/// process started playing) while — or just before the end of — the audio
-/// a speaker verdict was computed on? Then that audio holds the first
-/// moments of the new playback UNCANCELLED (the helper engages in reaction
-/// to the output starting, and the canceller needs time to converge), and
-/// a voice in it may be the video's. Measured 2026-10-14 11:25:16Z: a
-/// YouTube narrator verified at 0.581 on exactly such a window, while every
-/// narrator window after convergence scored 0.15–0.21 and the user's own
-/// verified scores over the same video were 0.516–0.685 — a threshold
-/// cannot separate them, the transition can. Such a verdict is neither a
-/// pass nor a fail: later windows (cancelled audio) decide.
-fn gate_audio_straddles_aec_engage(
-    audio_started_at: std::time::Instant,
-    verdict_at: std::time::Instant,
-    engaged_at: Option<std::time::Instant>,
-) -> bool {
-    let Some(engaged) = engaged_at else {
-        return false;
-    };
-    let from = audio_started_at
-        .checked_sub(AEC_EDGE_GUARD)
-        .unwrap_or(audio_started_at);
-    engaged > from && engaged <= verdict_at
-}
 
 /// What an in-flight speaker check was scoring, so its verdict is
 /// applied with the right semantics when it lands.
@@ -524,10 +495,6 @@ struct GateJob {
     committed_at_submit: usize,
     /// `voiced_samples` when submitted (early-streak eligibility).
     voiced_at_submit: usize,
-    /// Wall time the scored audio began (submit time minus its length):
-    /// a verdict on audio that straddles an echo-canceller engage edge
-    /// is not trusted — see [`gate_audio_straddles_aec_engage`].
-    audio_started_at: std::time::Instant,
     /// Samples scored (window = `len_at_submit - scored_len ..
     /// len_at_submit` of the live buffer) — for the segment timeline.
     scored_len: usize,
@@ -549,11 +516,6 @@ impl GateJob {
         let embedder = Arc::clone(&gate.embedder);
         let voiceprint = Arc::clone(&gate.voiceprint);
         let threshold = gate.threshold;
-        let audio_started_at = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs_f64(
-                samples.len() as f64 / 16_000.0,
-            ))
-            .unwrap_or_else(std::time::Instant::now);
         let scored_len = samples.len();
         let extra = Arc::new(std::sync::OnceLock::new());
         let extra_w = Arc::clone(&extra);
@@ -583,7 +545,6 @@ impl GateJob {
             len_at_submit,
             committed_at_submit,
             voiced_at_submit,
-            audio_started_at,
             scored_len,
             extra,
         }
@@ -602,9 +563,6 @@ impl GateJob {
     /// Similarity of the scored window to the film's recent windows
     /// (`None`: no output playing, or no film heard yet).
     fn media_similarity(&self) -> Option<f32> {
-        if !crate::always::speaker_trim::media_rules_on() {
-            return None;
-        }
         self.extra.get().and_then(|(_, _, m)| *m)
     }
 
@@ -619,14 +577,6 @@ impl GateJob {
         }
     }
 
-    /// The scored audio straddles a bypass→engaged echo-canceller edge.
-    fn straddles_aec_engage(&self) -> bool {
-        gate_audio_straddles_aec_engage(
-            self.audio_started_at,
-            std::time::Instant::now(),
-            crate::always::audio::aec_output_engaged_at(),
-        )
-    }
 
     /// `Some(verdict)` once the score landed; `None` while in flight.
     /// A dead worker (panic) reads as an unverifiable score.
@@ -785,34 +735,6 @@ const EARLY_CUE_MIN_SCORE: f32 = 0.40;
 /// Over media, live STT opens for a window at least this close to him (his
 /// windows under media 0.3-0.5; film/Iris/music -0.06..0.2).
 const STT_CANDIDATE_SCORE: f32 = 0.30;
-/// Replay A/B switch (tests only): `GATE_REPLAY_OLD_CUE` restores the
-/// Silero-streak instant cue with the gate on.
-fn old_instant_cue() -> bool {
-    #[cfg(test)]
-    if std::env::var_os("GATE_REPLAY_OLD_CUE").is_some() {
-        return true;
-    }
-    false
-}
-/// Replay A/B switch: `GATE_REPLAY_NO_EXCISE` (tests only) restores the
-/// old end-at-the-cut behaviour.
-fn media_excise_on() -> bool {
-    #[cfg(test)]
-    if std::env::var_os("GATE_REPLAY_NO_EXCISE").is_some() {
-        return false;
-    }
-    true
-}
-/// Replay A/B switch (tests only): `GATE_REPLAY_FIXED_EXCISE` restores the
-/// old fixed 2.5 s wait for his continuation after an excision (the
-/// 2026-10-16 20:18Z regression: every paste over Spotify 1.2-2.5 s late).
-fn fixed_excise_wait() -> Option<std::time::Duration> {
-    #[cfg(test)]
-    if std::env::var_os("GATE_REPLAY_FIXED_EXCISE").is_some() {
-        return Some(std::time::Duration::from_millis(2_500));
-    }
-    None
-}
 
 /// Frames of (end-of-turn state, samples, Silero prob) kept so an excision
 /// can rebuild HIS end-of-turn view from the excision point. A memory
@@ -832,8 +754,6 @@ struct MediaExcise {
     /// Buffer generation (`committed_samples`) the head belongs to.
     generation: usize,
     his: crate::always::eot::EotTracker,
-    /// Test A/B only (`fixed_excise_wait`): the old fixed deadline.
-    deadline: Option<std::time::Instant>,
 }
 
 /// How his turn ended during an excision.
@@ -1748,16 +1668,6 @@ fn record_with_local_vad(
     let mut gate_job: Option<GateJob> = None;
     macro_rules! gate_apply_verdict {
         () => {{
-            if media_excise
-                .as_ref()
-                .and_then(|ex| ex.deadline)
-                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-            {
-                // Test A/B only (`fixed_excise_wait`); the end is logged
-                // and applied after the loop.
-                tracing::info!("speaker_gate_excise_expired");
-                break;
-            }
             if let Some(score) = gate_job.as_ref().and_then(GateJob::poll) {
                 let job = gate_job.take().expect("polled gate job present");
                 if let Some(gate) = &speaker_gate
@@ -1792,7 +1702,7 @@ fn record_with_local_vad(
                                 // Whatever was speculated included the reel.
                                 speculation_pending = false;
                                 speculation_slot.invalidate();
-                                if over_media && media_excise_on() && !crate::always::speaker_trim::old_trail_rule() {
+                                if over_media {
                                     // Over a video/Iris his own words can score
                                     // foreign (14:37:49Z: cut mid-sentence, the
                                     // rest pasted as a second message): the
@@ -1961,7 +1871,7 @@ fn record_with_local_vad(
                                         &speculation_slot,
                                     );
                                     speaker_timeline.excise(confirmed_user_len, usize::MAX);
-                                    if film.is_some() && media_excise_on() {
+                                    if film.is_some() {
                                         // Other output plays: keep listening for his
                                         // continuation (see `media_excise`).
                                         tail_fail_streak = 0;
@@ -1975,17 +1885,8 @@ fn record_with_local_vad(
                                 }
                             }
                         }
-                    } else if !cohort_veto && speaker_gate_allows_score(score, gate.threshold)
-                        && job.kind == GateJobKind::Window
-                        && job.straddles_aec_engage()
-                    {
-                        // Playback just started under this window and was
-                        // not yet cancelled: no verdict either way; the
-                        // next (cancelled) window decides.
-                        tracing::info!(score = ?score, "speaker_gate_refused_aec_edge");
                     } else if !cohort_veto
                         && (speaker_gate_allows_score(score, gate.threshold) || media_pass)
-                        && !job.straddles_aec_engage()
                     {
                         let score = score.expect("accepted speaker score must be present");
                         if media_pass && !speaker_gate_allows_score(Some(score), gate.threshold) {
@@ -2212,18 +2113,16 @@ fn record_with_local_vad(
                     end = Some(e);
                 }
             }
-            let deadline = fixed_excise_wait().map(|w| std::time::Instant::now() + w);
             tracing::info!(
                 head_silence_ms,
                 his_silence_ms = his.raw_silence_frames() * FRAME_MS,
                 foreign_ms = n_after as u32 * FRAME_MS,
                 endpoint_ms = endpoint * FRAME_MS,
                 end = ?end,
-                fixed_wait = deadline.is_some(),
                 "speaker_gate_excise_his_view"
             );
-            media_excise = Some(MediaExcise { head, generation: committed_samples, his, deadline });
-            if end.is_some() && deadline.is_none() {
+            media_excise = Some(MediaExcise { head, generation: committed_samples, his });
+            if end.is_some() {
                 break;
             }
         }};
@@ -2428,7 +2327,7 @@ fn record_with_local_vad(
         // retracted 150-200 ms after the sound had already played). The
         // quiet-room early cue now waits for the first voiceprint window
         // (`EARLY_CUE_MIN_SCORE`, see gate_apply_verdict).
-        let instant_announce_ok = (!speaker_gate_requested || old_instant_cue())
+        let instant_announce_ok = !speaker_gate_requested
             && instant_announce_allowed(
                 speaker_gate_requested,
                 crate::always::audio::other_output_quiet(),
@@ -2542,7 +2441,6 @@ fn record_with_local_vad(
                 let ex = media_excise.as_mut().expect("excision present");
                 if let Some(end) =
                     his_turn_step(model, &mut ex.his, samples, last_prob, endpoint, veto, hold)
-                    && ex.deadline.is_none()
                 {
                     tracing::info!(
                         his_silence_ms = ex.his.raw_silence_frames() * FRAME_MS,
@@ -3595,33 +3493,23 @@ fn record_with_local_vad(
                     (
                         job.kind,
                         score,
-                        job.audio_started_at,
                         job.embedding().cloned(),
                         job.cohort(),
                     )
                 })
             });
-        let whole_started_at = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs_f64(
-                speaker_gate_whole_window(&speech_samples).len() as f64 / 16_000.0,
-            ))
-            .unwrap_or_else(std::time::Instant::now);
         // A landed window pass vetoed by the impostor cohort (see the
         // ladder) does not verify here either: the whole utterance decides.
-        let landed = landed.filter(|(kind, score, _, _, cohort)| {
+        let landed = landed.filter(|(kind, score, _, cohort)| {
             !(*kind == GateJobKind::Window
                 && score.is_some_and(|s| {
                     s >= threshold
                         && crate::always::speaker_trim::cohort_vetoes_pass(s, *cohort, threshold)
                 }))
         });
-        let (score, scored_from, scored_embedding) = match landed {
-            Some((_, score, from, e, _)) if speaker_gate_allows_score(score, threshold) => {
-                (score, from, e)
-            }
-            Some((GateJobKind::Tentative | GateJobKind::Decisive, score, from, e, _)) => {
-                (score, from, e)
-            }
+        let (score, scored_embedding) = match landed {
+            Some((_, score, e, _)) if speaker_gate_allows_score(score, threshold) => (score, e),
+            Some((GateJobKind::Tentative | GateJobKind::Decisive, score, e, _)) => (score, e),
             _ => {
                 let scored = speaker_gate.as_ref().and_then(|gate| {
                     (voiced_samples >= crate::always::speaker_embed::MIN_EMBED_SAMPLES)
@@ -3634,25 +3522,13 @@ fn record_with_local_vad(
                         .flatten()
                 });
                 match scored {
-                    Some((s, e)) => (Some(s), whole_started_at, Some(e)),
-                    None => (None, whole_started_at, None),
+                    Some((s, e)) => (Some(s), Some(e)),
+                    None => (None, None),
                 }
             }
         };
-        // A pass on audio that straddles a playback-start edge is not
-        // trusted (see `gate_audio_straddles_aec_engage`): the utterance
-        // goes to the recoverable rejected list instead of being pasted.
-        let aec_edge = speaker_gate_allows_score(score, threshold)
-            && gate_audio_straddles_aec_engage(
-                scored_from,
-                std::time::Instant::now(),
-                crate::always::audio::aec_output_engaged_at(),
-            );
-        if aec_edge {
-            tracing::info!(score = ?score, "speaker_gate_refused_aec_edge_final");
-        }
         if SPEAKER_GATE_ENFORCE_DROP
-            && (aec_edge || !speaker_gate_allows_transcription(true, score, threshold))
+            && !speaker_gate_allows_transcription(true, score, threshold)
         {
             if speaker_gate.is_none() {
                 tracing::warn!("speaker_gate_unavailable_reject");
@@ -4467,15 +4343,6 @@ fn looks_mid_sentence(loc: &crate::always::localization::Localization, text: &st
     classify_pause_text(loc, text) != PauseText::Complete
 }
 
-/// Does this pasted text read as a finished thought? Same rules as the
-/// end-of-turn decision (`classify_pause_text`): only a sentence
-/// terminator after a non-connector, non-filler word counts.
-pub(crate) fn text_reads_complete(
-    loc: &crate::always::localization::Localization,
-    text: &str,
-) -> bool {
-    classify_pause_text(loc, text) == PauseText::Complete
-}
 
 /// What the words before a pause say about whether the speaker is done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5603,7 +5470,6 @@ mod tests {
                 len_at_submit: len,
                 committed_at_submit: committed,
                 voiced_at_submit: len,
-                audio_started_at: std::time::Instant::now(),
                 scored_len: len.min(super::SPEAKER_TAIL_WINDOW_SAMPLES),
                 extra: std::sync::Arc::new(std::sync::OnceLock::new()),
             },
@@ -5791,39 +5657,6 @@ mod tests {
 #[path = "vad_endpoint_replay.rs"]
 mod endpoint_replay_tests;
 
-#[cfg(test)]
-mod aec_edge_tests {
-    use super::gate_audio_straddles_aec_engage as straddles;
-    use std::time::{Duration, Instant};
-
-    /// Replays the 2026-10-14 timings (seconds after an arbitrary base):
-    /// the narrator false accept, and the user's own verified windows over
-    /// the same video, which started long after the engage edge.
-    #[test]
-    fn verdicts_straddling_a_playback_engage_are_refused() {
-        let base = Instant::now();
-        let at = |s: f64| base + Duration::from_secs_f64(s);
-        // 11:25:14.941 engage; narrator window scored 11:25:16.369 on the
-        // trailing 1.5 s (audio from ~14.8): straddles.
-        let engaged = Some(at(14.941));
-        assert!(straddles(at(16.369 - 1.5 - 0.1), at(16.369), engaged));
-        // Whole-utterance score from voice onset 11:25:10.864: straddles.
-        assert!(straddles(at(10.864), at(18.2), engaged));
-        // User's verified windows over the same video: 11:25:26.874,
-        // 11:25:41.374, 11:26:22.871 … all well after the edge.
-        for v in [26.874, 41.374, 82.871, 130.772, 217.768] {
-            assert!(!straddles(at(v - 1.6), at(v), engaged), "{v}");
-        }
-        // Engage edge only seen after the verdict landed: not this one.
-        assert!(!straddles(at(10.0), at(12.0), Some(at(12.5))));
-        // Guard: an edge just before the window start still counts
-        // (capture latency), one well before does not.
-        assert!(straddles(at(15.3), at(16.8), engaged));
-        assert!(!straddles(at(15.6), at(17.1), engaged));
-        // No playback edge ever: never refused.
-        assert!(!straddles(at(0.0), at(5.0), None));
-    }
-}
 
 /// Offline "My Voice" window scores over WAVs (the daemon's view of the
 /// mic): `GATE_EVAL_WAVS=a.wav,b.wav GATE_EVAL_OUT=out.jsonl

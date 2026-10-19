@@ -969,25 +969,6 @@ fn handle_speech(
             Ok(())
         }
         SpeechAction::Paste { text: transformed } => {
-            // Foreign-speech rule 1 (low confidence) in LOG-ONLY mode
-            // (pref `foreign_speech_confidence_enforce` off): record what
-            // it would have rejected so the 0.40 cut can be tuned on real
-            // data — and paste anyway. Dictation is never swallowed on an
-            // untuned threshold.
-            if let Some(confidence) =
-                crate::always::hallucination::foreign_speech_low_confidence(transcription)
-            {
-                if crate::always::telemetry::should_log_transcripts() {
-                    tracing::info!(text, "foreign_speech_would_reject_text");
-                }
-                tracing::info!(
-                    confidence,
-                    threshold = crate::always::hallucination::FOREIGN_SPEECH_MAX_CONFIDENCE,
-                    live_stream = ?transcription.evidence.live_stream,
-                    chars = text.chars().count(),
-                    "foreign_speech_would_reject"
-                );
-            }
             // Deterministic local cleanup first: removes adjacent repeats and
             // fillers before snippet matching / grammar so they never reach the
             // paste buffer or the LLM prompt.
@@ -1699,29 +1680,6 @@ pub const GRAMMAR_MAX_CHARS: usize = 4000;
 // the empty/whitespace case (word_count 0).
 const AUTO_ENTER_MIN_WORDS: usize = 1;
 
-/// Commit window before auto-Enter for text that reads finished. The
-/// paste itself is never delayed — only the Return that SENDS it. Picked
-/// from his own history (always.2026-10-12..15: of the dictations he
-/// resumed within 3 s of a paste, 162 of 207 resumed within 1.5 s). Voice
-/// heard inside the window freezes it (`pause::countdown_defer_for_voice`),
-/// and a verified resume cancels it so the new words merge into the same
-/// message instead of arriving as a second one.
-pub(crate) const COMMIT_HOLD_COMPLETE_MS: u32 = 1_500;
-/// Commit window when the text trails off (no terminator, or a trailing
-/// connector/filler): he is more likely mid-thought, so wait longer.
-pub(crate) const COMMIT_HOLD_OPEN_MS: u32 = 3_000;
-
-/// How long auto-Enter waits after a paste of `text` (see the constants).
-/// 2026-10-15 18:56:06Z: "…and this is about all." was pasted and Entered
-/// 50 ms later; he resumed 0.7 s after the paste and his thought arrived as
-/// two messages.
-pub(crate) fn commit_hold_ms(loc: &crate::always::localization::Localization, text: &str) -> u32 {
-    if crate::always::vad::text_reads_complete(loc, text) {
-        COMMIT_HOLD_COMPLETE_MS
-    } else {
-        COMMIT_HOLD_OPEN_MS
-    }
-}
 
 fn should_auto_enter_for_text(text: &str) -> bool {
     word_count(text) >= AUTO_ENTER_MIN_WORDS
@@ -1988,8 +1946,8 @@ mod tests {
     // decision logic can be exercised in isolation.
 
     use super::{
-        AUTO_ENTER_MIN_WORDS, COMMIT_HOLD_COMPLETE_MS, COMMIT_HOLD_OPEN_MS,
-        SHORT_UTTERANCE_MAX_CHARS, SHORT_UTTERANCE_MAX_WORDS, commit_hold_ms, is_short_utterance,
+        AUTO_ENTER_MIN_WORDS,
+        SHORT_UTTERANCE_MAX_CHARS, SHORT_UTTERANCE_MAX_WORDS, is_short_utterance,
         should_auto_enter_for_text, should_refetch_speaker_model, snippet_utterance_for_log,
     };
 
@@ -2042,11 +2000,15 @@ mod tests {
                     .unwrap();
                 assert!(held < final_);
             }
-            // Exactly one audible cue per utterance (Listening at the
-            // first word); only a real failure adds the distinct Failure.
+            // Eyes-free contract (5c5916f1c9e9796333d6cb3517068500b87855d3): one "heard you" (Listening at
+            // the first word) and one outcome per cycle — Success on a
+            // paste, Failure when nothing went out; a held final's outcome
+            // waits for the consumer's verdict.
             let mut expected = vec![StatusSound::Listening];
-            if boundary == "error" {
-                expected.push(StatusSound::Failure);
+            match boundary {
+                "success" => expected.push(StatusSound::Success),
+                "held" => {}
+                _ => expected.push(StatusSound::Failure),
             }
             assert_eq!(take_test_cues(), expected, "{boundary}");
             super::emit_utterance_terminal(); // duplicate reset must stay quiet
@@ -2156,24 +2118,6 @@ mod tests {
         assert!(!message.contains('['), "{message}");
     }
 
-    #[test]
-    fn commit_hold_waits_longer_for_unfinished_text() {
-        let loc = &crate::always::localization::Localization::ENGLISH;
-        // 2026-10-15 18:56:06Z: complete-looking, yet he resumed 0.7 s
-        // after the paste — inside the window, so it merges.
-        let a = "This, I'm not sure if this is the exact code you have to check, test, and fix, and this is about all.";
-        assert_eq!(commit_hold_ms(loc, a), COMMIT_HOLD_COMPLETE_MS);
-        assert!(700 < COMMIT_HOLD_COMPLETE_MS);
-        assert_eq!(
-            commit_hold_ms(loc, "Takes a while to do that and"),
-            COMMIT_HOLD_OPEN_MS
-        );
-        assert_eq!(commit_hold_ms(loc, "so I think, uh,"), COMMIT_HOLD_OPEN_MS);
-        assert_eq!(
-            commit_hold_ms(loc, "What time is it?"),
-            COMMIT_HOLD_COMPLETE_MS
-        );
-    }
 
     #[test]
     fn auto_enter_fires_for_one_or_more_words() {

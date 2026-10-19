@@ -130,8 +130,7 @@ fn rejected(u: &Utterance) -> bool {
         },
         ..Default::default()
     };
-    // Shipping default: rule 1 (confidence) log-only, rule 2 enforced.
-    foreign_speech(&r, false).is_some()
+    foreign_speech(&r).is_some()
 }
 
 #[test]
@@ -196,74 +195,4 @@ fn replay_real_logs_through_foreign_speech_gate() {
 
     // Every misfire whose live session heard nothing is rejected.
     assert_eq!(rej(Label::Misfire), misfire_live_empty);
-}
-
-/// End-to-end acoustic check: rows produced by running the REAL
-/// `swift/apple_stt.swift` file-transcription path on WAV files
-/// (`name<TAB>confidence<TAB>ms<TAB>text`, confidence `-1` = none), fed
-/// through the real classifier on the Apple backend. Names starting with
-/// `en` must paste; `hi`/`ne` (Hindi/Nepali) must be ForeignSpeech.
-/// Skips unless `ALWAYS_FOREIGN_E2E_TSV` points at such a file.
-#[test]
-fn e2e_apple_confidence_rows_classify_correctly() {
-    use always::always::hallucination::foreign_speech_low_confidence;
-    use always::always::speech_action::{SpeechAction, classify_transcription};
-    let Ok(path) = std::env::var("ALWAYS_FOREIGN_E2E_TSV") else {
-        eprintln!("SKIP: ALWAYS_FOREIGN_E2E_TSV not set");
-        return;
-    };
-    let body = std::fs::read_to_string(path).expect("read tsv");
-    let cfg = always::always::config::AlwaysConfig {
-        transcriber_backend: always::stt_dispatch::TranscriberBackendChoice::Apple,
-        ..Default::default()
-    };
-    assert!(
-        !cfg.foreign_speech_confidence_enforce,
-        "rule 1 ships log-only"
-    );
-    let mut enforced = cfg.clone();
-    enforced.foreign_speech_confidence_enforce = true;
-    let now = std::time::Instant::now();
-    let last = now - std::time::Duration::from_secs(60);
-    let mut checked = 0;
-    for row in body.lines().filter(|l| !l.trim().is_empty()) {
-        let cols: Vec<&str> = row.splitn(4, '\t').collect();
-        let (name, conf, text) = (cols[0], cols[1].parse::<f32>().unwrap(), cols[3]);
-        let r = TranscriptionResult {
-            text: text.to_string(),
-            evidence: RecognitionEvidence {
-                confidence: (conf >= 0.0).then_some(conf),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // Shipping default: log-only → always pasted; would_reject logged
-        // for low confidence.
-        let action = classify_transcription(&cfg, text, &r, now, last);
-        let would = foreign_speech_low_confidence(&r).is_some();
-        // Pref on: rule 1 enforced.
-        let enforced_action = classify_transcription(&enforced, text, &r, now, last);
-        eprintln!(
-            "{name}\t{conf:.3}\tdefault={action:?} would_reject={would}\tenforced={enforced_action:?}"
-        );
-        assert!(
-            matches!(action, SpeechAction::Paste { .. }),
-            "{name}: {action:?}"
-        );
-        if name.starts_with("en") {
-            assert!(!would, "{name}");
-            assert!(
-                matches!(enforced_action, SpeechAction::Paste { .. }),
-                "{name}"
-            );
-        } else if name.starts_with("hi") || name.starts_with("ne") {
-            assert!(would, "{name}");
-            assert!(
-                matches!(enforced_action, SpeechAction::ForeignSpeech { .. }),
-                "{name}: {enforced_action:?}"
-            );
-        }
-        checked += 1;
-    }
-    assert!(checked > 0);
 }

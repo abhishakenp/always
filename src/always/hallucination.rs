@@ -150,18 +150,6 @@ fn normalize(text: &str) -> String {
     out
 }
 
-/// Mean per-word acoustic confidence below which a transcript is treated as
-/// speech in a language other than the recognizer's (Layer H).
-///
-/// Measured 2026-10-14 with Apple SpeechTranscriber (en_GB), mean of
-/// `.transcriptionConfidence` over the words:
-/// - the user's own saved English dictation audio (~/.always/failed-chunks,
-///   60+ clips): 0.59-0.96, typically 0.85+;
-/// - the user's saved Nepali speech ("Whisperway, Ma, Nepali, Ma, Boli…"):
-///   0.095; other non-English/garbled clips 0.05-0.27;
-/// - synthetic Hindi/Nepali (macOS `say -v Lekha`): 0.15-0.38;
-///   synthetic English: 0.86-0.95.
-pub const FOREIGN_SPEECH_MAX_CONFIDENCE: f32 = 0.40;
 
 /// When the live recognizer heard no words but the file recognizer scored
 /// its own transcript at least this confident, trust the transcript — a
@@ -205,35 +193,21 @@ pub fn preview_agreement(text: &str, preview: &str) -> f64 {
 /// ("And a baggy?"). Judged from ACOUSTIC evidence the engines already
 /// computed, never from the words themselves, so it is not a content
 /// filter and runs on every backend that reports evidence (backends that
-/// report none get `None` — no signal, no change):
-///
-/// 1. the file recognizer's mean word confidence is below
-///    [`FOREIGN_SPEECH_MAX_CONFIDENCE`]; or
-/// 2. the live Apple session ran over the same audio and finished
-///    cleanly with NO words, unless the file recognizer was confident
-///    (≥ [`FOREIGN_SPEECH_TRUST_CONFIDENCE`]) or the Parakeet preview heard
-///    the same words (≥ [`FOREIGN_SPEECH_PREVIEW_AGREEMENT`]).
+/// report none get `None` — no signal, no change): the live Apple session
+/// ran over the same audio and finished cleanly with NO words, unless the
+/// file recognizer was confident (>= [`FOREIGN_SPEECH_TRUST_CONFIDENCE`])
+/// or the Parakeet preview heard the same words
+/// (>= [`FOREIGN_SPEECH_PREVIEW_AGREEMENT`]).
 ///
 /// Pure, O(words). Returns the reject reason, or `None` to accept.
-///
-/// Rollout (2026-10-14): rule 2 is enforced; rule 1 is enforced only with
-/// `enforce_confidence` (pref `foreign_speech_confidence_enforce`, default
-/// off). When off, the daemon logs [`foreign_speech_low_confidence`] as
-/// `foreign_speech_would_reject` and still pastes.
 #[must_use]
-pub fn foreign_speech(
-    result: &TranscriptionResult,
-    enforce_confidence: bool,
-) -> Option<&'static str> {
+pub fn foreign_speech(result: &TranscriptionResult) -> Option<&'static str> {
     use crate::stt::LiveStreamOutcome;
     let text = result.text.trim();
     if text.is_empty() {
         return None;
     }
     let ev = &result.evidence;
-    if enforce_confidence && foreign_speech_low_confidence(result).is_some() {
-        return Some("foreign speech: low acoustic confidence");
-    }
     if ev.live_stream == LiveStreamOutcome::NoWords {
         let confident = ev
             .confidence
@@ -279,18 +253,6 @@ pub fn not_his_voice(result: &TranscriptionResult) -> Option<&'static str> {
     (best < bar).then_some("not his voice: no window reached his profile")
 }
 
-/// Rule 1 alone: the mean word confidence when it is below
-/// [`FOREIGN_SPEECH_MAX_CONFIDENCE`] (non-empty text only), else `None`.
-#[must_use]
-pub fn foreign_speech_low_confidence(result: &TranscriptionResult) -> Option<f32> {
-    if result.text.trim().is_empty() {
-        return None;
-    }
-    result
-        .evidence
-        .confidence
-        .filter(|c| *c < FOREIGN_SPEECH_MAX_CONFIDENCE)
-}
 
 /// Writing system of a letter. `None` for anything that is not a letter
 /// (digits, punctuation, emoji, combining accents), which never counts
@@ -1096,7 +1058,7 @@ mod tests {
         for preview in [None, Some("")] {
             let r = heard("And a baggy?", None, LiveStreamOutcome::NoWords, preview);
             assert_eq!(
-                foreign_speech(&r, false),
+                foreign_speech(&r),
                 Some("foreign speech: live recognizer heard no words"),
                 "preview={preview:?}"
             );
@@ -1112,7 +1074,7 @@ mod tests {
             LiveStreamOutcome::NoWords,
             None,
         );
-        assert!(foreign_speech(&r, false).is_none());
+        assert!(foreign_speech(&r).is_none());
         // Live session heard nothing but Parakeet heard the same words.
         let r = heard(
             "Okay, so do all of that, fix everything,",
@@ -1120,7 +1082,7 @@ mod tests {
             LiveStreamOutcome::NoWords,
             Some("okay so do all of that fix everything"),
         );
-        assert!(foreign_speech(&r, false).is_none());
+        assert!(foreign_speech(&r).is_none());
     }
 
     #[test]
@@ -1131,7 +1093,7 @@ mod tests {
             LiveStreamOutcome::NoWords,
             Some("ama khana"),
         );
-        assert!(foreign_speech(&r, false).is_some());
+        assert!(foreign_speech(&r).is_some());
     }
 
     #[test]
@@ -1139,125 +1101,25 @@ mod tests {
         // Groq / local backends report no evidence: never judged here.
         for text in ["And a baggy?", "Rings of Nanjani, Baina.", "No"] {
             assert!(
-                foreign_speech(&heard(text, None, LiveStreamOutcome::NotRun, None), true).is_none()
+                foreign_speech(&heard(text, None, LiveStreamOutcome::NotRun, None)).is_none()
             );
         }
         // Failed / timed-out live sessions say nothing about the audio.
         for outcome in [LiveStreamOutcome::Failed, LiveStreamOutcome::Unknown] {
-            assert!(foreign_speech(&heard("And a baggy?", None, outcome, None), true).is_none());
+            assert!(foreign_speech(&heard("And a baggy?", None, outcome, None)).is_none());
         }
         // Live session heard words, no confidence: accept.
         assert!(
-            foreign_speech(
-                &heard("Whatever", None, LiveStreamOutcome::Heard, None),
-                true
-            )
+            foreign_speech(&heard("Whatever", None, LiveStreamOutcome::Heard, None))
             .is_none()
         );
         // Empty text is the empty-guard's job, not this layer's.
         assert!(
-            foreign_speech(
-                &heard("  ", Some(0.0), LiveStreamOutcome::NoWords, None),
-                true
-            )
+            foreign_speech(&heard("  ", Some(0.0), LiveStreamOutcome::NoWords, None))
             .is_none()
         );
     }
 
-    /// Mean SpeechTranscriber (en_GB) word confidence MEASURED 2026-10-14
-    /// on real audio: the user's own saved dictation clips
-    /// (~/.always/failed-chunks) and synthetic `say` clips. Text shortened.
-    const MEASURED_ENGLISH: &[(&str, f32)] = &[
-        (
-            "Can you go through all the failing tests and test out? …",
-            0.957,
-        ),
-        ("without you touching them, commit only those, …", 0.867),
-        ("Patience along with it as you go.", 0.765),
-        (
-            "Uh, uh, and all that at 1st and after that only, uh, we uh, …",
-            0.596,
-        ),
-        (
-            "Will the everyone not on? I want to see which is accurate.",
-            0.609,
-        ),
-        ("but we cannot follow without bailing. No, I mean, …", 0.592),
-        ("Okay, I am speaking now. Can you hear me, Iris?", 0.666),
-        (
-            "Uh, it does not look like uh, they are streaming in.",
-            0.730,
-        ),
-        ("Okay, commit push all those changes then.", 0.875),
-        ("Please, I need good code.", 0.875),
-        ("You cannot do anything otherwise.", 0.862),
-        ("Oh, it's not that slow. It's pretty fast actually.", 0.781),
-        (
-            "Stops always transcribing other people videos in calls.",
-            0.892,
-        ),
-        // synthetic (macOS say, en_GB / en_IN voices)
-        ("Yes.", 0.860),
-        ("Whatever.", 0.886),
-        ("Commit and push it.", 0.953),
-        (
-            "Why is this preview not showing in WhatsApp when I'm speaking?",
-            0.911,
-        ),
-    ];
-    const MEASURED_FOREIGN: &[(&str, f32)] = &[
-        // the user's own saved Nepali speech
-        (
-            "Whisperway, Ma, Nepali, Ma, Boli, Rathu, Tunde, Buzna, …",
-            0.095,
-        ),
-        ("Chaku, the Malay, Mangali.", 0.198),
-        (
-            "Go to Ludonia, or 10, I need below. See, see, see, …",
-            0.209,
-        ),
-        (
-            "So they go on there, they pick up any underwear, so...",
-            0.269,
-        ),
-        // synthetic Nepali / Hindi (macOS say -v Lekha)
-        ("Amma, kana, kanugyu, makali, hilo, ai, chuhe.", 0.152),
-        ("Hajul Thik Chak, Bholi Bihan phone got to...", 0.341),
-        ("Ki, Gharde, Huno, Hunj.", 0.307),
-        ("Mummy, me kori, der, me, ata, kana, kalo.", 0.378),
-        ("Bad, badme, bad, Karte, Hain.", 0.214),
-        ("Huh?", 0.358),
-    ];
-
-    #[test]
-    fn measured_confidence_separates_english_from_foreign() {
-        for live in [LiveStreamOutcome::NotRun, LiveStreamOutcome::Heard] {
-            for (text, c) in MEASURED_ENGLISH {
-                let r = heard(text, Some(*c), live, None);
-                assert!(foreign_speech_low_confidence(&r).is_none(), "{text} ({c})");
-                for enforce in [false, true] {
-                    assert!(
-                        foreign_speech(&r, enforce).is_none(),
-                        "genuine English rejected: {text} ({c}) enforce={enforce}"
-                    );
-                }
-            }
-            for (text, c) in MEASURED_FOREIGN {
-                let r = heard(text, Some(*c), live, None);
-                assert_eq!(foreign_speech_low_confidence(&r), Some(*c), "{text}");
-                assert_eq!(
-                    foreign_speech(&r, true),
-                    Some("foreign speech: low acoustic confidence"),
-                    "foreign speech accepted when enforced: {text} ({c})"
-                );
-                // Default rollout: rule 1 is log-only — still pasted.
-                assert!(
-                    foreign_speech(&r, false).is_none(),
-                    "log-only rule 1 must not reject: {text} ({c})"
-                );
-            }
-        }
-    }
 
     #[test]
     fn preview_agreement_counts_shared_words() {

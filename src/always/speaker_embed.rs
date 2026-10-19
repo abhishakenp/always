@@ -679,41 +679,13 @@ mod tests {
     }
 
     fn probe_embedder(ep: &str) -> SpeakerEmbedder {
-        use ort::ep::coreml::{ComputeUnits, ModelFormat};
-        let ep_name = ep;
-        let (fmt, units) = match ep {
-            "shipped" => return SpeakerEmbedder::new().unwrap(),
-            "cpu" => return SpeakerEmbedder::cpu(&model_path().unwrap()).unwrap(),
-            "gpu" => return SpeakerEmbedder::gpu_trunk(&model_path().unwrap()).unwrap(),
-            "ort-cpu" => (ModelFormat::NeuralNetwork, ComputeUnits::CPUOnly),
-            "nn-gpu" => (ModelFormat::NeuralNetwork, ComputeUnits::CPUAndGPU),
-            "nn-all" => (ModelFormat::NeuralNetwork, ComputeUnits::All),
-            "nn-ane" => (ModelFormat::NeuralNetwork, ComputeUnits::CPUAndNeuralEngine),
-            "ml-cpu" => (ModelFormat::MLProgram, ComputeUnits::CPUOnly),
-            "ml-gpu" => (ModelFormat::MLProgram, ComputeUnits::CPUAndGPU),
-            "ml-ane" => (ModelFormat::MLProgram, ComputeUnits::CPUAndNeuralEngine),
-            other => panic!("SPK_PROBE_EP {other}"),
-        };
-        let ep = ort::ep::CoreML::default()
-            .with_model_format(fmt)
-            .with_compute_units(units)
-            .with_profile_compute_plan(std::env::var_os("SPK_PROBE_PLAN").is_some())
-            .build();
-        // SPK_PROBE_TRUNK=<trunk.onnx>,<tail.bin>: the trunk-only graph.
-        let trunk = std::env::var("SPK_PROBE_TRUNK").ok();
-        let (path, tail) = match &trunk {
-            Some(t) => {
-                let (m, w) = t.split_once(',').unwrap();
-                (PathBuf::from(m), Some(PoolingTail::from_le_bytes(&std::fs::read(w).unwrap()).unwrap()))
-            }
-            None => (model_path().unwrap(), None),
-        };
-        let mut b = cpu_session_builder().unwrap();
-        if ep_name != "ort-cpu" {
-            b = b.with_execution_providers([ep]).map_err(|e| -> ort::Error { e.into() }).unwrap();
+        let path = model_path().unwrap();
+        match ep {
+            "shipped" => SpeakerEmbedder::new().unwrap(),
+            "cpu" => SpeakerEmbedder::cpu(&path).unwrap(),
+            "gpu" => SpeakerEmbedder::gpu_trunk(&path).unwrap(),
+            other => panic!("SPK_PROBE_EP {other}: shipped | cpu | gpu"),
         }
-        let session = b.commit_from_file(path).unwrap();
-        SpeakerEmbedder { session: Mutex::new(session), tail, window: None }
     }
 
     fn footprint_mb() -> f64 {

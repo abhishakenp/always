@@ -170,10 +170,7 @@ pub fn classify_transcription(
     // words), so — unlike the content filters below — it applies to local
     // backends too. Backends that report no evidence are unaffected.
     if cfg.filter_enabled
-        && let Some(reason) = crate::always::hallucination::foreign_speech(
-            transcription,
-            cfg.foreign_speech_confidence_enforce,
-        )
+        && let Some(reason) = crate::always::hallucination::foreign_speech(transcription)
     {
         return SpeechAction::ForeignSpeech {
             reason: reason.to_string(),
@@ -419,7 +416,6 @@ mod tests {
             fail_cue: None,
             learn_from_voice: false,
             stt_live_preview: true,
-            foreign_speech_confidence_enforce: false,
             mic_conflict_exclusion_bundles: Vec::new(),
         }
     }
@@ -691,31 +687,6 @@ mod tests {
         );
     }
 
-    /// Rule 1 (low confidence) is log-only by default: still pasted.
-    /// With `foreign_speech_confidence_enforce` it rejects.
-    #[test]
-    fn classify_low_confidence_is_log_only_unless_enforced() {
-        let mut cfg = test_config();
-        cfg.transcriber_backend = crate::stt_dispatch::TranscriberBackendChoice::Apple;
-        let text = "Amma, kana, kanugyu, makali, hilo, ai, chuhe.";
-        let mut tr = empty_transcription(text);
-        tr.evidence.live_stream = crate::stt::LiveStreamOutcome::Heard;
-        tr.evidence.confidence = Some(0.152); // measured, synthetic Nepali
-        let now = Instant::now();
-        let last = now - Duration::from_secs(10);
-        assert!(!cfg.foreign_speech_confidence_enforce);
-        let action = classify_transcription(&cfg, text, &tr, now, last);
-        assert!(
-            matches!(action, SpeechAction::Paste { .. }),
-            "got {action:?}"
-        );
-        cfg.foreign_speech_confidence_enforce = true;
-        let action = classify_transcription(&cfg, text, &tr, now, last);
-        assert!(
-            matches!(action, SpeechAction::ForeignSpeech { .. }),
-            "got {action:?}"
-        );
-    }
 
     /// Local backend stays raw verbatim for real speech: the foreign gate
     /// only acts on acoustic evidence, never on content.

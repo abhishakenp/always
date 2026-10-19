@@ -137,12 +137,10 @@ reader.stackSize = 1 << 20
 reader.start()
 
 let config = MLModelConfiguration()
-switch ProcessInfo.processInfo.environment["ALWAYS_PREVIEW_COMPUTE"] ?? "ane" {
-case "all": config.computeUnits = .all
-case "cpu": config.computeUnits = .cpuOnly
-case "gpu": config.computeUnits = .cpuAndGPU
-default: config.computeUnits = .cpuAndNeuralEngine
-}
+// Neural Engine. CPU-only and `.all` measured the same first-word time
+// (2026-10-19, 40 of his utterances: p50 553 / 553 / 561 ms), so the ANE
+// stays: it keeps the CPU free.
+config.computeUnits = .cpuAndNeuralEngine
 let manager = StreamingEouAsrManager(configuration: config, chunkSize: .ms160)
 
 func warmUp() async throws {

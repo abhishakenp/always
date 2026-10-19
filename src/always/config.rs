@@ -284,13 +284,6 @@ pub struct AlwaysConfig {
     /// cadence is much slower than the streaming-engine preview loop
     /// (see `LIVE_PREVIEW_INTERVAL_MS` in vad.rs). Default on.
     pub stt_live_preview: bool,
-    /// Enforce the foreign-speech LOW-CONFIDENCE rule (mean Apple word
-    /// confidence < 0.40 → not pasted, kept recoverable). Default false:
-    /// log-only (`foreign_speech_would_reject`) — dictation is never
-    /// swallowed on an untuned cut. DB pref
-    /// `foreign_speech_confidence_enforce`, env
-    /// `ALWAYS_FOREIGN_SPEECH_CONFIDENCE_ENFORCE`.
-    pub foreign_speech_confidence_enforce: bool,
     /// Bundle IDs excluded from mic-conflict detection (apps that hold
     /// the mic but shouldn't pause Always, e.g. screen recorders).
     /// User-configurable via `always config set
@@ -569,7 +562,6 @@ impl AlwaysConfig {
             fail_cue: prefs.fail_cue.clone().filter(|p| !p.is_empty()),
             learn_from_voice: prefs.learn_from_voice.unwrap_or(true),
             stt_live_preview: resolve_stt_live_preview(&prefs),
-            foreign_speech_confidence_enforce: resolve_foreign_speech_confidence_enforce(&prefs),
             mic_conflict_exclusion_bundles: resolve_mic_conflict_exclusion_bundles(&prefs),
         };
 
@@ -674,7 +666,6 @@ impl Default for AlwaysConfig {
             fail_cue: None,
             learn_from_voice: false,
             stt_live_preview: true,
-            foreign_speech_confidence_enforce: false,
             mic_conflict_exclusion_bundles: DEFAULT_MIC_CONFLICT_EXCLUSION_BUNDLES
                 .iter()
                 .map(|s| s.to_string())
@@ -710,21 +701,6 @@ fn resolve_hesitation_silence_secs(env: Option<&str>) -> f64 {
         .unwrap_or(DEFAULT_HESITATION_SILENCE_SECS)
 }
 
-/// Resolve the foreign-speech low-confidence enforcement. Order: DB pref →
-/// `ALWAYS_FOREIGN_SPEECH_CONFIDENCE_ENFORCE` env var → default OFF.
-fn resolve_foreign_speech_confidence_enforce(prefs: &Preferences) -> bool {
-    if let Some(saved) = prefs.foreign_speech_confidence_enforce {
-        return saved;
-    }
-    std::env::var("ALWAYS_FOREIGN_SPEECH_CONFIDENCE_ENFORCE")
-        .ok()
-        .and_then(|s| match s.to_lowercase().as_str() {
-            "true" | "1" => Some(true),
-            "false" | "0" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(false)
-}
 
 /// Resolve the mic-conflict exclusion bundle IDs. Order: DB pref →
 /// built-in defaults (ScreenFlow, CleanShotX).

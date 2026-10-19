@@ -598,7 +598,7 @@ pub fn countdown_remaining_ms() -> u32 {
 /// the user's (the "My Voice" gate needs ~0.4-0.8 s). The countdown stops
 /// ticking until this passes, so Return can't fire while he may be
 /// resuming the same thought; a verified resume then cancels it outright
-/// and the new utterance merges (see `event_loop::commit_hold_ms`).
+/// and the new utterance merges.
 static COUNTDOWN_DEFER_UNTIL: std::sync::LazyLock<Mutex<Option<std::time::Instant>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
