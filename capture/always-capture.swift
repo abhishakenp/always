@@ -960,6 +960,7 @@ func processMic(_ src: UnsafePointer<Float>, _ frames: Int, host: UInt64) {
 /// block (stamped with its first IO block's capture time): the converter and
 /// canceller run ~47 times a second as with the tap, not once per IO cycle.
 let micThread = Thread {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
     let cap = 1 << 16
     var block = [Float](repeating: 0, count: cap)
     var host: UInt64 = 0, firstHost: UInt64 = 0
