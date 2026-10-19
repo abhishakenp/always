@@ -884,21 +884,39 @@ func stopRawMeter() {
 // touches them.
 var monoBuf: AVAudioPCMBuffer?
 var outBuf: AVAudioPCMBuffer?
-/// Mic tap callbacks arrive every ~21 ms; a gap past 500 ms is logged (the
-/// device or this process was late), so a daemon-side stall has its source.
+/// The mic's blocks leave CoreAudio's IO thread through an AVAudioSinkNode
+/// into a lock-free ring (no allocation, no lock, no wait on that thread)
+/// and are processed on one user-interactive thread. Before 2026-10-19 they
+/// came through `installTap`, whose delivery queue fell behind while the
+/// display slept: "mic tap gap 568 ms (buffer captured 571 ms ago)" at
+/// 02:16:18Z, and 5.6-12.7 s bursts at 00:09-00:41Z reached the daemon as one
+/// late backlog. A gap past 500 ms between processed blocks is still logged.
+let micRing = rt_ring_create(1 << 19)!   // floats: ~5.4 s at 96 kHz
+let micReady = DispatchSemaphore(value: 0)
+let micStride = inFormat.isInterleaved ? UInt32(inFormat.channelCount) : 1
+let micSink = AVAudioSinkNode { ts, frameCount, abl -> OSStatus in
+    let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
+    guard frameCount > 0, let first = list.first, let data = first.mData else { return noErr }
+    let host = ts.pointee.mFlags.contains(.hostTimeValid) ? ts.pointee.mHostTime : mach_absolute_time()
+    _ = rt_ring_write(micRing, data.assumingMemoryBound(to: Float.self), frameCount, micStride, host)
+    micReady.signal()
+    return noErr
+}
+engine.attach(micSink)
+engine.connect(input, to: micSink, format: inFormat)
+
 var lastTapAt: UInt64 = 0
-input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buffer, when in
+func processMic(_ src: UnsafePointer<Float>, _ frames: Int, host: UInt64) {
     let tapNow = mach_absolute_time()
     if lastTapAt != 0 {
         let gapMs = Double(tapNow &- lastTapAt) / hostTicksPerSec * 1000
         if gapMs >= 500 {
-            let lateMs = when.isHostTimeValid ? Double(Int64(bitPattern: tapNow &- when.hostTime)) / hostTicksPerSec * 1000 : -1
+            let lateMs = Double(Int64(bitPattern: tapNow &- host)) / hostTicksPerSec * 1000
             log(String(format: "mic tap gap %.0f ms (buffer captured %.0f ms ago)", gapMs, lateMs))
         }
     }
     lastTapAt = tapNow
-    let frames = Int(buffer.frameLength)
-    guard frames > 0, let src = buffer.floatChannelData?[0] else { return }
+    guard frames > 0 else { return }
     if rawLevelsEnabled { procMeter.add(src, frames, rate: inFormat.sampleRate) }
     if monoBuf == nil || Int(monoBuf!.frameCapacity) < frames {
         monoBuf = AVAudioPCMBuffer(pcmFormat: monoIn, frameCapacity: AVAudioFrameCount(max(frames, 4096)))
@@ -924,11 +942,27 @@ input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { buffer, when in
     let n = Int(out.frameLength)
     guard n > 0 else { return }
     if let tp = tapPipeline {
-        tp.feed(out.floatChannelData![0], n, host: when.isHostTimeValid ? when.hostTime : mach_absolute_time())
+        tp.feed(out.floatChannelData![0], n, host: host)
     } else {
         writeAll(out.int16ChannelData![0], n * 2)
     }
 }
+
+let micThread = Thread {
+    var block = [Float](repeating: 0, count: 1 << 15)
+    var host: UInt64 = 0
+    while true {
+        micReady.wait()
+        while true {
+            let n = block.withUnsafeMutableBufferPointer { rt_ring_read(micRing, $0.baseAddress!, UInt32($0.count), &host) }
+            if n == 0 { break }
+            block.withUnsafeBufferPointer { processMic($0.baseAddress!, Int(n), host: host) }
+        }
+    }
+}
+micThread.name = "mic-process"
+micThread.qualityOfService = .userInteractive
+micThread.start()
 
 // ---- Status cues through THIS engine's output -------------------------------
 // Audio rendered by the voice-processing unit's own output is never ducked by

@@ -2,3 +2,4 @@
 #include "aec_core.h"
 #include "tse_core.h"
 #include "speexdsp/speex/speex_resampler.h"
+#include "rt_ring.h"
