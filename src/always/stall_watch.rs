@@ -86,6 +86,9 @@ pub fn spawn() {
                 std::thread::sleep(Duration::from_millis(50));
                 let depth = QUEUED.load(Ordering::Relaxed);
                 match (stalled_for(depth), open.as_mut()) {
+                    // Gated (paused, mic taken): the queue is stale by design
+                    // and discarded on resume, so its depth is no stall.
+                    (Some(_), None) if Phase::from_u8(PHASE.load(Ordering::Relaxed)) == Phase::Gated => {}
                     (Some(d), None) => {
                         let phase = Phase::from_u8(PHASE.load(Ordering::Relaxed));
                         tracing::warn!(phase = ?phase, backlog_ms = d.as_millis() as u64, "capture_consumer_stall");

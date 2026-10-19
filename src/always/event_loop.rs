@@ -303,6 +303,13 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
 
     crate::always::shutdown::report_pending_on_start();
     crate::always::stall_watch::spawn();
+    // Duplicate-daemon check every 30 s on its own thread: it runs `ps` (and
+    // kills), which ran on this thread — the mic's only consumer — and held
+    // the audio up (2026-10-19 01:50:57Z: 420 ms backlog in Housekeeping).
+    let _ = std::thread::Builder::new().name("dup-check".into()).spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(30));
+        daemon::reconcile_duplicate_processes();
+    });
     use crate::always::stall_watch::{Phase, set_phase};
 
     loop {
@@ -320,7 +327,6 @@ pub fn run(cfg: &AlwaysConfig) -> Result<()> {
         if last_dup_check.elapsed() >= Duration::from_secs(30) {
             set_phase(Phase::Housekeeping);
             last_dup_check = Instant::now();
-            daemon::reconcile_duplicate_processes();
 
             // Memory-leak safety net: if ONNX retention has piled up past
             // the ceiling, exit gracefully while nothing is being
