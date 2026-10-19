@@ -894,12 +894,20 @@ var outBuf: AVAudioPCMBuffer?
 let micRing = rt_ring_create(1 << 19)!   // floats: ~5.4 s at 96 kHz
 let micReady = DispatchSemaphore(value: 0)
 let micStride = inFormat.isInterleaved ? UInt32(inFormat.channelCount) : 1
+/// The processing thread is woken once per ~1024 input frames (the old tap's
+/// block, ~11 ms at 96 kHz), not per IO cycle: same latency, fewer wakeups.
+let MIC_WAKE_FRAMES: UInt32 = 1024
+var micPendingFrames: UInt32 = 0   // IO thread only
 let micSink = AVAudioSinkNode { ts, frameCount, abl -> OSStatus in
     let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
     guard frameCount > 0, let first = list.first, let data = first.mData else { return noErr }
     let host = ts.pointee.mFlags.contains(.hostTimeValid) ? ts.pointee.mHostTime : mach_absolute_time()
     _ = rt_ring_write(micRing, data.assumingMemoryBound(to: Float.self), frameCount, micStride, host)
-    micReady.signal()
+    micPendingFrames += frameCount
+    if micPendingFrames >= MIC_WAKE_FRAMES {
+        micPendingFrames = 0
+        micReady.signal()
+    }
     return noErr
 }
 engine.attach(micSink)
